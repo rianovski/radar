@@ -3,7 +3,7 @@ import { flushSync } from 'react-dom'
 import { useRefreshAnimation } from './hooks/useRefreshAnimation'
 import { startViewTransitionSafe } from '@skyhook-io/k8s-ui/utils/view-transition'
 import { useQueryClient } from '@tanstack/react-query'
-import { useNavigate, useLocation, useSearchParams } from 'react-router-dom'
+import { useNavigate, useLocation, useSearchParams, useNavigationType, NavigationType } from 'react-router-dom'
 import { HomeView } from './components/home/HomeView'
 import { DebugOverlay } from './components/DebugOverlay'
 import { TopologyGraph, TopologyFilterSidebar, TopologyControls } from '@skyhook-io/k8s-ui'
@@ -173,6 +173,7 @@ function AuthBarrier({ authMode }: { authMode: string }) {
 function AppInner() {
   const navigate = useNavigate()
   const location = useLocation()
+  const navigationType = useNavigationType()
   const [searchParams, setSearchParams] = useSearchParams()
   const capabilities = useCapabilitiesContext()
   const openLocalTerminal = useOpenLocalTerminal()
@@ -768,7 +769,36 @@ function AppInner() {
         setSelectedHelmRelease({ namespace: ns, name, storageNamespace: searchParams.get('releaseStorage') || undefined })
       }
     }
-  }, [searchParams])
+
+    // Restore resource drawer selection from URL on browser back/forward (POP) within
+    // /resources/{kind}. Cross-kind POP re-mounts ResourcesView via key={pathname} so its
+    // mount effect re-reads ?resource=; same-kind POP doesn't remount, so App must
+    // reconcile selectedResource here. Limited to POP to avoid clobbering deliberate
+    // setSelectedResource calls that race the URL writer (e.g. helm/audit -> resources).
+    if (navigationType === NavigationType.Pop && mainView === 'resources') {
+      const kindFromPath = location.pathname.match(/^\/resources\/([^/]+)/)?.[1] ?? ''
+      const resourceParam = searchParams.get('resource')
+      if (kindFromPath && resourceParam) {
+        const slashIdx = resourceParam.indexOf('/')
+        const ns = slashIdx > 0 ? resourceParam.slice(0, slashIdx) : ''
+        const name = slashIdx > 0 ? resourceParam.slice(slashIdx + 1) : resourceParam
+        const apiGroup = searchParams.get('apiGroup') ?? ''
+        const next: SelectedResource = { kind: kindFromPath, namespace: ns, name, group: apiGroup }
+        setSelectedResource(prev => {
+          if (
+            prev &&
+            prev.kind === next.kind &&
+            prev.namespace === next.namespace &&
+            prev.name === next.name &&
+            (prev.group ?? '') === (next.group ?? '')
+          ) return prev
+          return next
+        })
+      } else if (kindFromPath && !resourceParam) {
+        setSelectedResource(prev => (prev === null ? prev : null))
+      }
+    }
+  }, [searchParams, location.pathname, mainView, navigationType])
 
   // Auto-adjust grouping when namespaces change
   useEffect(() => {
