@@ -12,7 +12,7 @@ import (
 type listContextsInput struct{}
 
 type switchContextInput struct {
-	Name string `json:"name" jsonschema:"description=kubeconfig context name to switch to"`
+	Name string `json:"name" jsonschema:"kubeconfig context name to switch to"`
 }
 
 func handleListContexts(ctx context.Context, req *mcp.CallToolRequest, _ listContextsInput) (*mcp.CallToolResult, any, error) {
