@@ -52,11 +52,14 @@ make build
 
 # ── Replace binary ───────────────────────────────────────────────────────────
 RADAR_BIN=$(which radar)
+echo "→ Stopping radar..."
+"${RADAR_SH}" stop || true
+
 echo "→ Replacing ${RADAR_BIN}..."
 cp "${RADAR_BIN}" "${RADAR_BIN}.bak"
 cp radar "${RADAR_BIN}"
 
 # ── Restart ──────────────────────────────────────────────────────────────────
-echo "→ Restarting..."
-"${RADAR_SH}" restart
+echo "→ Starting radar..."
+"${RADAR_SH}" start
 echo "✓ Done"
