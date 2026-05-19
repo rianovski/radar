@@ -44,7 +44,8 @@ type SSEBroadcaster struct {
 	// entryFunc resolves the pool entry for this broadcaster. When non-nil, cache
 	// lookups use the pool entry instead of global singletons, and global
 	// context-switch/connection-state callbacks are not registered.
-	entryFunc func() *k8s.PoolEntry
+	entryFunc   func() *k8s.PoolEntry
+	contextName string // non-empty for pool-entry broadcasters; sent in connection_state
 }
 
 // ClientInfo stores information about a connected client
@@ -96,9 +97,10 @@ func NewSSEBroadcaster() *SSEBroadcaster {
 // reflects the current pool entry state. Global context-switch and
 // connection-state callbacks are not registered — the pool entry is already
 // connected and has a fixed context lifetime.
-func NewSSEBroadcasterFor(entryFunc func() *k8s.PoolEntry) *SSEBroadcaster {
+func NewSSEBroadcasterFor(contextName string, entryFunc func() *k8s.PoolEntry) *SSEBroadcaster {
 	b := NewSSEBroadcaster()
 	b.entryFunc = entryFunc
+	b.contextName = contextName
 	return b
 }
 
@@ -798,7 +800,7 @@ func (b *SSEBroadcaster) HandleSSE(w http.ResponseWriter, r *http.Request) {
 	status := k8s.GetConnectionStatus()
 	if b.entryFunc != nil {
 		// Pool-entry broadcaster: always connected (entries only exist post-connect).
-		status = k8s.ConnectionStatus{State: k8s.StateConnected}
+		status = k8s.ConnectionStatus{State: k8s.StateConnected, Context: b.contextName}
 	}
 	connData, err := json.Marshal(map[string]any{
 		"state":           status.State,

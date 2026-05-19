@@ -630,7 +630,7 @@ func (s *Server) broadcasterFor(username string) *SSEBroadcaster {
 	if !loaded || val == nil {
 		// Create and start a new broadcaster for this context.
 		entryFunc := func() *k8s.PoolEntry { return s.pool.EntryForUser(username) }
-		b := NewSSEBroadcasterFor(entryFunc)
+		b := NewSSEBroadcasterFor(contextName, entryFunc)
 		b.Start()
 		s.entryBroadcasters.Store(contextName, b)
 		return b
