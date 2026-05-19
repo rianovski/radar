@@ -20,6 +20,16 @@ func handleListContexts(ctx context.Context, req *mcp.CallToolRequest, _ listCon
 	if err != nil {
 		return nil, nil, err
 	}
+	// When the pool is active, override IsCurrent to reflect the per-user
+	// context rather than the global kubeconfig current context.
+	if mcpPool != nil {
+		userCtx := mcpPool.ContextForUser(mcpUsername(ctx))
+		if userCtx != "" {
+			for i := range contexts {
+				contexts[i].IsCurrent = contexts[i].Name == userCtx
+			}
+		}
+	}
 	return toJSONResult(contexts)
 }
 
