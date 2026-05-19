@@ -20,9 +20,48 @@ import (
 	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/internal/search"
 	"github.com/skyhook-io/radar/internal/timeline"
+	"github.com/skyhook-io/radar/pkg/auth"
 	aicontext "github.com/skyhook-io/radar/pkg/ai/context"
 	topology "github.com/skyhook-io/radar/pkg/topology"
 )
+
+// mcpPool is set at handler registration time. It is never mutated after startup.
+var mcpPool *k8s.CachePool
+
+func mcpUsername(ctx context.Context) string {
+	if user := auth.UserFromContext(ctx); user != nil {
+		return user.Username
+	}
+	return ""
+}
+
+func mcpEntry(ctx context.Context) *k8s.PoolEntry {
+	if mcpPool != nil {
+		return mcpPool.EntryForUser(mcpUsername(ctx))
+	}
+	return nil
+}
+
+func mcpCache(ctx context.Context) *k8s.ResourceCache {
+	if e := mcpEntry(ctx); e != nil {
+		return e.Cache
+	}
+	return k8s.GetResourceCache()
+}
+
+func mcpDynCache(ctx context.Context) *k8s.DynamicResourceCache {
+	if e := mcpEntry(ctx); e != nil {
+		return e.DynCache
+	}
+	return k8s.GetDynamicResourceCache()
+}
+
+func mcpDiscovery(ctx context.Context) *k8s.ResourceDiscovery {
+	if e := mcpEntry(ctx); e != nil {
+		return e.Discovery
+	}
+	return k8s.GetResourceDiscovery()
+}
 
 // logToolCall logs an MCP tool invocation with colored formatting for terminal visibility.
 func logToolCall[In any](name string, handler func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, any, error)) func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, any, error) {
@@ -41,7 +80,8 @@ func logToolCall[In any](name string, handler func(context.Context, *mcp.CallToo
 	}
 }
 
-func registerTools(server *mcp.Server, authMode string) {
+func registerTools(server *mcp.Server, pool *k8s.CachePool) {
+	mcpPool = pool
 	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true}
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -107,14 +147,13 @@ func registerTools(server *mcp.Server, authMode string) {
 		Annotations: readOnly,
 	}, logToolCall("list_contexts", handleListContexts))
 
-	// switch_context performs a global reconnect that disrupts all concurrent users.
-	// Only safe in single-user (no-auth) mode.
-	if authMode == "none" {
-		mcp.AddTool(server, &mcp.Tool{
-			Name:        "switch_context",
-			Description: "Switch the active Kubernetes context. All subsequent tool calls will target the new cluster. Use list_contexts first to see available context names.",
-		}, logToolCall("switch_context", handleSwitchContext))
-	}
+	// switch_context is always available: when the pool is set it switches only
+	// the requesting user's context; without a pool it falls back to the global
+	// reconnect (single-user / no-auth mode only).
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "switch_context",
+		Description: "Switch the active Kubernetes context. All subsequent tool calls will target the new cluster. Use list_contexts first to see available context names.",
+	}, logToolCall("switch_context", handleSwitchContext))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "get_changes",
@@ -364,7 +403,7 @@ type issuesInput struct {
 // Tool handlers
 
 func handleGetDashboard(ctx context.Context, req *mcp.CallToolRequest, input dashboardInput) (*mcp.CallToolResult, any, error) {
-	cache := k8s.GetResourceCache()
+	cache := mcpCache(ctx)
 	if cache == nil {
 		return nil, nil, fmt.Errorf("not connected to cluster")
 	}
@@ -386,7 +425,7 @@ func handleGetDashboard(ctx context.Context, req *mcp.CallToolRequest, input das
 }
 
 func handleListResources(ctx context.Context, req *mcp.CallToolRequest, input listResourcesInput) (*mcp.CallToolResult, any, error) {
-	cache := k8s.GetResourceCache()
+	cache := mcpCache(ctx)
 	if cache == nil {
 		return nil, nil, fmt.Errorf("not connected to cluster")
 	}
@@ -512,7 +551,7 @@ func listDynamicResources(ctx context.Context, cache *k8s.ResourceCache, kind, g
 }
 
 func handleGetResource(ctx context.Context, req *mcp.CallToolRequest, input getResourceInput) (*mcp.CallToolResult, any, error) {
-	cache := k8s.GetResourceCache()
+	cache := mcpCache(ctx)
 	if cache == nil {
 		return nil, nil, fmt.Errorf("not connected to cluster")
 	}
@@ -625,15 +664,15 @@ func attachResourceExtras(ctx context.Context, cache *k8s.ResourceCache, result 
 		if namespace != "" {
 			opts.Namespaces = []string{namespace}
 		}
-		builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(k8s.GetResourceCache())).WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+		builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(mcpCache(ctx))).WithDynamic(k8s.NewTopologyDynamicProvider(mcpDynCache(ctx), mcpDiscovery(ctx)))
 		topo, err := builder.Build(opts)
 		if err != nil {
 			log.Printf("[mcp] Failed to build topology for relationships %s/%s/%s: %v", kind, namespace, name, err)
 		} else {
 			displayKind := normalizeDisplayKind(kind)
 			if rels := topology.GetRelationships(displayKind, namespace, name, topo,
-				k8s.NewTopologyResourceProvider(k8s.GetResourceCache()),
-				k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery())); rels != nil {
+				k8s.NewTopologyResourceProvider(mcpCache(ctx)),
+				k8s.NewTopologyDynamicProvider(mcpDynCache(ctx), mcpDiscovery(ctx))); rels != nil {
 				result["relationships"] = rels
 			}
 		}
@@ -833,7 +872,7 @@ func handleGetTopology(ctx context.Context, req *mcp.CallToolRequest, input topo
 		opts.ViewMode = topology.ViewModeTraffic
 	}
 
-	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(k8s.GetResourceCache())).WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(mcpCache(ctx))).WithDynamic(k8s.NewTopologyDynamicProvider(mcpDynCache(ctx), mcpDiscovery(ctx)))
 	topo, err := builder.Build(opts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to build topology: %w", err)
@@ -1080,7 +1119,7 @@ func nodeNamespace(n *topology.Node) string {
 }
 
 func handleGetEvents(ctx context.Context, req *mcp.CallToolRequest, input eventsInput) (*mcp.CallToolResult, any, error) {
-	cache := k8s.GetResourceCache()
+	cache := mcpCache(ctx)
 	if cache == nil {
 		return nil, nil, fmt.Errorf("not connected to cluster")
 	}
@@ -1193,7 +1232,7 @@ func handleGetPodLogs(ctx context.Context, req *mcp.CallToolRequest, input podLo
 }
 
 func handleListNamespaces(ctx context.Context, req *mcp.CallToolRequest, input struct{}) (*mcp.CallToolResult, any, error) {
-	cache := k8s.GetResourceCache()
+	cache := mcpCache(ctx)
 	if cache == nil {
 		return nil, nil, fmt.Errorf("not connected to cluster")
 	}
@@ -1396,7 +1435,7 @@ func buildDashboard(ctx context.Context, cache *k8s.ResourceCache, namespace str
 	}
 
 	// CAPI problems (Cluster API resources)
-	for _, p := range k8s.DetectCAPIProblems(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery(), namespace) {
+	for _, p := range k8s.DetectCAPIProblems(mcpDynCache(ctx), mcpDiscovery(ctx), namespace) {
 		if len(d.Problems) >= 10 {
 			break
 		}
@@ -1604,7 +1643,7 @@ func buildDashboard(ctx context.Context, cache *k8s.ResourceCache, namespace str
 		if namespace != "" {
 			opts.Namespaces = []string{namespace}
 		}
-		builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(k8s.GetResourceCache())).WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+		builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(mcpCache(ctx))).WithDynamic(k8s.NewTopologyDynamicProvider(mcpDynCache(ctx), mcpDiscovery(ctx)))
 		if topo, err := builder.Build(opts); err == nil {
 			d.TopologyNodes = len(topo.Nodes)
 			d.TopologyEdges = len(topo.Edges)

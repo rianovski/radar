@@ -801,6 +801,16 @@ func CheckResourcePermissions(ctx context.Context) *PermissionCheckResult {
 	return result
 }
 
+// CheckPermissionsForDynClient runs resource-access probes using an explicit
+// dynamic client instead of the global singleton. Used by CachePool when
+// building an independent cluster connection for a pool-managed context.
+// scopeNs is the kubeconfig context's default namespace used as a fallback
+// when cluster-wide list access is denied.
+func CheckPermissionsForDynClient(ctx context.Context, dyn dynamic.Interface, scopeNs string) *PermissionCheckResult {
+	result, _ := probeResourceAccess(ctx, dyn, scopeNs, false)
+	return result
+}
+
 // probeResourceAccess is the testable inner of CheckResourcePermissions.
 // It does the actual probing with the supplied dynamic client and namespace,
 // with no caching and no global state. The returned bool is true when at

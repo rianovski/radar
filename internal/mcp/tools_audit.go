@@ -7,7 +7,6 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/skyhook-io/radar/internal/audit"
-	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/internal/settings"
 	bp "github.com/skyhook-io/radar/pkg/audit"
 )
@@ -43,7 +42,7 @@ type auditFinding struct {
 }
 
 func handleGetAudit(ctx context.Context, req *mcp.CallToolRequest, input auditInput) (*mcp.CallToolResult, any, error) {
-	cache := k8s.GetResourceCache()
+	cache := mcpCache(ctx)
 	if cache == nil {
 		return nil, nil, fmt.Errorf("not connected to cluster")
 	}

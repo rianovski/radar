@@ -279,6 +279,49 @@ func recordK8sEventToTimeline(obj any) {
 	}
 }
 
+func recordK8sEventToTimelineWithCache(obj any, cache *ResourceCache) {
+	event, ok := obj.(*corev1.Event)
+	if !ok {
+		return
+	}
+	store := timeline.GetStore()
+	if store == nil {
+		return
+	}
+	if DebugEvents {
+		timeline.IncrementReceived("K8sEvent:" + event.InvolvedObject.Kind)
+	}
+	var owner *timeline.OwnerInfo
+	if cache != nil {
+		if event.InvolvedObject.Kind == "Pod" && cache.Pods() != nil {
+			if pod, err := cache.Pods().Pods(event.Namespace).Get(event.InvolvedObject.Name); err == nil && pod != nil {
+				for _, ref := range pod.OwnerReferences {
+					if ref.Controller != nil && *ref.Controller {
+						owner = &timeline.OwnerInfo{Kind: ref.Kind, Name: ref.Name}
+						break
+					}
+				}
+			}
+		} else if event.InvolvedObject.Kind == "ReplicaSet" && cache.ReplicaSets() != nil {
+			if rs, err := cache.ReplicaSets().ReplicaSets(event.Namespace).Get(event.InvolvedObject.Name); err == nil && rs != nil {
+				for _, ref := range rs.OwnerReferences {
+					if ref.Controller != nil && *ref.Controller {
+						owner = &timeline.OwnerInfo{Kind: ref.Kind, Name: ref.Name}
+						break
+					}
+				}
+			}
+		}
+	}
+	timelineEvent := timeline.NewK8sEventTimelineEvent(event, owner)
+	ctx := context.Background()
+	if err := timeline.RecordEventWithBroadcast(ctx, timelineEvent); err != nil {
+		log.Printf("Warning: failed to record K8s event to timeline store: %v", err)
+	} else if DebugEvents {
+		timeline.IncrementRecorded("K8sEvent:" + event.InvolvedObject.Kind)
+	}
+}
+
 // emitSyncProgress is the SyncProgress callback wired into the resource
 // cache. It keeps the connection's progressMessage in step with the live
 // informer-sync count so the connecting screen ticks up instead of

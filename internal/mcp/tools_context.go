@@ -30,6 +30,18 @@ func handleSwitchContext(ctx context.Context, req *mcp.CallToolRequest, input sw
 	if k8s.IsInCluster() {
 		return nil, nil, fmt.Errorf("cannot switch context when running in-cluster")
 	}
+	// Pool-based per-user switch: only affects the requesting user's context.
+	if mcpPool != nil {
+		username := mcpUsername(ctx)
+		if err := mcpPool.Switch(ctx, username, input.Name); err != nil {
+			return nil, nil, err
+		}
+		return toJSONResult(map[string]string{
+			"status":  "ok",
+			"context": input.Name,
+		})
+	}
+	// Global switch fallback (single-user / no-auth mode).
 	if err := k8s.PerformContextSwitch(input.Name); err != nil {
 		k8s.SetConnectionStatus(k8s.ConnectionStatus{
 			State:   k8s.StateDisconnected,

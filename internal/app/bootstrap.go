@@ -48,6 +48,10 @@ type AppConfig struct {
 	AuthConfig           auth.Config
 }
 
+// appPool is created in CreateServer and seeded after InitAllSubsystems completes.
+// Shared between CreateServer (wires MCP + HTTP server) and InitializeCluster (seeds default entry).
+var appPool *k8s.CachePool
+
 // SetGlobals applies debug/test flags to global state.
 func SetGlobals(cfg AppConfig) {
 	k8s.DebugEvents = cfg.DebugEvents
@@ -179,8 +183,15 @@ func CreateServer(cfg AppConfig) *server.Server {
 		AuthConfig: cfg.AuthConfig,
 	}
 
+	// Pool is only useful for multi-context switching; skip for in-cluster deployments
+	// (context switching is disabled there). Created early so both MCP and HTTP
+	// server point to the same instance. Seeded after InitAllSubsystems (below).
+	if !k8s.IsInCluster() {
+		appPool = k8s.NewCachePool(k8s.GetContextName(), nil)
+	}
+
 	if cfg.MCPEnabled {
-		serverCfg.MCPHandler = mcppkg.NewHandler(cfg.AuthConfig.Mode)
+		serverCfg.MCPHandler = mcppkg.NewHandler(appPool)
 		if cfg.Port != 0 {
 			log.Printf("MCP server enabled at http://localhost:%d/mcp", cfg.Port)
 		} else {
@@ -188,7 +199,9 @@ func CreateServer(cfg AppConfig) *server.Server {
 		}
 	}
 
-	return server.New(serverCfg)
+	srv := server.New(serverCfg)
+	srv.SetPool(appPool)
+	return srv
 }
 
 // InitializeCluster connects to the cluster and initializes all subsystems.
@@ -305,6 +318,17 @@ func InitializeCluster() {
 		Context:     k8s.GetContextName(),
 		ClusterName: k8s.GetClusterName(),
 	})
+
+	// Seed the pool with the default context entry so it's reference-counted
+	// from the start. The cancel is a no-op because the global subsystems own
+	// the informer lifecycle — pool teardown only applies to non-default entries.
+	if appPool != nil {
+		appPool.Seed(k8s.GetContextName(), k8s.PoolEntry{
+			Cache:     k8s.GetResourceCache(),
+			DynCache:  k8s.GetDynamicResourceCache(),
+			Discovery: k8s.GetResourceDiscovery(),
+		}, func() {})
+	}
 
 	// Auto-discover Prometheus in the background so charts are ready immediately
 	go func() {

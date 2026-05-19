@@ -5,15 +5,14 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/internal/version"
 )
 
 // NewHandler creates the MCP server, registers all tools and resources,
 // and returns an http.Handler to mount on chi.
-// authMode is the value of --auth-mode ("none", "proxy", or "oidc").
-// switch_context is omitted when auth is enabled because it performs a
-// global context switch that disrupts all concurrent users.
-func NewHandler(authMode string) http.Handler {
+// pool enables per-user context isolation; pass nil for single-user/no-auth mode.
+func NewHandler(pool *k8s.CachePool) http.Handler {
 	server := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "radar",
@@ -22,7 +21,7 @@ func NewHandler(authMode string) http.Handler {
 		nil,
 	)
 
-	registerTools(server, authMode)
+	registerTools(server, pool)
 	registerResources(server)
 
 	handler := mcp.NewStreamableHTTPHandler(

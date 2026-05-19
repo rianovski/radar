@@ -75,7 +75,7 @@ func handleResourceHealth(ctx context.Context, req *mcp.ReadResourceRequest) (*m
 	if blocked, ok := requireClusterAdminAccess(ctx, "cluster://health"); ok {
 		return blocked, nil
 	}
-	cache := k8s.GetResourceCache()
+	cache := mcpCache(ctx)
 	if cache == nil {
 		return jsonErrorResource("cluster://health", "not connected to cluster"), nil
 	}
@@ -91,7 +91,7 @@ func handleResourceTopology(ctx context.Context, req *mcp.ReadResourceRequest) (
 		return blocked, nil
 	}
 	opts := topology.DefaultBuildOptions()
-	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(k8s.GetResourceCache())).WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(mcpCache(ctx))).WithDynamic(k8s.NewTopologyDynamicProvider(mcpDynCache(ctx), mcpDiscovery(ctx)))
 	topo, err := builder.Build(opts)
 	if err != nil {
 		return jsonErrorResource("cluster://topology", err.Error()), nil
@@ -105,7 +105,7 @@ func handleResourceEvents(ctx context.Context, req *mcp.ReadResourceRequest) (*m
 	if blocked, ok := requireClusterAdminAccess(ctx, "cluster://events"); ok {
 		return blocked, nil
 	}
-	cache := k8s.GetResourceCache()
+	cache := mcpCache(ctx)
 	if cache == nil {
 		return jsonErrorResource("cluster://events", "not connected to cluster"), nil
 	}

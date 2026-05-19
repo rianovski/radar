@@ -78,6 +78,14 @@ type Server struct {
 	// (page-load tree+insights, in-flight 2s polling, dashboard widgets)
 	// without user-visible staleness — controllers reconcile far slower.
 	topoMemo *topology.Memoizer
+
+	// pool manages per-user cluster connections. Nil when running in-cluster
+	// (no context switching possible) or before SetPool is called.
+	pool *k8s.CachePool
+
+	// entryBroadcasters holds one SSEBroadcaster per non-default pool context.
+	// Key: context name (string), value: *SSEBroadcaster.
+	entryBroadcasters sync.Map
 }
 
 // Config holds server configuration
@@ -558,6 +566,82 @@ func (s *Server) Handler() http.Handler {
 	return s.router
 }
 
+// SetPool attaches the CachePool so REST and SSE handlers can route to the
+// correct per-user cluster connection. Call this after the pool is seeded
+// (i.e. after InitAllSubsystems returns).
+func (s *Server) SetPool(pool *k8s.CachePool) {
+	s.pool = pool
+}
+
+// usernameFrom extracts the username string from a request context.
+// Returns "" for unauthenticated requests (maps to default context in the pool).
+func usernameFrom(r *http.Request) string {
+	if user := auth.UserFromContext(r.Context()); user != nil {
+		return user.Username
+	}
+	return ""
+}
+
+// entryFor returns the pool entry for the requesting user, or nil when the
+// pool is not configured or no entry exists yet.
+func (s *Server) entryFor(r *http.Request) *k8s.PoolEntry {
+	if s.pool == nil {
+		return nil
+	}
+	return s.pool.EntryForUser(usernameFrom(r))
+}
+
+// cacheFor returns the resource cache for the requesting user.
+func (s *Server) cacheFor(r *http.Request) *k8s.ResourceCache {
+	if e := s.entryFor(r); e != nil {
+		return e.Cache
+	}
+	return k8s.GetResourceCache()
+}
+
+// dynCacheFor returns the dynamic resource cache for the requesting user.
+func (s *Server) dynCacheFor(r *http.Request) *k8s.DynamicResourceCache {
+	if e := s.entryFor(r); e != nil {
+		return e.DynCache
+	}
+	return k8s.GetDynamicResourceCache()
+}
+
+// discoveryFor returns the resource discovery for the requesting user.
+func (s *Server) discoveryFor(r *http.Request) *k8s.ResourceDiscovery {
+	if e := s.entryFor(r); e != nil {
+		return e.Discovery
+	}
+	return k8s.GetResourceDiscovery()
+}
+
+// broadcasterFor returns the SSEBroadcaster for the given user's active context.
+// For the default context it returns the global broadcaster. For other contexts
+// it lazily creates and starts a per-context broadcaster backed by the pool entry.
+func (s *Server) broadcasterFor(username string) *SSEBroadcaster {
+	if s.pool == nil {
+		return s.broadcaster
+	}
+	contextName := s.pool.ContextForUser(username)
+	if contextName == "" || contextName == k8s.GetContextName() {
+		return s.broadcaster
+	}
+	val, loaded := s.entryBroadcasters.LoadOrStore(contextName, (*SSEBroadcaster)(nil))
+	if !loaded || val == nil {
+		// Create and start a new broadcaster for this context.
+		entryFunc := func() *k8s.PoolEntry { return s.pool.EntryForUser(username) }
+		b := NewSSEBroadcasterFor(entryFunc)
+		b.Start()
+		s.entryBroadcasters.Store(contextName, b)
+		return b
+	}
+	if b, ok := val.(*SSEBroadcaster); ok && b != nil {
+		return b
+	}
+	// Stored value is nil (lost the race above) — use global as fallback.
+	return s.broadcaster
+}
+
 // Stop gracefully stops the server and releases the listening port.
 func (s *Server) Stop() {
 	StopAllLocalTermSessions()
@@ -861,7 +945,7 @@ var clusterScopedTopologyKinds = []struct {
 // unknown-kind passthrough.
 func (s *Server) deniedClusterScopedTopoKinds(r *http.Request) map[topology.NodeKind]bool {
 	deny := make(map[topology.NodeKind]bool)
-	disc := k8s.GetResourceDiscovery()
+	disc := s.discoveryFor(r)
 	for _, ck := range clusterScopedTopologyKinds {
 		if ck.group != "" && disc != nil {
 			if _, ok := disc.GetResourceWithGroup(ck.resource, ck.group); !ok {
@@ -926,7 +1010,7 @@ func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 		opts.ShowPolicyEffect = true
 	}
 
-	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(k8s.GetResourceCache())).WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(s.cacheFor(r))).WithDynamic(k8s.NewTopologyDynamicProvider(s.dynCacheFor(r), s.discoveryFor(r)))
 	topo, err := builder.Build(opts)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
@@ -949,7 +1033,7 @@ func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
 	}
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
@@ -1015,7 +1099,7 @@ func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAPIResources(w http.ResponseWriter, r *http.Request) {
-	discovery := k8s.GetResourceDiscovery()
+	discovery := s.discoveryFor(r)
 	if discovery == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource discovery not available")
 		return
@@ -1104,7 +1188,7 @@ func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
@@ -1513,7 +1597,7 @@ func (s *Server) handleGetResource(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
@@ -1559,10 +1643,10 @@ func (s *Server) handleGetResource(w http.ResponseWriter, r *http.Request) {
 
 		// Get relationships from cached topology
 		var relationships *topology.Relationships
-		if cachedTopo := s.broadcaster.GetCachedTopology(); cachedTopo != nil {
+		if cachedTopo := s.broadcasterFor(usernameFrom(r)).GetCachedTopology(); cachedTopo != nil {
 			relationships = topology.GetRelationships(kind, namespace, name, cachedTopo,
-				k8s.NewTopologyResourceProvider(k8s.GetResourceCache()),
-				k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+				k8s.NewTopologyResourceProvider(s.cacheFor(r)),
+				k8s.NewTopologyDynamicProvider(s.dynCacheFor(r), s.discoveryFor(r)))
 		}
 
 		s.writeJSON(w, topology.ResourceWithRelationships{
@@ -1723,10 +1807,10 @@ func (s *Server) handleGetResource(w http.ResponseWriter, r *http.Request) {
 
 	// Get relationships from cached topology
 	var relationships *topology.Relationships
-	if cachedTopo := s.broadcaster.GetCachedTopology(); cachedTopo != nil {
+	if cachedTopo := s.broadcasterFor(usernameFrom(r)).GetCachedTopology(); cachedTopo != nil {
 		relationships = topology.GetRelationships(kind, namespace, name, cachedTopo,
-			k8s.NewTopologyResourceProvider(k8s.GetResourceCache()),
-			k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+			k8s.NewTopologyResourceProvider(s.cacheFor(r)),
+			k8s.NewTopologyDynamicProvider(s.dynCacheFor(r), s.discoveryFor(r)))
 	}
 
 	// Return resource with relationships
@@ -1860,7 +1944,7 @@ func (s *Server) handleTopPods(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get pod lister from cache to enrich with requests/limits
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil || cache.Pods() == nil {
 		// No cache — return metrics-only data
 		result := make([]k8s.TopPodMetrics, 0, len(metricsMap))
@@ -1934,7 +2018,7 @@ func (s *Server) handleTopNodes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Count running pods per node
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	podCounts := make(map[string]int)
 	if cache != nil {
 		if podLister := cache.Pods(); podLister != nil {
@@ -1999,7 +2083,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	namespaces := s.parseNamespacesForUser(r)
 
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
@@ -2359,8 +2443,8 @@ func (s *Server) handleCascadeDeletePreview(w http.ResponseWriter, r *http.Reque
 		namespace = ""
 	}
 
-	cachedTopo := s.broadcaster.GetCachedTopology()
-	dp := k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery())
+	cachedTopo := s.broadcasterFor(usernameFrom(r)).GetCachedTopology()
+	dp := k8s.NewTopologyDynamicProvider(s.dynCacheFor(r), s.discoveryFor(r))
 	preview := topology.GetCascadeDeletePreview(kind, namespace, name, cachedTopo, dp)
 
 	s.writeJSON(w, preview)
@@ -2715,7 +2799,24 @@ func (s *Server) handleSwitchContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stop all active sessions before switching
+	// Pool-based per-user switch: only affects the requesting user.
+	if s.pool != nil {
+		username := usernameFrom(r)
+		if err := s.pool.Switch(r.Context(), username, name); err != nil {
+			s.writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// Notify only this user's SSE stream that the context changed so the
+		// frontend closes and reopens its EventSource, routing to the new context.
+		s.broadcasterFor(username).Broadcast(SSEEvent{
+			Event: "context_changed",
+			Data:  map[string]any{"context": name},
+		})
+		s.writeJSON(w, map[string]string{"status": "ok", "context": name})
+		return
+	}
+
+	// Global switch (no pool, or in-cluster fallback): affects all users.
 	StopAllSessions()
 
 	if err := k8s.PerformContextSwitch(name); err != nil {
@@ -3098,7 +3199,7 @@ func (s *Server) getUserNamespaces(r *http.Request, requested []string) []string
 
 		// Get all namespace names from cache
 		var allNamespaces []string
-		if cache := k8s.GetResourceCache(); cache != nil {
+		if cache := s.cacheFor(r); cache != nil {
 			if nsLister := cache.Namespaces(); nsLister != nil {
 				nsList, _ := nsLister.List(labels.Everything())
 				for _, ns := range nsList {
@@ -3158,7 +3259,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	r.URL.RawQuery = q.Encode()
-	s.broadcaster.HandleSSE(w, r)
+	s.broadcasterFor(usernameFrom(r)).HandleSSE(w, r)
 }
 
 // Settings handlers

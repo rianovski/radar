@@ -40,6 +40,11 @@ type SSEBroadcaster struct {
 	// topology broadcasts use longer debounce and skip the expensive full-topology
 	// cache build. Protected by watchMu (same as watchStopCh).
 	warmupDone chan struct{}
+
+	// entryFunc resolves the pool entry for this broadcaster. When non-nil, cache
+	// lookups use the pool entry instead of global singletons, and global
+	// context-switch/connection-state callbacks are not registered.
+	entryFunc func() *k8s.PoolEntry
 }
 
 // ClientInfo stores information about a connected client
@@ -86,21 +91,61 @@ func NewSSEBroadcaster() *SSEBroadcaster {
 	}
 }
 
+// NewSSEBroadcasterFor creates a broadcaster backed by a pool entry instead of
+// global singletons. The entryFunc is called on each cache access so it always
+// reflects the current pool entry state. Global context-switch and
+// connection-state callbacks are not registered — the pool entry is already
+// connected and has a fixed context lifetime.
+func NewSSEBroadcasterFor(entryFunc func() *k8s.PoolEntry) *SSEBroadcaster {
+	b := NewSSEBroadcaster()
+	b.entryFunc = entryFunc
+	return b
+}
+
+func (b *SSEBroadcaster) getCache() *k8s.ResourceCache {
+	if b.entryFunc != nil {
+		if e := b.entryFunc(); e != nil {
+			return e.Cache
+		}
+		return nil
+	}
+	return k8s.GetResourceCache()
+}
+
+func (b *SSEBroadcaster) getDynCache() *k8s.DynamicResourceCache {
+	if b.entryFunc != nil {
+		if e := b.entryFunc(); e != nil {
+			return e.DynCache
+		}
+		return nil
+	}
+	return k8s.GetDynamicResourceCache()
+}
+
+func (b *SSEBroadcaster) getDiscovery() *k8s.ResourceDiscovery {
+	if b.entryFunc != nil {
+		if e := b.entryFunc(); e != nil {
+			return e.Discovery
+		}
+		return nil
+	}
+	return k8s.GetResourceDiscovery()
+}
+
 // Start begins the broadcaster's main loop
 func (b *SSEBroadcaster) Start() {
-	// Build initial topology cache (only if connected)
-	if k8s.IsConnected() {
+	// Pool-entry broadcasters are always connected; global broadcaster needs IsConnected check.
+	if b.entryFunc != nil || k8s.IsConnected() {
 		b.initCachedTopology()
 	}
 
-	// Register for context switch notifications
-	b.registerContextSwitchCallback()
-
-	// Register for connection state changes (for graceful startup)
-	b.registerConnectionStateCallback()
-
-	// Register for CRD discovery completion
-	b.registerCRDDiscoveryCallback()
+	// Global callbacks only apply to the default broadcaster.
+	// Pool-entry broadcasters have a fixed context and are already connected.
+	if b.entryFunc == nil {
+		b.registerContextSwitchCallback()
+		b.registerConnectionStateCallback()
+		b.registerCRDDiscoveryCallback()
+	}
 
 	go b.run()
 	go b.watchResourceChanges()
@@ -143,7 +188,7 @@ func (b *SSEBroadcaster) watchDeferredSync() {
 
 	// Wait for cache to exist first
 	for {
-		cache := k8s.GetResourceCache()
+		cache := b.getCache()
 		if cache != nil {
 			ch := cache.DeferredDone()
 			if ch == nil {
@@ -152,7 +197,7 @@ func (b *SSEBroadcaster) watchDeferredSync() {
 			select {
 			case <-ch:
 				// Verify cache is still current (not torn down by context switch)
-				if k8s.GetResourceCache() == nil {
+				if b.getCache() == nil {
 					return
 				}
 				log.Printf("SSE broadcaster: deferred informers synced, broadcasting topology update")
@@ -272,7 +317,7 @@ func (b *SSEBroadcaster) registerContextSwitchCallback() {
 
 // initCachedTopology builds the initial topology cache
 func (b *SSEBroadcaster) initCachedTopology() {
-	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(k8s.GetResourceCache())).WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(b.getCache())).WithDynamic(k8s.NewTopologyDynamicProvider(b.getDynCache(), b.getDiscovery()))
 	opts := topology.DefaultBuildOptions()
 	opts.ViewMode = topology.ViewModeResources
 	// Include ReplicaSets in the cache so relationship lookups work for them
@@ -356,8 +401,12 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 	watchStop := b.watchStopCh
 	b.watchMu.Unlock()
 
-	cache := k8s.GetResourceCache()
+	cache := b.getCache()
 	if cache == nil {
+		if b.entryFunc != nil {
+			// Pool-entry broadcaster: entry was torn down before watcher started.
+			return
+		}
 		// Cache not ready yet — wait for connection to be established
 		log.Println("SSE broadcaster: cache not ready, waiting for connection...")
 		ch := make(chan struct{}, 1)
@@ -386,7 +435,7 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 		}
 		select {
 		case <-ch:
-			cache = k8s.GetResourceCache()
+			cache = b.getCache()
 			if cache == nil {
 				log.Println("Warning: Resource cache still nil after connection")
 				return
@@ -491,7 +540,7 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 func (b *SSEBroadcaster) broadcastTopologyUpdate() {
 	// Skip if resource cache is torn down (e.g. during context switch).
 	// The next successful connection will trigger a fresh build.
-	if k8s.GetResourceCache() == nil {
+	if b.getCache() == nil {
 		return
 	}
 
@@ -519,14 +568,14 @@ func (b *SSEBroadcaster) broadcastTopologyUpdate() {
 		b.cachedTopologyDirty = true
 		b.cachedTopologyMu.Unlock()
 	} else {
-		if fullTopo, err := buildFullTopology(); err == nil {
+		if fullTopo, err := b.buildFullTopology(); err == nil {
 			b.updateCachedTopology(fullTopo)
 		} else {
 			log.Printf("Error building full topology for cache: %v", err)
 		}
 	}
 
-	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(k8s.GetResourceCache())).WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(b.getCache())).WithDynamic(k8s.NewTopologyDynamicProvider(b.getDynCache(), b.getDiscovery()))
 
 	// Group clients by namespace filter + viewMode
 	// Use comma-separated namespaces string as map key since slices aren't comparable
@@ -655,7 +704,7 @@ func (b *SSEBroadcaster) GetCachedTopology() *topology.Topology {
 	topo := b.cachedTopology
 	b.cachedTopologyMu.RUnlock()
 
-	if dirty && k8s.GetResourceCache() != nil {
+	if dirty && b.getCache() != nil {
 		// Gate: only one goroutine proceeds to rebuild
 		b.cachedTopologyMu.Lock()
 		if !b.cachedTopologyDirty {
@@ -683,11 +732,10 @@ func (b *SSEBroadcaster) GetCachedTopology() *topology.Topology {
 // rebuildCachedTopology rebuilds the full topology for relationship lookups.
 // Returns true if the rebuild succeeded, false otherwise.
 func (b *SSEBroadcaster) rebuildCachedTopology() bool {
-	cache := k8s.GetResourceCache()
-	if cache == nil {
+	if b.getCache() == nil {
 		return false
 	}
-	if fullTopo, err := buildFullTopology(); err == nil {
+	if fullTopo, err := b.buildFullTopology(); err == nil {
 		b.updateCachedTopology(fullTopo)
 		return true
 	} else {
@@ -706,8 +754,8 @@ func (b *SSEBroadcaster) updateCachedTopology(topo *topology.Topology) {
 
 // buildFullTopology constructs a full topology (all namespaces, resources view)
 // for relationship lookups. Used by both broadcast and lazy rebuild paths.
-func buildFullTopology() (*topology.Topology, error) {
-	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(k8s.GetResourceCache())).WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+func (b *SSEBroadcaster) buildFullTopology() (*topology.Topology, error) {
+	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(b.getCache())).WithDynamic(k8s.NewTopologyDynamicProvider(b.getDynCache(), b.getDiscovery()))
 	opts := topology.DefaultBuildOptions()
 	opts.ViewMode = topology.ViewModeResources
 	opts.IncludeReplicaSets = true
@@ -748,6 +796,10 @@ func (b *SSEBroadcaster) HandleSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Send current connection state immediately so client knows current status
 	status := k8s.GetConnectionStatus()
+	if b.entryFunc != nil {
+		// Pool-entry broadcaster: always connected (entries only exist post-connect).
+		status = k8s.ConnectionStatus{State: k8s.StateConnected}
+	}
 	connData, err := json.Marshal(map[string]any{
 		"state":           status.State,
 		"context":         status.Context,
@@ -763,7 +815,7 @@ func (b *SSEBroadcaster) HandleSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Send initial topology immediately (only if connected)
 	if status.State == k8s.StateConnected {
-		builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(k8s.GetResourceCache())).WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+		builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(b.getCache())).WithDynamic(k8s.NewTopologyDynamicProvider(b.getDynCache(), b.getDiscovery()))
 		opts := topology.DefaultBuildOptions()
 		opts.Namespaces = namespaces
 		if viewMode == "traffic" {
