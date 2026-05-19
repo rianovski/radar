@@ -519,6 +519,9 @@ function AppInner() {
     timer: number | null
   }>({ kinds: new Set(), hasCountChange: false, timer: null })
 
+  // Holds reconnectSSE so onContextChanged (defined inside useEventSource) can call it.
+  const reconnectSSERef = useRef<(() => void) | null>(null)
+
   const handleK8sEvent = useCallback((event: K8sEvent) => {
     // Skip K8s Event kind — informational, not resource mutations
     if (event.kind === 'Event') return
@@ -593,6 +596,10 @@ function AppInner() {
       // Auto-unpause so the new cluster's topology loads immediately
       setTopologyPaused(false)
       pendingTopologyRef.current = null
+
+      // Reconnect the SSE stream so it routes to the new context's broadcaster.
+      // Without this, topology events from the new cluster never reach the UI.
+      reconnectSSERef.current?.()
     },
     onConnectionStateChange: updateConnectionFromSSE,
     onDeferredReady: () => {
@@ -602,6 +609,7 @@ function AppInner() {
     },
     onK8sEvent: handleK8sEvent,
   }, forceNamespaceFilter, showPolicyEffect)
+  reconnectSSERef.current = reconnectSSE
   const [reconnect, isReconnecting] = useRefreshAnimation(reconnectSSE)
 
   // On large clusters (where the server requires namespace filtering), keep

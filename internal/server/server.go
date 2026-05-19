@@ -2802,13 +2802,17 @@ func (s *Server) handleSwitchContext(w http.ResponseWriter, r *http.Request) {
 	// Pool-based per-user switch: only affects the requesting user.
 	if s.pool != nil {
 		username := usernameFrom(r)
+		// Capture the broadcaster the user is currently connected to BEFORE
+		// switching — pool.Switch changes ContextForUser, so broadcasterFor
+		// would resolve to the new context's broadcaster after the call.
+		prevBroadcaster := s.broadcasterFor(username)
 		if err := s.pool.Switch(r.Context(), username, name); err != nil {
 			s.writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		// Notify only this user's SSE stream that the context changed so the
-		// frontend closes and reopens its EventSource, routing to the new context.
-		s.broadcasterFor(username).Broadcast(SSEEvent{
+		// Notify on the old broadcaster so the user's active SSE stream
+		// receives the event and triggers an EventSource reconnect.
+		prevBroadcaster.Broadcast(SSEEvent{
 			Event: "context_changed",
 			Data:  map[string]any{"context": name},
 		})
@@ -2856,9 +2860,21 @@ func (s *Server) handleConnectionStatus(w http.ResponseWriter, r *http.Request) 
 	status := k8s.GetConnectionStatus()
 	contexts, _ := k8s.GetAvailableContexts() // Always works (reads kubeconfig)
 
+	// Per-user override: when the pool is active, report the user's context
+	// rather than the global default so the UI header stays accurate after a switch.
+	contextName := status.Context
+	if s.pool != nil {
+		if userCtx := s.pool.ContextForUser(usernameFrom(r)); userCtx != "" {
+			contextName = userCtx
+			for i := range contexts {
+				contexts[i].IsCurrent = contexts[i].Name == userCtx
+			}
+		}
+	}
+
 	s.writeJSON(w, map[string]any{
 		"state":           status.State,
-		"context":         status.Context,
+		"context":         contextName,
 		"clusterName":     status.ClusterName,
 		"error":           status.Error,
 		"errorType":       status.ErrorType,
