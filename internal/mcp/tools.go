@@ -41,7 +41,7 @@ func logToolCall[In any](name string, handler func(context.Context, *mcp.CallToo
 	}
 }
 
-func registerTools(server *mcp.Server) {
+func registerTools(server *mcp.Server, authMode string) {
 	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true}
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -107,10 +107,14 @@ func registerTools(server *mcp.Server) {
 		Annotations: readOnly,
 	}, logToolCall("list_contexts", handleListContexts))
 
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "switch_context",
-		Description: "Switch the active Kubernetes context. All subsequent tool calls will target the new cluster. Use list_contexts first to see available context names.",
-	}, logToolCall("switch_context", handleSwitchContext))
+	// switch_context performs a global reconnect that disrupts all concurrent users.
+	// Only safe in single-user (no-auth) mode.
+	if authMode == "none" {
+		mcp.AddTool(server, &mcp.Tool{
+			Name:        "switch_context",
+			Description: "Switch the active Kubernetes context. All subsequent tool calls will target the new cluster. Use list_contexts first to see available context names.",
+		}, logToolCall("switch_context", handleSwitchContext))
+	}
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "get_changes",

@@ -180,7 +180,7 @@ func CreateServer(cfg AppConfig) *server.Server {
 	}
 
 	if cfg.MCPEnabled {
-		serverCfg.MCPHandler = mcppkg.NewHandler()
+		serverCfg.MCPHandler = mcppkg.NewHandler(cfg.AuthConfig.Mode)
 		if cfg.Port != 0 {
 			log.Printf("MCP server enabled at http://localhost:%d/mcp", cfg.Port)
 		} else {

@@ -3,7 +3,6 @@ package auth
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -72,6 +71,10 @@ func NewAPIKeyStore(path string) (*APIKeyStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("create api_keys table: %w", err)
 	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS api_keys_hash ON api_keys (hash)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create api_keys_hash index: %w", err)
+	}
 
 	return &APIKeyStore{db: db, path: path}, nil
 }
@@ -97,27 +100,15 @@ func randHex(n int) (string, error) {
 // Lookup finds the key matching plaintext. Returns nil if not found.
 // Updates last_used_at asynchronously on a hit.
 func (s *APIKeyStore) Lookup(plaintext string) *APIKey {
-	want := hashKey(plaintext)
-
-	rows, err := s.db.Query(`SELECT id, description, hash, username, groups, created_at, last_used_at FROM api_keys`)
+	row := s.db.QueryRow(
+		`SELECT id, description, hash, username, groups, created_at, last_used_at FROM api_keys WHERE hash=?`,
+		hashKey(plaintext),
+	)
+	found, err := scanKey(row)
 	if err != nil {
-		log.Printf("[auth] api key lookup error: %v", err)
-		return nil
-	}
-	defer rows.Close()
-
-	var found *APIKey
-	for rows.Next() {
-		k, err := scanKey(rows)
-		if err != nil {
-			continue
+		if err != sql.ErrNoRows {
+			log.Printf("[auth] api key lookup error: %v", err)
 		}
-		if subtle.ConstantTimeCompare([]byte(k.Hash), []byte(want)) == 1 {
-			found = k
-			break
-		}
-	}
-	if found == nil {
 		return nil
 	}
 

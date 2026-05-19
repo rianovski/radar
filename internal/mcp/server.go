@@ -10,7 +10,10 @@ import (
 
 // NewHandler creates the MCP server, registers all tools and resources,
 // and returns an http.Handler to mount on chi.
-func NewHandler() http.Handler {
+// authMode is the value of --auth-mode ("none", "proxy", or "oidc").
+// switch_context is omitted when auth is enabled because it performs a
+// global context switch that disrupts all concurrent users.
+func NewHandler(authMode string) http.Handler {
 	server := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "radar",
@@ -19,7 +22,7 @@ func NewHandler() http.Handler {
 		nil,
 	)
 
-	registerTools(server)
+	registerTools(server, authMode)
 	registerResources(server)
 
 	handler := mcp.NewStreamableHTTPHandler(
