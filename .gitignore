@@ -38,3 +38,7 @@ web/package.json.md5
 .env
 .env.local
 dist/
+
+# Local deployment & contribution drafts
+deploy.sh
+CONTRIBUTE_API_KEY.md
