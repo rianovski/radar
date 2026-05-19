@@ -1,23 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE="${REMOTE:-a000s-itsentry}"
 REPO_URL="${REPO_URL:-https://tfs.astra.co.id/tfs/CIST/DevSecOps/_git/radar}"
 SRC_DIR="${SRC_DIR:-/opt/radar/src}"
 RADAR_SH="${RADAR_SH:-/opt/radar/radar.sh}"
 GO_VERSION="${GO_VERSION:-1.26.0}"
 NODE_VERSION="${NODE_VERSION:-22}"
-
-echo "→ Deploying radar to ${REMOTE}..."
-
-ssh "$REMOTE" \
-    GO_VERSION="$GO_VERSION" \
-    NODE_VERSION="$NODE_VERSION" \
-    REPO_URL="$REPO_URL" \
-    SRC_DIR="$SRC_DIR" \
-    RADAR_SH="$RADAR_SH" \
-    bash <<'EOF'
-set -euo pipefail
 
 export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"
 
@@ -72,4 +60,3 @@ cp radar "${RADAR_BIN}"
 echo "→ Restarting..."
 "${RADAR_SH}" restart
 echo "✓ Done"
-EOF
