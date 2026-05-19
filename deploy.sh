@@ -50,6 +50,14 @@ echo "→ Building..."
 cd "${SRC_DIR}"
 make build
 
+# ── Smoke test ───────────────────────────────────────────────────────────────
+echo "→ Testing binary..."
+if ! ./radar --version &>/dev/null; then
+    echo "✗ Build smoke test failed — aborting, existing binary untouched"
+    exit 1
+fi
+echo "✓ Binary OK"
+
 # ── Replace binary ───────────────────────────────────────────────────────────
 RADAR_BIN=$(which radar)
 echo "→ Stopping radar..."
