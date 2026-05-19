@@ -2774,7 +2774,13 @@ func (s *Server) handleListContexts(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
+	if s.pool != nil {
+		if userCtx := s.pool.ContextForUser(usernameFrom(r)); userCtx != "" {
+			for i := range contexts {
+				contexts[i].IsCurrent = contexts[i].Name == userCtx
+			}
+		}
+	}
 	s.writeJSON(w, contexts)
 }
 
