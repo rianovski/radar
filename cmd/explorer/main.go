@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -79,6 +80,7 @@ func main() {
 	authOIDCInsecureSkipVerify := flag.Bool("auth-oidc-insecure-skip-verify", false, "Skip TLS certificate verification for OIDC provider (insecure, dev/test only)")
 	authOIDCCACert := flag.String("auth-oidc-ca-cert", "", "Path to CA certificate file for OIDC provider TLS verification")
 	authOIDCBackchannelLogout := flag.Bool("auth-oidc-backchannel-logout", false, "Enable OIDC Back-Channel Logout endpoint (single-replica only)")
+	authAPIKeysFile := flag.String("auth-api-keys-file", "", "Path to API keys JSON file (default: ~/.config/radar/api-keys.json when auth is enabled)")
 	// Radar Cloud flags — enable hosted mode when --cloud-url is set.
 	// Local-binary behavior is unchanged when these flags are empty. Each
 	// flag falls back to an env var so Kubernetes deployments can source
@@ -130,6 +132,13 @@ func main() {
 
 	log.Printf("Radar %s starting...", version)
 
+	// Default API keys file path when auth is enabled
+	if *authAPIKeysFile == "" && *authMode != "none" {
+		if home, err := os.UserHomeDir(); err == nil {
+			*authAPIKeysFile = filepath.Join(home, ".config", "radar", "api-keys.db")
+		}
+	}
+
 	// Validate flags
 	switch *authMode {
 	case "none", "proxy", "oidc":
@@ -139,6 +148,16 @@ func main() {
 	}
 	if *kubeconfig != "" && *kubeconfigDir != "" {
 		log.Fatalf("--kubeconfig and --kubeconfig-dir are mutually exclusive")
+	}
+
+	var apiKeyStore *auth.APIKeyStore
+	if *authAPIKeysFile != "" {
+		var err error
+		apiKeyStore, err = auth.NewAPIKeyStore(*authAPIKeysFile)
+		if err != nil {
+			log.Fatalf("[auth] Failed to load API key store at %q: %v", *authAPIKeysFile, err)
+		}
+		log.Printf("[auth] API key store: %s", *authAPIKeysFile)
 	}
 
 	cfg := app.AppConfig{
@@ -178,6 +197,7 @@ func main() {
 			OIDCInsecureSkipVerify:    *authOIDCInsecureSkipVerify,
 			OIDCCACert:                *authOIDCCACert,
 			OIDCBackchannelLogout:     *authOIDCBackchannelLogout,
+			APIKeys:                   apiKeyStore,
 		},
 	}
 
