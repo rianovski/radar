@@ -26,7 +26,7 @@ func (s *Server) handleSecretCertExpiry(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
@@ -62,8 +62,7 @@ type DashboardCertificateHealth struct {
 // namespaces and counts by expiry bucket. nil namespaces means
 // "every namespace the cache exposes"; an empty slice means none
 // (matches the MatchesNamespace contract used throughout this package).
-func (s *Server) getDashboardCertificateHealth(namespaces []string) *DashboardCertificateHealth {
-	cache := k8s.GetResourceCache()
+func (s *Server) getDashboardCertificateHealth(cache *k8s.ResourceCache, namespaces []string) *DashboardCertificateHealth {
 	if cache == nil {
 		return nil
 	}
