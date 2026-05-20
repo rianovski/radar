@@ -80,6 +80,22 @@ func safeSend(ch chan SSEEvent, event SSEEvent) {
 	}
 }
 
+// safeSendBlocking sends an event to a channel, blocking up to timeout if the
+// channel is full. Use for control events (context_changed) where silent drop
+// breaks the client state machine — the user is left stuck on the old context
+// because the frontend never receives the switch signal.
+func safeSendBlocking(ch chan SSEEvent, event SSEEvent, timeout time.Duration) bool {
+	defer func() {
+		recover() // Ignore panic from send on closed channel
+	}()
+	select {
+	case ch <- event:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // NewSSEBroadcaster creates a new SSE broadcaster
 func NewSSEBroadcaster() *SSEBroadcaster {
 	return &SSEBroadcaster{
@@ -303,12 +319,12 @@ func (b *SSEBroadcaster) registerContextSwitchCallback() {
 		b.mu.RUnlock()
 		log.Printf("SSE broadcaster: broadcasting context_changed to %d clients", clientCount)
 
-		b.Broadcast(SSEEvent{
+		b.BroadcastReliable(SSEEvent{
 			Event: "context_changed",
 			Data: map[string]any{
 				"context": newContext,
 			},
-		})
+		}, 2*time.Second)
 
 		// Broadcast the new topology so clients can complete the switch
 		// Run in goroutine to not block the context switch
@@ -655,6 +671,30 @@ func (b *SSEBroadcaster) Broadcast(event SSEEvent) {
 
 	for ch := range b.clients {
 		safeSend(ch, event)
+	}
+}
+
+// BroadcastReliable sends a control event to all connected clients using a
+// blocking send with a per-client timeout. Used for events whose loss puts
+// the client into an unrecoverable state (e.g. context_changed — without it
+// the UI's "switching context" overlay never clears). Logs the number of
+// recipients that timed out so the drop is observable.
+func (b *SSEBroadcaster) BroadcastReliable(event SSEEvent, timeout time.Duration) {
+	b.mu.RLock()
+	chans := make([]chan SSEEvent, 0, len(b.clients))
+	for ch := range b.clients {
+		chans = append(chans, ch)
+	}
+	b.mu.RUnlock()
+
+	var timedOut int
+	for _, ch := range chans {
+		if !safeSendBlocking(ch, event, timeout) {
+			timedOut++
+		}
+	}
+	if timedOut > 0 {
+		log.Printf("SSE broadcaster: %s event timed out on %d/%d clients", event.Event, timedOut, len(chans))
 	}
 }
 

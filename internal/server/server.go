@@ -2826,11 +2826,15 @@ func (s *Server) handleSwitchContext(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Notify on the old broadcaster so the user's active SSE stream
-		// receives the event and triggers an EventSource reconnect.
-		prevBroadcaster.Broadcast(SSEEvent{
+		// receives the event and triggers an EventSource reconnect. Use the
+		// reliable broadcaster — a dropped context_changed leaves the UI's
+		// switching overlay stuck because waitingForTopologyAfterSwitch is
+		// only set in response to this event, and the buffered eventCh can
+		// fill up if a slow client/proxy is backpressuring topology updates.
+		prevBroadcaster.BroadcastReliable(SSEEvent{
 			Event: "context_changed",
 			Data:  map[string]any{"context": name},
-		})
+		}, 2*time.Second)
 		s.writeJSON(w, map[string]string{"status": "ok", "context": name})
 		return
 	}
