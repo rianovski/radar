@@ -687,6 +687,12 @@ func (b *SSEBroadcaster) BroadcastReliable(event SSEEvent, timeout time.Duration
 	}
 	b.mu.RUnlock()
 
+	tag := b.contextName
+	if tag == "" {
+		tag = "default"
+	}
+	log.Printf("SSE broadcaster[%s]: BroadcastReliable %q to %d clients", tag, event.Event, len(chans))
+
 	var timedOut int
 	for _, ch := range chans {
 		if !safeSendBlocking(ch, event, timeout) {
@@ -694,7 +700,7 @@ func (b *SSEBroadcaster) BroadcastReliable(event SSEEvent, timeout time.Duration
 		}
 	}
 	if timedOut > 0 {
-		log.Printf("SSE broadcaster: %s event timed out on %d/%d clients", event.Event, timedOut, len(chans))
+		log.Printf("SSE broadcaster[%s]: %s event timed out on %d/%d clients", tag, event.Event, timedOut, len(chans))
 	}
 }
 
@@ -895,6 +901,13 @@ func (b *SSEBroadcaster) HandleSSE(w http.ResponseWriter, r *http.Request) {
 				fmt.Fprintf(w, "event: error\ndata: %s\n\n", errorData)
 				flusher.Flush()
 				continue
+			}
+			if event.Event == "context_changed" {
+				tag := b.contextName
+				if tag == "" {
+					tag = "default"
+				}
+				log.Printf("SSE broadcaster[%s]: writing context_changed to wire", tag)
 			}
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Event, data)
 			flusher.Flush()
