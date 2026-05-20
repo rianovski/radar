@@ -548,9 +548,52 @@ proxy: {
 
 ## Per-User Context Isolation Status (work-in-progress 2026-05-20)
 
-Production deployment at `cm.astra.co.id` switched from single-context "global swap" to per-user context switching via `internal/k8s/pool.go`. The pool gives each authenticated user their own `PoolEntry { Cache, DynCache, Discovery, Client, ContextName, ClusterName }`. `pool.ContextForUser(username)` returns the user's current context (or `defaultCtx`); `pool.EntryForUser(username)` and `pool.EntryForContext(contextName)` return the entry.
+### Why this section exists
 
-The pool is grafted onto a codebase that was originally single-context, so many subsystems still read from `k8s.GetResourceCache()`, `k8s.GetClient()`, `k8s.GetContextName()`, etc. — the **process-global** singletons that always point at the default kubeconfig context. Each one is a latent bug for users who have switched contexts: they keep seeing the default cluster's data even though `cacheFor(r)`-based endpoints correctly return their own.
+Production deployment at `cm.astra.co.id` switched from single-context "global swap" to per-user context switching via `internal/k8s/pool.go`. The pool gives each authenticated user their own `PoolEntry { Cache, DynCache, Discovery, Client, RestConfig, ContextName, ClusterName }`. `pool.ContextForUser(username)` returns the user's current context (or `defaultCtx`); `pool.EntryForUser(username)` and `pool.EntryForContext(contextName)` return the entry.
+
+The pool is grafted onto a codebase that was originally single-context, so many subsystems still read from `k8s.GetResourceCache()`, `k8s.GetClient()`, `k8s.GetContextName()`, etc. — the **process-global** singletons that always point at the default kubeconfig context. Each unmigrated subsystem is a latent bug: a user who has switched contexts keeps seeing the default cluster's data (or worse, write operations that mutate the wrong cluster) even though resource-cache reads via `cacheFor(r)` correctly return their own.
+
+This work is incomplete. The user (Moh. Ferian) is paying close attention because each session has surfaced more globals — they want it finished, not patched incrementally.
+
+### Goal: every per-user-visible endpoint must reflect the user's `PoolEntry`, not process globals
+
+Concretely: when user A is on context X and user B is on context Y simultaneously, no endpoint should return Y's data to A or vice versa, and no write should hit X when the requester is on Y.
+
+### Next move (pick up here)
+
+**Priority 1 — `/api/packages` (Packages inventory page) still shows default cluster's Helm releases.** This is the most user-visible remaining bug after the Helm tab fix. Driver: `internal/server/packages.go:412` — `collectHelmReleases(namespaces, "", nil)` calls `helm.GetClient().ListReleasesAsUser` with no per-context routing.
+
+To fix:
+1. Add `HelmRestConfig *rest.Config` and `HelmContextName string` to `ListPackagesParams` (already a thread-through param struct).
+2. In `handleListPackages`, populate them from `s.helmContextFor(r)`.
+3. Thread them through `ListPackages → computePackagesInternal → collectHelmReleases`.
+4. In `collectHelmReleases`, when `helmRestConfig != nil`, build an `action.Configuration` via `hClient.GetActionConfigForUserWith(restConfig, contextName, ns, "", nil)` then call `helm.ListReleasesWith(actionConfig, ns, "", nil)`. Otherwise fall through to the existing `hClient.ListReleasesAsUser` (default-context behavior preserved).
+
+**Priority 2 — `/api/helm/upgrade-check` & `/api/helm/releases/{ns}/{name}/upgrade-info`.** `handleCheckUpgrade` / `handleBatchUpgradeCheck` call `client.CheckForUpgradeAsUser` which still reads globals.
+
+To fix:
+1. Add `Client.CheckForUpgradeWith(actionConfig, ...)` mirroring the other `*With` methods exposed in `client.go`.
+2. Add a dispatcher `h.checkForUpgrade(r, client, namespace, name, ...)` in `helm/handlers.go` following the same pattern as `h.uninstall`, `h.upgrade` etc.
+3. Wire the handlers to call it.
+
+**Priority 3 — Namespace switcher preferences leak across contexts.** `internal/server/namespace_scope.go:62,81,125,321` use `k8s.GetContextName()` to key per-user namespace picks. Replace with `s.pool.ContextForUser(usernameFrom(r))` (falling back to `k8s.GetContextName()` when `s.pool == nil`) so a pick made on context X stays scoped to X and doesn't bleed into Y.
+
+**Priority 4 — Search / Issues providers.** `internal/search/provider.go` and `internal/issues/provider.go` capture `k8s.GetResourceCache()` / `GetDynamicResourceCache()` / `GetResourceDiscovery()` at construction time. Refactor to take a `providerFor func(r) (cache, dynCache, discovery)` callback so the server can wire `s.cacheFor / s.dynCacheFor / s.discoveryFor` per-request. Affects `/api/search/*` and `/api/issues`.
+
+**Priority 5 — Image inspector, Prometheus, OpenCost, Traffic.** All have their own connection state attached to the default cluster. Lower priority because Prometheus / OpenCost / Traffic gracefully degrade to "not configured" when the per-context cluster lacks them, and image inspection is an audit-only path. See the table below for file locations.
+
+### The migration pattern (use this for every fix in this section)
+
+Every per-user fix in this codebase has the same shape — match it so the next agent doesn't re-invent the wheel:
+
+1. **Extend the data carrier**: PoolEntry already has `Cache`, `DynCache`, `Discovery`, `Client`, `RestConfig`, `ContextName`, `ClusterName`. If your subsystem needs something else, add it to `PoolEntry`, populate it in `BuildEntryForContext`, and seed it on the default entry in `bootstrap.go:325`. Read it from the entry instead of the global getter.
+2. **Add `*With` (or `*ForEntry`) variants** to whatever helper currently reads globals. Keep the existing global-reading method as a one-line wrapper that calls the `*With` variant with the global values. This keeps the no-pool / default-context path byte-identical.
+3. **Add a server-side resolver** (`s.someContextFor(r)`) that returns the entry's value when the user is on a non-default pool entry, and `(nil, "")` otherwise. Pattern: `if e := s.entryFor(r); e != nil && e.ContextName != k8s.GetContextName() { return e.RestConfig, e.ContextName }; return nil, ""`. The "default falls back" check is load-bearing — handlers should not pay the per-user code path on default-context requests.
+4. **For subsystems with their own handler struct** (e.g. `helm.Handlers`, future `search.Handlers`), add a `ContextResolver func(*http.Request) (...)` field and wire it from `server.New` so the package stays independent of `pool.CachePool`.
+5. **For free functions called from handlers** (e.g. `computePackagesInternal`), add the resolved context as additional parameters to the function's existing params struct — don't reach into HTTP-request internals from deep helpers.
+
+See `internal/helm/handlers.go` and `server.helmContextFor` for a fully-worked example covering both reads and writes.
 
 ### Already migrated to per-user (DO NOT regress)
 
@@ -588,17 +631,27 @@ Subsystems that ignore the user's context and always return / act on the default
 
 `internal/server/diagnostics.go:246`, `internal/mcp/tools.go:1379`, and `internal/server/server.go:2866` also call `k8s.GetClusterInfo` but those are correct as-is (diagnostics endpoint, MCP handler, and the legacy `PerformContextSwitch` fallback path which only fires when `s.pool == nil`).
 
-### The shape of a per-user fix
+### Verification checklist before declaring a fix done
 
-When a global-state caller is on this list, the fix is usually:
+After migrating any subsystem from the list above, run through this checklist — these are the failure modes that have surfaced repeatedly in past sessions:
 
-1. Extend the relevant struct with what it needs from the pool entry (`Client`, `Cache`, `DynCache`, `ContextName`, `ClusterName`, or a `*rest.Config`).
-2. Add a constructor / factory that takes those instead of reading globals.
-3. Add a server-side helper that picks the per-user variant when the pool is in use and falls back to the global for the no-pool / in-cluster case (see `GetClusterInfoForEntry` for the template).
-4. Route call sites through `entryFor(r)` / `cacheFor(r)` / `clientFor(r)` etc.
-5. Seed the default pool entry with the global value in `bootstrap.go` so the default-context path stays unchanged.
+1. **Does the build pass?** `cd /home/astra/Research/Project/radarhq/radar && go build ./...` — no output means clean.
+2. **Did you preserve the default-context path?** A user who never switches contexts should hit byte-identical code paths to before your change. The `*With` variants exist precisely so the default-context call still goes through `helm.GetClient().ListReleasesAsUser(...)` (or whatever) without per-user overhead.
+3. **Does the resolver short-circuit on the default context?** If `s.helmContextFor(r)` returns `(nil, "")` on the default context, the dispatcher must take the original code path, not the `*With` path with a nil rest.Config — nil rest.Config in `GetActionConfigForUserWith` falls back to globals, which works but is wasteful.
+4. **Did you check ALL the variants?** Many subsystems have `Xxx`, `XxxAsUser`, `XxxWithProgress`, `XxxWithProgressAsUser`, plus stream handlers. Helm has 4-5 variants per write operation. Missing any one leaves a hole.
+5. **Did you update CLAUDE.md?** Move the subsystem out of "Still wired to global state" and into "Already migrated", and remove its entry from the "Next move" priority list. The next session's agent reads this section first.
+6. **Did you commit author the right author per remote?** `rianovski <mar.sha1@outlook.com>` for `origin` (GitHub `rianovski/radar`); `Moh. Ferian <moh.ferian@ai.astra.co.id>` for `tfs` (internal). See [[project_git_authors]] memory entry.
 
-The default-context entry already carries `Client`, `ContextName`, and `ClusterName` (seeded from globals in `bootstrap.go`). Use these from the entry instead of calling the global getters when you're inside a handler.
+### How to test changes against production
+
+User cannot test locally — the bug only manifests with the real multi-cluster kubeconfig and the radar-auth identity in front of nginx. Workflow:
+
+1. Push to `origin` (GitHub).
+2. User redeploys on the production server (they handle deploy themselves; do not try to ssh or run `deploy.sh`).
+3. User tails logs via `./radar.sh logs` on the production box and pastes the relevant lines.
+4. Diagnose from the logs. The diagnostic log lines (`BroadcastReliable`, `writing context_changed to wire`, `[pool] building entry`, `[pool] context X shut down`) were added in past sessions specifically so this remote-diagnose flow works.
+
+Do not propose changes that require local testing — the user has been clear this is a remote-only debugging path.
 
 ### Infrastructure note: SSE proxy buffering
 
