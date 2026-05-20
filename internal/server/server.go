@@ -626,20 +626,29 @@ func (s *Server) broadcasterFor(username string) *SSEBroadcaster {
 	if contextName == "" || contextName == k8s.GetContextName() {
 		return s.broadcaster
 	}
-	val, loaded := s.entryBroadcasters.LoadOrStore(contextName, (*SSEBroadcaster)(nil))
-	if !loaded || val == nil {
-		// Create and start a new broadcaster for this context.
-		entryFunc := func() *k8s.PoolEntry { return s.pool.EntryForUser(username) }
-		b := NewSSEBroadcasterFor(contextName, entryFunc)
-		b.Start()
-		s.entryBroadcasters.Store(contextName, b)
-		return b
+
+	// Fast path: broadcaster already exists.
+	if val, ok := s.entryBroadcasters.Load(contextName); ok {
+		if b, ok := val.(*SSEBroadcaster); ok && b != nil {
+			return b
+		}
 	}
-	if b, ok := val.(*SSEBroadcaster); ok && b != nil {
-		return b
+
+	// Slow path: create a broadcaster and race to store it.
+	// entryFunc resolves by context name so it stays correct even if the user
+	// later switches away and the per-user mapping changes.
+	entryFunc := func() *k8s.PoolEntry { return s.pool.EntryForContext(contextName) }
+	b := NewSSEBroadcasterFor(contextName, entryFunc)
+	b.Start()
+	if actual, loaded := s.entryBroadcasters.LoadOrStore(contextName, b); loaded {
+		// Another goroutine stored first — discard ours and use the winner.
+		b.Stop()
+		if winner, ok := actual.(*SSEBroadcaster); ok && winner != nil {
+			return winner
+		}
+		return s.broadcaster
 	}
-	// Stored value is nil (lost the race above) — use global as fallback.
-	return s.broadcaster
+	return b
 }
 
 // Stop gracefully stops the server and releases the listening port.

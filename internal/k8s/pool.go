@@ -83,6 +83,19 @@ func (p *CachePool) EntryForUser(username string) *PoolEntry {
 	return &e
 }
 
+// EntryForContext returns the PoolEntry for a specific context name, regardless
+// of which user is currently mapped to it. Returns nil if no entry exists.
+func (p *CachePool) EntryForContext(contextName string) *PoolEntry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ref, ok := p.entries[contextName]
+	if !ok || ref == nil {
+		return nil
+	}
+	e := ref.entry
+	return &e
+}
+
 // ContextForUser returns the context name currently active for username.
 func (p *CachePool) ContextForUser(username string) string {
 	p.mu.Lock()
@@ -175,7 +188,12 @@ func (p *CachePool) releaseContext(username, contextName string) {
 	if len(ref.users) == 0 && contextName != p.defaultCtx {
 		ref.cancel()
 		delete(p.entries, contextName)
-		delete(p.userContext, username)
+		// Only remove the explicit mapping if it still points to this context.
+		// Switch() updates the mapping before calling releaseContext, so the
+		// mapping may already point to the new destination.
+		if p.userContext[username] == contextName {
+			delete(p.userContext, username)
+		}
 		p.mu.Unlock()
 		log.Printf("[pool] context %q shut down — no remaining users", contextName)
 		if p.onRelease != nil {

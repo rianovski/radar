@@ -90,7 +90,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
 	}
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Cache not initialized")
 		return
@@ -111,7 +111,7 @@ func (s *Server) handleAuditResource(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
 	}
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Cache not initialized")
 		return
