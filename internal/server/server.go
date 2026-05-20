@@ -367,8 +367,9 @@ func (s *Server) setupRoutes() {
 			r.Get("/workloads/{kind}/{namespace}/{name}/logs", s.handleWorkloadLogs)
 			r.Get("/workloads/{kind}/{namespace}/{name}/pods", s.handleWorkloadPods)
 
-			// Helm routes
-			helmHandlers := helm.NewHandlers()
+			// Helm routes — pass a context resolver so Helm reads route through
+			// the user's per-pool rest.Config instead of the default cluster.
+			helmHandlers := helm.NewHandlers(s.helmContextFor)
 			helmHandlers.RegisterRoutes(r)
 
 			// Image inspection routes
@@ -613,6 +614,35 @@ func (s *Server) discoveryFor(r *http.Request) *k8s.ResourceDiscovery {
 		return e.Discovery
 	}
 	return k8s.GetResourceDiscovery()
+}
+
+// helmContextFor returns the (restConfig, contextName) pair Helm should
+// target for the requesting user. Returns (nil, "") when the request maps
+// to the default context — callers should treat nil restConfig as
+// "use the process-global helm.Client behavior" so the default-context
+// path stays untouched.
+func (s *Server) helmContextFor(r *http.Request) (*rest.Config, string) {
+	if e := s.entryFor(r); e != nil && e.ContextName != k8s.GetContextName() {
+		return e.RestConfig, e.ContextName
+	}
+	return nil, ""
+}
+
+// listHelmReleasesForUser dispatches a Helm list to either the per-user
+// pool context (when the user has switched away from the default) or the
+// global helm.Client (default context). Per-user mode builds an
+// action.Configuration against the entry's rest.Config so the SDK reads
+// release storage Secrets from the user's cluster instead of the default.
+func (s *Server) listHelmReleasesForUser(r *http.Request, helmClient *helm.Client, namespace, username string, groups []string) ([]helm.HelmRelease, error) {
+	restCfg, ctxName := s.helmContextFor(r)
+	if restCfg == nil {
+		return helmClient.ListReleasesAsUser(namespace, username, groups)
+	}
+	actionConfig, err := helmClient.GetActionConfigForUserWith(restCfg, ctxName, namespace, username, groups)
+	if err != nil {
+		return nil, err
+	}
+	return helm.ListReleasesWith(actionConfig, namespace, username, groups)
 }
 
 // broadcasterFor returns the SSEBroadcaster for the given user's active context.

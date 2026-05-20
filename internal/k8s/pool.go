@@ -10,6 +10,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/skyhook-io/radar/internal/timeline"
 	"github.com/skyhook-io/radar/pkg/k8score"
@@ -28,6 +29,7 @@ type PoolEntry struct {
 	DynCache    *DynamicResourceCache
 	Discovery   *ResourceDiscovery
 	Client      kubernetes.Interface
+	RestConfig  *rest.Config
 	ContextName string
 	ClusterName string
 }
@@ -355,6 +357,7 @@ func BuildEntryForContext(ctx context.Context, contextName string) (*PoolEntry, 
 		DynCache:    &DynamicResourceCache{DynamicResourceCache: dynCore},
 		Discovery:   disc,
 		Client:      client,
+		RestConfig:  restCfg,
 		ContextName: contextName,
 		ClusterName: clusterName,
 	}

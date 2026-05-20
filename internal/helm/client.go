@@ -150,13 +150,28 @@ func (c *Client) getActionConfigForUser(namespace, username string, groups []str
 // rest.Config the rest of Radar already uses — Helm's default
 // ConfigFlags only resolves kubeconfig and would otherwise fall through
 // to localhost:8080 inside a pod with no ~/.kube/config.
+//
+// Defaults restConfig/currentContext to the process-global values so the
+// existing public methods keep working. Pass explicit values from a pool
+// entry to route the action against a non-default cluster.
 func (c *Client) buildActionConfig(namespace, username string, groups []string) (*action.Configuration, error) {
+	return c.buildActionConfigWith(k8s.GetConfig(), k8s.GetContextName(), namespace, username, groups)
+}
+
+func (c *Client) buildActionConfigWith(restConfig *rest.Config, currentContext, namespace, username string, groups []string) (*action.Configuration, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	actionConfig := new(action.Configuration)
 
-	getter, err := c.restClientGetter(namespace, username, groups)
+	getter, err := buildRESTClientGetter(restClientGetterParams{
+		kubeconfig:     c.kubeconfig,
+		restConfig:     restConfig,
+		currentContext: currentContext,
+		namespace:      namespace,
+		username:       username,
+		groups:         groups,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to build helm RESTClientGetter: %w", err)
 	}
@@ -254,6 +269,78 @@ func (c *Client) GetActionConfig(namespace string) (*action.Configuration, error
 // Exported for use by handlers that need to pass user-specific configs.
 func (c *Client) GetActionConfigForUser(namespace, username string, groups []string) (*action.Configuration, error) {
 	return c.getActionConfigForUser(namespace, username, groups)
+}
+
+// GetActionConfigForUserWith returns an action.Configuration that targets the
+// supplied restConfig + kubeconfig context instead of the process-global
+// defaults. Callers operating in a per-user pool context pass the pool
+// entry's RestConfig and ContextName so Helm operations hit the user's
+// switched-to cluster instead of the default one. A nil restConfig falls
+// back to the global behavior.
+func (c *Client) GetActionConfigForUserWith(restConfig *rest.Config, contextName, namespace, username string, groups []string) (*action.Configuration, error) {
+	if restConfig == nil {
+		return c.getActionConfigForUser(namespace, username, groups)
+	}
+	return c.buildActionConfigWith(restConfig, contextName, namespace, username, groups)
+}
+
+// ListReleasesWith runs a list against the supplied action.Configuration.
+// Used by per-user callers that built their own action.Configuration via
+// GetActionConfigForUserWith. The username/groups args are only used to
+// produce identity-aware error messages — the action.Configuration already
+// embeds the impersonation headers.
+func ListReleasesWith(actionConfig *action.Configuration, namespace, username string, groups []string) ([]HelmRelease, error) {
+	return listReleasesWith(actionConfig, namespace, username, groups)
+}
+
+// GetReleaseWith returns a single release using the supplied
+// action.Configuration. See ListReleasesWith for the per-user usage pattern.
+func GetReleaseWith(actionConfig *action.Configuration, namespace, name string) (*HelmReleaseDetail, error) {
+	return getReleaseWith(actionConfig, namespace, name)
+}
+
+// GetManifestWith returns a rendered manifest using the supplied
+// action.Configuration. See ListReleasesWith for the per-user usage pattern.
+func GetManifestWith(actionConfig *action.Configuration, name string, revision int) (string, error) {
+	return getManifestWith(actionConfig, name, revision)
+}
+
+// GetValuesWith returns release values using the supplied action.Configuration.
+// See ListReleasesWith for the per-user usage pattern.
+func GetValuesWith(actionConfig *action.Configuration, name string, allValues bool) (*HelmValues, error) {
+	return getValuesWith(actionConfig, name, allValues)
+}
+
+// UninstallWith uninstalls a release using the supplied action.Configuration.
+// Use this from per-user handlers so destructive operations target the user's
+// switched-to cluster instead of the default one. The caller is responsible
+// for building an action.Configuration via GetActionConfigForUserWith.
+func (c *Client) UninstallWith(actionConfig *action.Configuration, name string) error {
+	return c.uninstallWith(actionConfig, name)
+}
+
+// RollbackWith rolls back a release using the supplied action.Configuration.
+// See UninstallWith for the per-user usage pattern.
+func (c *Client) RollbackWith(actionConfig *action.Configuration, name string, revision int) error {
+	return c.rollbackWith(actionConfig, name, revision)
+}
+
+// UpgradeWith upgrades a release using the supplied action.Configuration. Pass
+// a nil progressCh to silently discard progress messages.
+func (c *Client) UpgradeWith(actionConfig *action.Configuration, name, targetVersion, repositoryName string, progressCh chan<- InstallProgress) error {
+	return c.upgradeWith(actionConfig, name, targetVersion, repositoryName, progressSender(progressCh))
+}
+
+// ApplyValuesWith re-runs a release with overridden values using the supplied
+// action.Configuration. See UninstallWith for the per-user usage pattern.
+func (c *Client) ApplyValuesWith(actionConfig *action.Configuration, name string, newValues map[string]any) error {
+	return c.applyValuesWith(actionConfig, name, newValues)
+}
+
+// InstallWith installs a release using the supplied action.Configuration. Pass
+// a nil progressCh to silently discard progress messages.
+func (c *Client) InstallWith(actionConfig *action.Configuration, req *InstallRequest, progressCh chan<- InstallProgress) (*HelmRelease, error) {
+	return c.installWithProgressUsing(actionConfig, req, progressCh)
 }
 
 // ListReleasesAsUser is ListReleases with K8s impersonation.

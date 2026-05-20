@@ -328,6 +328,7 @@ func InitializeCluster() {
 			DynCache:    k8s.GetDynamicResourceCache(),
 			Discovery:   k8s.GetResourceDiscovery(),
 			Client:      k8s.GetClient(),
+			RestConfig:  k8s.GetConfig(),
 			ContextName: k8s.GetContextName(),
 			ClusterName: k8s.GetClusterName(),
 		}, func() {})

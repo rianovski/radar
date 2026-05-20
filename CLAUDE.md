@@ -545,3 +545,65 @@ proxy: {
   }
 }
 ```
+
+## Per-User Context Isolation Status (work-in-progress 2026-05-20)
+
+Production deployment at `cm.astra.co.id` switched from single-context "global swap" to per-user context switching via `internal/k8s/pool.go`. The pool gives each authenticated user their own `PoolEntry { Cache, DynCache, Discovery, Client, ContextName, ClusterName }`. `pool.ContextForUser(username)` returns the user's current context (or `defaultCtx`); `pool.EntryForUser(username)` and `pool.EntryForContext(contextName)` return the entry.
+
+The pool is grafted onto a codebase that was originally single-context, so many subsystems still read from `k8s.GetResourceCache()`, `k8s.GetClient()`, `k8s.GetContextName()`, etc. — the **process-global** singletons that always point at the default kubeconfig context. Each one is a latent bug for users who have switched contexts: they keep seeing the default cluster's data even though `cacheFor(r)`-based endpoints correctly return their own.
+
+### Already migrated to per-user (DO NOT regress)
+
+| Endpoint / call site | Helper to use | Notes |
+|---|---|---|
+| `/api/dashboard` (resource counts, health, problems) | `s.cacheFor(r)`, `s.dynCacheFor(r)`, `s.discoveryFor(r)` | passed through `getDashboardHealth` etc. |
+| `/api/dashboard/crds` | `s.dynCacheFor(r)`, `s.discoveryFor(r)` | |
+| `/api/cluster-info` | `k8s.GetClusterInfoForEntry(ctx, s.entryFor(r))` | per-entry variant lives in `cluster_detection.go` |
+| Dashboard cluster card (name/platform/version/counts) | same as above | `getDashboardCluster(ctx, s.entryFor(r))` |
+| `/api/resources/...` listers and detail | `s.cacheFor(r)` | |
+| Audit handlers | `s.cacheFor(r)` | |
+| Topology builds in handlers | `k8s.NewTopologyResourceProvider(s.cacheFor(r))` + `s.dynCacheFor(r)` | |
+| SSE broadcasting | `s.broadcasterFor(username)` + pool-entry `SSEBroadcaster` via `entryFunc = pool.EntryForContext(contextName)` | |
+| `context_changed` SSE event delivery | `BroadcastReliable` (blocking send with timeout) — NOT `Broadcast` | a dropped `context_changed` leaves the UI overlay stuck forever |
+
+### Still wired to global state — KNOWN BUGS, prioritized
+
+Subsystems that ignore the user's context and always return / act on the default cluster's data. Listed by user-visibility:
+
+1. **Helm — partially migrated.** `internal/helm/client.go` keeps the process-singleton `Client`, but now exposes per-context entry points:
+   - `Client.GetActionConfigForUserWith(restConfig, contextName, ns, user, groups)` builds an `action.Configuration` against an explicit `rest.Config` instead of reading `k8s.GetConfig()` / `k8s.GetContextName()`. Pass it the `PoolEntry.RestConfig` / `ContextName`.
+   - Package-level read wrappers `ListReleasesWith`, `GetReleaseWith`, `GetManifestWith`, `GetValuesWith` and Client write methods `UninstallWith`, `RollbackWith`, `UpgradeWith`, `ApplyValuesWith`, `InstallWith` take an explicit `action.Configuration`.
+   - `helm.Handlers` now carries a `ContextResolver func(*http.Request) (*rest.Config, string)` wired from `server.New` via `helm.NewHandlers(s.helmContextFor)`. All read handlers (list, get, manifest, values, diff) and write handlers (install, upgrade, rollback, uninstall, applyValues, plus their `*-stream` variants) route through dispatchers (`h.listReleases`, `h.getRelease`, `h.uninstall`, etc.) that pick the per-user path when the resolver returns a non-nil rest.Config.
+   - `server.helmContextFor(r)` returns `(entry.RestConfig, entry.ContextName)` for users on a non-default pool entry, or `(nil, "")` so the dispatchers fall through to the existing `helm.GetClient()` methods for the default-context case.
+   - `getDashboardHelmSummary` routes through `s.listHelmReleasesForUser`.
+   - **Still uses globals**: `collectHelmReleases` in `internal/server/packages.go:412` (the `/api/packages` inventory page) calls `helm.GetClient().ListReleasesAsUser` directly. `handleCheckUpgrade` / `handleBatchUpgradeCheck` (`/api/helm/upgrade-check`) use `CheckForUpgradeAsUser` which has not been per-user-ized yet. `internal/mcp/tools_helm.go` is MCP and uses globals.
+   - **To migrate the remaining helm callers**: thread a `helm.Handlers.ContextResolver`-equivalent into `collectHelmReleases` (e.g. add `RestConfig *rest.Config` and `ContextName string` to `ListPackagesParams`), and add `Client.CheckForUpgradeWith(actionConfig, ...)` mirroring the other `*With` methods, then dispatch from `handleCheckUpgrade` like the others.
+2. **Search provider (`internal/search/provider.go:26-33`)** — captures globals at init. `/api/search/*` returns default cluster's results.
+3. **Issues provider (`internal/issues/provider.go:28-35`)** — captures globals at init. Issues page shows default cluster's issues.
+4. **Namespace switcher prefs (`internal/server/namespace_scope.go:62,81,125,321`)** — key shape `username\x00contextName` uses `k8s.GetContextName()` instead of `pool.ContextForUser(username)`. Picks bleed across contexts.
+5. **Image inspector (`internal/images/auth.go:38,80,218`)** — pull secrets read via `k8s.GetResourceCache()`. Cluster audit's image checks use default cluster's pull secrets.
+6. **Traffic manager (`internal/traffic`)** — process singleton, Hubble connection to default cluster only.
+7. **Prometheus / OpenCost (`internal/prometheus/handlers.go:483`, `internal/opencost/handlers.go:381`)** — auto-discovery against default cluster only; charts always reflect default cluster.
+8. **Self-upgrade SAR, search RBAC SAR** (`selfupgrade.go:80`, `search_rbac.go:52`) — SARs sent to default cluster's apiserver.
+
+`internal/server/diagnostics.go:246`, `internal/mcp/tools.go:1379`, and `internal/server/server.go:2866` also call `k8s.GetClusterInfo` but those are correct as-is (diagnostics endpoint, MCP handler, and the legacy `PerformContextSwitch` fallback path which only fires when `s.pool == nil`).
+
+### The shape of a per-user fix
+
+When a global-state caller is on this list, the fix is usually:
+
+1. Extend the relevant struct with what it needs from the pool entry (`Client`, `Cache`, `DynCache`, `ContextName`, `ClusterName`, or a `*rest.Config`).
+2. Add a constructor / factory that takes those instead of reading globals.
+3. Add a server-side helper that picks the per-user variant when the pool is in use and falls back to the global for the no-pool / in-cluster case (see `GetClusterInfoForEntry` for the template).
+4. Route call sites through `entryFor(r)` / `cacheFor(r)` / `clientFor(r)` etc.
+5. Seed the default pool entry with the global value in `bootstrap.go` so the default-context path stays unchanged.
+
+The default-context entry already carries `Client`, `ContextName`, and `ClusterName` (seeded from globals in `bootstrap.go`). Use these from the entry instead of calling the global getters when you're inside a handler.
+
+### Infrastructure note: SSE proxy buffering
+
+Two nginx layers sit between the browser and Radar in production: the SSL terminator (`/home/astra/Research/Project/radarhq/1st.nginx.conf`) and the docker-compose nginx (`/home/astra/Research/Project/radarhq/nginx.conf`). **Both** need a `location ~ ^/api/(events/stream|.*/stream)` block with `proxy_buffering off` and `proxy_cache off`. Without it, the `context_changed` event from `BroadcastReliable` sits in a proxy buffer until enough bytes accumulate, and the UI's "Switching context" overlay never clears. `X-Accel-Buffering: no` alone is not sufficient when `Connection: upgrade` is being set unconditionally upstream.
+
+### Deployment
+
+Production binary path: `/usr/local/bin/kubectl-radar` (symlinked from `/usr/local/bin/radar`). Service manager: `/opt/radar/radar.sh` (uses `nohup radar` in PATH, pid file `~/.local/run/radar.pid`). Git remotes: `origin` is GitHub `rianovski/radar` (author `rianovski <mar.sha1@outlook.com>`), `tfs` is internal TFS (author `Moh. Ferian <moh.ferian@ai.astra.co.id>`).
