@@ -358,7 +358,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer wg.Done()
 		t := time.Now()
-		cluster = s.getDashboardCluster(ctx)
+		cluster = s.getDashboardCluster(ctx, s.entryFor(r))
 		k8s.LogTiming("  [dashboard] cluster info: %v", time.Since(t))
 	}()
 	go func() {
@@ -513,8 +513,8 @@ func (s *Server) handleDashboardCRDs(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, DashboardCRDsResponse{TopCRDs: mergeCRDCounts(clusterScoped, nsScoped)})
 }
 
-func (s *Server) getDashboardCluster(ctx context.Context) DashboardCluster {
-	info, err := k8s.GetClusterInfo(ctx)
+func (s *Server) getDashboardCluster(ctx context.Context, entry *k8s.PoolEntry) DashboardCluster {
+	info, err := k8s.GetClusterInfoForEntry(ctx, entry)
 	if err != nil {
 		return DashboardCluster{Connected: false}
 	}

@@ -55,6 +55,55 @@ type ClusterInfo struct {
 	CRDDiscoveryStatus string `json:"crdDiscoveryStatus,omitempty"` // idle, discovering, ready
 }
 
+// GetClusterInfoForEntry returns ClusterInfo derived from a specific pool
+// entry, so per-user dashboards reflect the cluster the user is currently
+// pointed at instead of the global default. Falls back to GetClusterInfo
+// when entry is nil (no pool / pool entry not built yet).
+func GetClusterInfoForEntry(ctx context.Context, entry *PoolEntry) (*ClusterInfo, error) {
+	if entry == nil {
+		return GetClusterInfo(ctx)
+	}
+
+	platform, _ := getClusterPlatformFromCache(entry.Cache)
+
+	info := &ClusterInfo{
+		Context:   entry.ContextName,
+		Cluster:   entry.ClusterName,
+		Platform:  platform,
+		InCluster: IsInCluster(),
+	}
+
+	if entry.Client != nil {
+		if v, err := entry.Client.Discovery().ServerVersion(); err == nil {
+			info.KubernetesVersion = v.GitVersion
+		}
+	}
+
+	if entry.Cache != nil {
+		if nodeLister := entry.Cache.Nodes(); nodeLister != nil {
+			if nodes, err := nodeLister.List(labels.Everything()); err == nil {
+				info.NodeCount = len(nodes)
+			}
+		}
+		if podLister := entry.Cache.Pods(); podLister != nil {
+			if pods, err := podLister.List(labels.Everything()); err == nil {
+				info.PodCount = len(pods)
+			}
+		}
+		if nsLister := entry.Cache.Namespaces(); nsLister != nil {
+			if namespaces, err := nsLister.List(labels.Everything()); err == nil {
+				info.NamespaceCount = len(namespaces)
+			}
+		}
+	}
+
+	if entry.DynCache != nil {
+		info.CRDDiscoveryStatus = string(entry.DynCache.GetDiscoveryStatus())
+	}
+
+	return info, nil
+}
+
 // GetClusterInfo returns detected cluster information
 func GetClusterInfo(ctx context.Context) (*ClusterInfo, error) {
 	platform, _ := GetClusterPlatform(ctx)
@@ -96,6 +145,31 @@ func GetClusterInfo(ctx context.Context) (*ClusterInfo, error) {
 	}
 
 	return info, nil
+}
+
+// getClusterPlatformFromCache runs the node-based platform detection against
+// a specific cache (rather than the global singleton). Used by per-entry
+// ClusterInfo so the dashboard reflects the user's actual context.
+func getClusterPlatformFromCache(cache *ResourceCache) (string, error) {
+	if cache == nil {
+		return "unknown", nil
+	}
+	nodeLister := cache.Nodes()
+	if nodeLister == nil {
+		return "unknown", nil
+	}
+	nodeList, err := nodeLister.List(labels.Everything())
+	if err != nil || len(nodeList) == 0 {
+		return "unknown", nil
+	}
+	node := *nodeList[0]
+	if p := detectByProviderID(node); p != "unknown" {
+		return p, nil
+	}
+	if p := detectByLabels(node); p != "unknown" {
+		return p, nil
+	}
+	return detectByNodeName(node), nil
 }
 
 // GetClusterPlatform attempts to detect the Kubernetes platform/provider

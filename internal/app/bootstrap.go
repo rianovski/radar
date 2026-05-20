@@ -324,9 +324,12 @@ func InitializeCluster() {
 	// the informer lifecycle — pool teardown only applies to non-default entries.
 	if appPool != nil {
 		appPool.Seed(k8s.GetContextName(), k8s.PoolEntry{
-			Cache:     k8s.GetResourceCache(),
-			DynCache:  k8s.GetDynamicResourceCache(),
-			Discovery: k8s.GetResourceDiscovery(),
+			Cache:       k8s.GetResourceCache(),
+			DynCache:    k8s.GetDynamicResourceCache(),
+			Discovery:   k8s.GetResourceDiscovery(),
+			Client:      k8s.GetClient(),
+			ContextName: k8s.GetContextName(),
+			ClusterName: k8s.GetClusterName(),
 		}, func() {})
 	}
 

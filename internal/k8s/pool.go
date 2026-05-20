@@ -17,10 +17,19 @@ import (
 
 // PoolEntry groups the per-cluster resources that are created for each
 // independently connected kubeconfig context.
+//
+// ContextName and ClusterName identify the kubeconfig context this entry was
+// built for. Client lets cluster-info / server-version lookups route to the
+// right apiserver instead of the global one — without it, the dashboard's
+// cluster card would always show the default context's metadata regardless of
+// which context the user is actually on.
 type PoolEntry struct {
-	Cache     *ResourceCache
-	DynCache  *DynamicResourceCache
-	Discovery *ResourceDiscovery
+	Cache       *ResourceCache
+	DynCache    *DynamicResourceCache
+	Discovery   *ResourceDiscovery
+	Client      kubernetes.Interface
+	ContextName string
+	ClusterName string
 }
 
 // poolRef wraps a PoolEntry with its lifecycle cancel and the set of
@@ -329,10 +338,25 @@ func BuildEntryForContext(ctx context.Context, contextName string) (*PoolEntry, 
 		return nil, nil, fmt.Errorf("create dynamic cache for %q: %w", contextName, err)
 	}
 
+	// Look up the cluster name for this context from kubeconfig so per-entry
+	// ClusterInfo doesn't have to re-parse the file on every dashboard fetch.
+	var clusterName string
+	if ctxs, err := GetAvailableContexts(); err == nil {
+		for _, c := range ctxs {
+			if c.Name == contextName {
+				clusterName = c.Cluster
+				break
+			}
+		}
+	}
+
 	entry := &PoolEntry{
-		Cache:     typedCache,
-		DynCache:  &DynamicResourceCache{DynamicResourceCache: dynCore},
-		Discovery: disc,
+		Cache:       typedCache,
+		DynCache:    &DynamicResourceCache{DynamicResourceCache: dynCore},
+		Discovery:   disc,
+		Client:      client,
+		ContextName: contextName,
+		ClusterName: clusterName,
 	}
 	return entry, cancel, nil
 }

@@ -720,7 +720,7 @@ func (s *Server) handleVersionCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleClusterInfo(w http.ResponseWriter, r *http.Request) {
-	info, err := k8s.GetClusterInfo(r.Context())
+	info, err := k8s.GetClusterInfoForEntry(r.Context(), s.entryFor(r))
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
