@@ -41,7 +41,7 @@ func (s *Server) handleAIListResources(w http.ResponseWriter, r *http.Request) {
 	group := r.URL.Query().Get("group")
 	level := parseVerbosity(r, aicontext.LevelSummary)
 
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
@@ -127,7 +127,7 @@ func (s *Server) handleAIGetResource(w http.ResponseWriter, r *http.Request) {
 		namespace = ""
 	}
 
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return

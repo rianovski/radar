@@ -25,7 +25,7 @@ func (s *Server) handleResourceCounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
@@ -63,8 +63,8 @@ func (s *Server) handleResourceCounts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Dynamic resources (CRDs) — counted concurrently since each Count() hits a separate informer indexer
-	discovery := k8s.GetResourceDiscovery()
-	dynamicCache := k8s.GetDynamicResourceCache()
+	discovery := s.discoveryFor(r)
+	dynamicCache := s.dynCacheFor(r)
 	if discovery != nil && dynamicCache != nil {
 		resources, err := discovery.GetAPIResources()
 		if err != nil {

@@ -322,11 +322,13 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		iterateNamespaces = namespaces
 	}
 
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
 	}
+	dynCache := s.dynCacheFor(r)
+	discovery := s.discoveryFor(r)
 
 	resp := DashboardResponse{}
 	canReadNodes := s.canRead(r, "", "nodes", "", "list")
@@ -367,7 +369,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		// wide namespaced access / no-auth). Node capacity and usage are
 		// cluster-scoped, so omit metrics unless the caller can list Nodes.
 		if canReadNodes {
-			metrics = s.getDashboardMetrics(ctx, namespaces)
+			metrics = s.getDashboardMetrics(ctx, namespaces, cache)
 		}
 		k8s.LogTiming("  [dashboard] metrics: %v", time.Since(t))
 	}()
@@ -384,7 +386,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	// cluster-wide call.
 	t := time.Now()
 	for _, ns := range iterateNamespaces {
-		h, probs := s.getDashboardHealth(cache, ns)
+		h, probs := s.getDashboardHealth(cache, dynCache, discovery, ns)
 		resp.Health.Healthy += h.Healthy
 		resp.Health.Warning += h.Warning
 		resp.Health.Error += h.Error
@@ -399,7 +401,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	t = time.Now()
 	for _, ns := range iterateNamespaces {
-		mergeResourceCounts(&resp.ResourceCounts, s.getDashboardResourceCounts(cache, ns))
+		mergeResourceCounts(&resp.ResourceCounts, s.getDashboardResourceCounts(cache, dynCache, discovery, ns))
 	}
 	k8s.LogTiming("  [dashboard] resource counts: %v", time.Since(t))
 
@@ -415,11 +417,11 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	k8s.LogTiming("  [dashboard] changes: %v", time.Since(t))
 
 	t = time.Now()
-	resp.TopologySummary = s.getDashboardTopologySummary(namespaces)
+	resp.TopologySummary = s.getDashboardTopologySummary(namespaces, cache, dynCache, discovery)
 	k8s.LogTiming("  [dashboard] topology: %v", time.Since(t))
 
-	resp.CertificateHealth = s.getDashboardCertificateHealth(namespaces)
-	resp.NetworkPolicyCoverage = s.getDashboardNetworkPolicyCoverage(cache, namespaces)
+	resp.CertificateHealth = s.getDashboardCertificateHealth(cache, namespaces)
+	resp.NetworkPolicyCoverage = s.getDashboardNetworkPolicyCoverage(cache, dynCache, discovery, namespaces)
 	resp.Audit = getDashboardAudit(cache, namespaces)
 	resp.GitOpsControllers = s.getDashboardGitOpsControllers(cache, namespaces)
 
@@ -506,7 +508,7 @@ func (s *Server) handleDashboardCRDs(w http.ResponseWriter, r *http.Request) {
 	namespaces := s.parseNamespacesForUser(r)
 
 	clusterScoped := s.collectClusterScopedCRDCounts(r)
-	nsScoped := s.collectNamespacedCRDCounts(r.Context(), namespaces)
+	nsScoped := s.collectNamespacedCRDCounts(r.Context(), namespaces, s.dynCacheFor(r), s.discoveryFor(r))
 
 	s.writeJSON(w, DashboardCRDsResponse{TopCRDs: mergeCRDCounts(clusterScoped, nsScoped)})
 }
@@ -524,7 +526,7 @@ func (s *Server) getDashboardCluster(ctx context.Context) DashboardCluster {
 	}
 }
 
-func (s *Server) getDashboardHealth(cache *k8s.ResourceCache, namespace string) (DashboardHealth, []DashboardProblem) {
+func (s *Server) getDashboardHealth(cache *k8s.ResourceCache, dynCache *k8s.DynamicResourceCache, discovery *k8s.ResourceDiscovery, namespace string) (DashboardHealth, []DashboardProblem) {
 	health := DashboardHealth{}
 	problems := make([]DashboardProblem, 0)
 
@@ -612,7 +614,7 @@ func (s *Server) getDashboardHealth(cache *k8s.ResourceCache, namespace string) 
 	}
 
 	// CAPI problems (Cluster API resources)
-	for _, p := range k8s.DetectCAPIProblems(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery(), namespace) {
+	for _, p := range k8s.DetectCAPIProblems(dynCache, discovery, namespace) {
 		problems = append(problems, DashboardProblem{
 			Kind:            p.Kind,
 			Namespace:       p.Namespace,
@@ -797,7 +799,7 @@ func collectPodForRollup(pod *corev1.Pod, severity string, now time.Time, groups
 	}
 }
 
-func (s *Server) getDashboardResourceCounts(cache *k8s.ResourceCache, namespace string) DashboardResourceCounts {
+func (s *Server) getDashboardResourceCounts(cache *k8s.ResourceCache, dynCache *k8s.DynamicResourceCache, discovery *k8s.ResourceDiscovery, namespace string) DashboardResourceCounts {
 	counts := DashboardResourceCounts{}
 	var restricted []string
 
@@ -946,9 +948,7 @@ func (s *Server) getDashboardResourceCounts(cache *k8s.ResourceCache, namespace 
 	}
 
 	// Gateways and routes (via dynamic cache)
-	dynamicCache := k8s.GetDynamicResourceCache()
-	resourceDiscovery := k8s.GetResourceDiscovery()
-	if dynamicCache != nil && resourceDiscovery != nil {
+	if dynamicCache, resourceDiscovery := dynCache, discovery; dynamicCache != nil && resourceDiscovery != nil {
 		if gwGVR, ok := resourceDiscovery.GetGVR("Gateway"); ok {
 			gateways, err := dynamicCache.List(gwGVR, namespace)
 			if err != nil {
@@ -1184,7 +1184,7 @@ func (s *Server) getDashboardRecentChanges(ctx context.Context, namespaces []str
 	return result
 }
 
-func (s *Server) getDashboardTopologySummary(namespaces []string) DashboardTopologySummary {
+func (s *Server) getDashboardTopologySummary(namespaces []string, cache *k8s.ResourceCache, dynCache *k8s.DynamicResourceCache, discovery *k8s.ResourceDiscovery) DashboardTopologySummary {
 	// Use cached topology only when no namespace filter is active,
 	// since the cached topology's namespace scope may not match the request.
 	if namespaces == nil {
@@ -1199,7 +1199,7 @@ func (s *Server) getDashboardTopologySummary(namespaces []string) DashboardTopol
 	// Build topology with the requested namespace filter
 	opts := topology.DefaultBuildOptions()
 	opts.Namespaces = namespaces
-	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(k8s.GetResourceCache())).WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery()))
+	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(cache)).WithDynamic(k8s.NewTopologyDynamicProvider(dynCache, discovery))
 	topo, err := builder.Build(opts)
 	if err != nil {
 		log.Printf("[dashboard] Failed to build topology summary: %v", err)
@@ -1349,7 +1349,7 @@ func (s *Server) countWarningEvents(cache *k8s.ResourceCache, namespace string) 
 	return count
 }
 
-func (s *Server) getDashboardMetrics(ctx context.Context, allowedNamespaces []string) *DashboardMetrics {
+func (s *Server) getDashboardMetrics(ctx context.Context, allowedNamespaces []string, cache *k8s.ResourceCache) *DashboardMetrics {
 	client := k8s.ClientFromContext(ctx)
 	if client == nil {
 		return nil
@@ -1388,7 +1388,6 @@ func (s *Server) getDashboardMetrics(ctx context.Context, allowedNamespaces []st
 	}
 
 	// Get node capacity from the cache
-	cache := k8s.GetResourceCache()
 	if cache == nil {
 		return nil
 	}
@@ -1490,8 +1489,8 @@ func parseMemoryToBytes(s string) int64 { return k8s.ParseMemoryToBytes(s) }
 // the calling user is authorized to see. Each cluster-scoped CRD is gated by
 // a per-kind SubjectAccessReview; CRDs the user can't list are omitted.
 func (s *Server) collectClusterScopedCRDCounts(r *http.Request) []DashboardCRDCount {
-	disc := k8s.GetResourceDiscovery()
-	dynamicCache := k8s.GetDynamicResourceCache()
+	disc := s.discoveryFor(r)
+	dynamicCache := s.dynCacheFor(r)
 	if disc == nil || dynamicCache == nil {
 		return nil
 	}
@@ -1548,12 +1547,12 @@ func (s *Server) collectClusterScopedCRDCounts(r *http.Request) []DashboardCRDCo
 //     access). One call to dynamicCache.List with namespace="".
 //   - empty:      user has no namespace access; returns nil.
 //   - non-empty:  iterate per allowed namespace and sum.
-func (s *Server) collectNamespacedCRDCounts(_ context.Context, allowed []string) []DashboardCRDCount {
+func (s *Server) collectNamespacedCRDCounts(_ context.Context, allowed []string, dynCache *k8s.DynamicResourceCache, discovery *k8s.ResourceDiscovery) []DashboardCRDCount {
 	if allowed != nil && len(allowed) == 0 {
 		return nil
 	}
-	disc := k8s.GetResourceDiscovery()
-	dynamicCache := k8s.GetDynamicResourceCache()
+	disc := discovery
+	dynamicCache := dynCache
 	if disc == nil || dynamicCache == nil {
 		return nil
 	}
@@ -1638,7 +1637,7 @@ type npSelector struct {
 	selector  labels.Selector
 }
 
-func (s *Server) getDashboardNetworkPolicyCoverage(cache *k8s.ResourceCache, namespaces []string) *DashboardNetworkPolicyCoverage {
+func (s *Server) getDashboardNetworkPolicyCoverage(cache *k8s.ResourceCache, dynCache *k8s.DynamicResourceCache, discovery *k8s.ResourceDiscovery, namespaces []string) *DashboardNetworkPolicyCoverage {
 	npLister := cache.NetworkPolicies()
 	if npLister == nil {
 		return nil
@@ -1675,9 +1674,9 @@ func (s *Server) getDashboardNetworkPolicyCoverage(cache *k8s.ResourceCache, nam
 		}
 	}
 
-	if dynamicCache := k8s.GetDynamicResourceCache(); dynamicCache != nil {
-		if discovery := k8s.GetResourceDiscovery(); discovery != nil {
-			if cnpGVR, ok := discovery.GetGVR("CiliumNetworkPolicy"); ok {
+	if dynamicCache := dynCache; dynamicCache != nil {
+		if disc := discovery; disc != nil {
+			if cnpGVR, ok := disc.GetGVR("CiliumNetworkPolicy"); ok {
 				nsFilter := ""
 				if len(namespaces) == 1 {
 					nsFilter = namespaces[0]

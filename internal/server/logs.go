@@ -12,7 +12,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/pkg/k8score"
 )
 
@@ -49,7 +48,7 @@ func (s *Server) handlePodLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get pod to find containers
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
@@ -142,7 +141,7 @@ func (s *Server) handlePodLogsStream(w http.ResponseWriter, r *http.Request) {
 
 	// If no container specified, get the first one
 	if container == "" {
-		cache := k8s.GetResourceCache()
+		cache := s.cacheFor(r)
 		if cache != nil {
 			pod, err := cache.Pods().Pods(namespace).Get(podName)
 			if err == nil && len(pod.Spec.Containers) > 0 {

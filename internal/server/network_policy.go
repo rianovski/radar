@@ -45,7 +45,7 @@ func (s *Server) handleEvaluateNetworkPolicies(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "resource cache not ready")
 		return
@@ -135,8 +135,8 @@ func (s *Server) handleEvaluateNetworkPolicies(w http.ResponseWriter, r *http.Re
 	}
 
 	// 2. CiliumNetworkPolicies (from dynamic cache)
-	if dynamicCache := k8s.GetDynamicResourceCache(); dynamicCache != nil {
-		if discovery := k8s.GetResourceDiscovery(); discovery != nil {
+	if dynamicCache := s.dynCacheFor(r); dynamicCache != nil {
+		if discovery := s.discoveryFor(r); discovery != nil {
 			if cnpGVR, ok := discovery.GetGVR("CiliumNetworkPolicy"); ok {
 				cnps, err := dynamicCache.List(cnpGVR, evalNs)
 				if err != nil {

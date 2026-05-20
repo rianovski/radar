@@ -140,6 +140,8 @@ type ListPackagesParams struct {
 	// "use the SA identity" (helm.ListReleasesAsUser convention).
 	User   string
 	Groups []string
+	// Cache is the per-user resource cache. nil falls back to the global cache.
+	Cache *k8s.ResourceCache
 }
 
 // ErrInvalidSourceCode is returned when ListPackagesParams.Source is set
@@ -185,7 +187,7 @@ func ListPackages(ctx context.Context, p ListPackagesParams) (PackagesResponse, 
 		generatedAt = entry.at
 	} else {
 		var err error
-		rows, sourceErrs, err = computePackagesInternal(ctx, p.Namespaces)
+		rows, sourceErrs, err = computePackagesInternal(ctx, p.Namespaces, p.Cache)
 		if err != nil {
 			return PackagesResponse{}, err
 		}
@@ -283,6 +285,7 @@ func (s *Server) handleListPackages(w http.ResponseWriter, r *http.Request) {
 		Chart:      r.URL.Query().Get("chart"),
 		User:       user,
 		Groups:     groups,
+		Cache:      s.cacheFor(r),
 	})
 	if err != nil {
 		if errors.Is(err, errResourceCacheUnavailable) {
@@ -309,8 +312,10 @@ func (s *Server) handleListPackages(w http.ResponseWriter, r *http.Request) {
 // cloud-mode (see the helm comment below for the rationale). User
 // identity does still flow through ListPackagesParams for cache
 // scoping and for sensitive Helm endpoints invoked elsewhere.
-func computePackagesInternal(ctx context.Context, namespaces []string) ([]packages.PackageRow, []SourceError, error) {
-	cache := k8s.GetResourceCache()
+func computePackagesInternal(ctx context.Context, namespaces []string, cache *k8s.ResourceCache) ([]packages.PackageRow, []SourceError, error) {
+	if cache == nil {
+		cache = k8s.GetResourceCache()
+	}
 	if cache == nil {
 		return nil, nil, errResourceCacheUnavailable
 	}

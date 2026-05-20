@@ -199,6 +199,10 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	uptime := now.Sub(s.startTime)
 
+	diagCache := s.cacheFor(r)
+	diagDynCache := s.dynCacheFor(r)
+	diagDiscovery := s.discoveryFor(r)
+
 	snap := DiagnosticsSnapshot{
 		Timestamp:    now.Format(time.RFC3339),
 		RadarVersion: version.Current,
@@ -255,7 +259,7 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 
 	// Cache
 	collectSafe("cache", &errs, func() {
-		cache := k8s.GetResourceCache()
+		cache := diagCache
 		if cache == nil {
 			return
 		}
@@ -337,7 +341,7 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 		diag := &DiagInformers{}
 
 		// Get typed informer count and sync status from cache
-		cache := k8s.GetResourceCache()
+		cache := diagCache
 		if cache != nil {
 			enabled := cache.GetEnabledResources()
 			count := 0
@@ -351,7 +355,7 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 			diag.SyncStatus = &syncStatus
 		}
 
-		dynCache := k8s.GetDynamicResourceCache()
+		dynCache := diagDynCache
 		if dynCache != nil {
 			diag.DynamicCount = dynCache.GetInformerCount()
 			watched := dynCache.GetWatchedResources()
@@ -449,7 +453,7 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 
 	// API Discovery — read-only stats, no refresh
 	collectSafe("apiDiscovery", &errs, func() {
-		discovery := k8s.GetResourceDiscovery()
+		discovery := diagDiscovery
 		if discovery == nil {
 			return
 		}

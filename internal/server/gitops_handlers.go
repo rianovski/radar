@@ -29,6 +29,8 @@ import (
 type gitopsRequest struct {
 	Kind, Namespace, Name, Group string
 	Cache                        *k8s.ResourceCache
+	DynCache                     *k8s.DynamicResourceCache
+	Discovery                    *k8s.ResourceDiscovery
 	AllowedNamespaces            []string
 }
 
@@ -58,7 +60,7 @@ func (s *Server) parseGitOpsRequest(w http.ResponseWriter, r *http.Request) (*gi
 		}
 	}
 
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return nil, false
@@ -77,6 +79,8 @@ func (s *Server) parseGitOpsRequest(w http.ResponseWriter, r *http.Request) (*gi
 		Name:              name,
 		Group:             group,
 		Cache:             cache,
+		DynCache:          s.dynCacheFor(r),
+		Discovery:         s.discoveryFor(r),
 		AllowedNamespaces: s.getUserNamespaces(r, nil),
 	}, true
 }
@@ -98,7 +102,7 @@ func (s *Server) buildGitOpsTree(ctx context.Context, req *gitopsRequest) (*gito
 
 	topo, err := s.topoMemo.Get(opts, func() (*topology.Topology, error) {
 		return topology.NewBuilder(k8s.NewTopologyResourceProvider(req.Cache)).
-			WithDynamic(k8s.NewTopologyDynamicProvider(k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery())).
+			WithDynamic(k8s.NewTopologyDynamicProvider(req.DynCache, req.Discovery)).
 			Build(opts)
 	})
 	if err != nil {

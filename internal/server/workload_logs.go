@@ -53,7 +53,7 @@ func (s *Server) handleWorkloadPods(w http.ResponseWriter, r *http.Request) {
 	namespace := chi.URLParam(r, "namespace")
 	name := chi.URLParam(r, "name")
 
-	pods, err := s.getWorkloadPods(kind, namespace, name)
+	pods, err := s.getWorkloadPods(kind, namespace, name, s.cacheFor(r))
 	if err != nil {
 		s.writeWorkloadError(w, err)
 		return
@@ -80,7 +80,7 @@ func (s *Server) handleWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 	tailLines := parseTailLines(r.URL.Query().Get("tailLines"), 100)
 	sinceSeconds := parseSinceSeconds(r.URL.Query().Get("sinceSeconds"))
 
-	pods, err := s.getWorkloadPods(kind, namespace, name)
+	pods, err := s.getWorkloadPods(kind, namespace, name, s.cacheFor(r))
 	if err != nil {
 		s.writeWorkloadError(w, err)
 		return
@@ -145,7 +145,7 @@ func (s *Server) handleWorkloadLogsStream(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		sendSSEError(w, flusher, "resource cache not available")
 		return
@@ -390,12 +390,11 @@ type workloadError struct {
 func (e *workloadError) Error() string { return e.message }
 
 // getWorkloadPods validates the kind, retrieves cache, and returns pods for a workload
-func (s *Server) getWorkloadPods(kind, namespace, name string) ([]*corev1.Pod, *workloadError) {
+func (s *Server) getWorkloadPods(kind, namespace, name string, cache *k8s.ResourceCache) ([]*corev1.Pod, *workloadError) {
 	if !validWorkloadKinds[kind] {
 		return nil, &workloadError{http.StatusBadRequest, "only deployments, statefulsets, and daemonsets are supported"}
 	}
 
-	cache := k8s.GetResourceCache()
 	if cache == nil {
 		return nil, &workloadError{http.StatusServiceUnavailable, "resource cache not available"}
 	}
