@@ -259,6 +259,10 @@ func (s *Server) setupRoutes() {
 		r.Get("/local-terminal", s.handleLocalTerminal)
 		r.Get("/pods/{namespace}/{name}/files/download", s.handlePodFileDownload)
 		r.Get("/workloads/{kind}/{namespace}/{name}/logs/stream", s.handleWorkloadLogsStream)
+		// Forwarded apps may stream or upgrade to WebSocket, so keep the proxy
+		// out of the timeout group.
+		r.HandleFunc("/portforwards/{id}/proxy", s.handlePortForwardProxyRoot)
+		r.HandleFunc("/portforwards/{id}/proxy/*", s.handlePortForwardProxy)
 
 		// Node drain — outside 60s timeout group (drain may need minutes for PDB backoff)
 		r.Post("/nodes/{name}/drain", s.handleDrainNode)

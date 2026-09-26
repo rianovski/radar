@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"crypto/tls"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -252,6 +256,76 @@ func (s *Server) handleStartPortForward(w http.ResponseWriter, r *http.Request) 
 	pfManager.mu.Unlock()
 
 	s.writeJSON(w, session)
+}
+
+// handlePortForwardProxyRoot redirects the bare proxy path to its
+// trailing-slash form so the forwarded app's relative links resolve under
+// the proxy prefix instead of under /api/portforwards/{id}/.
+func (s *Server) handlePortForwardProxyRoot(w http.ResponseWriter, r *http.Request) {
+	target := r.URL.Path + "/"
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+}
+
+// handlePortForwardProxy serves HTTP through an active port forward. The
+// forward listens on the loopback of the machine running Radar, so a browser
+// on another machine (Radar in-cluster or on a shared server) cannot reach
+// it directly — this endpoint is its only way in. Apps that hardcode absolute
+// paths (/static/...) will still break unless they honour X-Forwarded-Prefix;
+// that is the same limitation kubectl proxy has.
+func (s *Server) handlePortForwardProxy(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "id")
+
+	pfManager.mu.RLock()
+	session, ok := pfManager.sessions[sessionID]
+	var target *url.URL
+	if ok && session.Status == "running" {
+		scheme := "http"
+		if session.Scheme == "https" {
+			scheme = "https"
+		}
+		target = &url.URL{Scheme: scheme, Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(session.LocalPort))}
+	}
+	pfManager.mu.RUnlock()
+
+	if target == nil {
+		s.writeError(w, http.StatusNotFound, "port forward not found or not running")
+		return
+	}
+
+	rest := chi.URLParam(r, "*")
+	prefix := strings.TrimSuffix(strings.TrimSuffix(r.URL.Path, rest), "/")
+
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.URL.Path = "/" + rest
+			pr.Out.URL.RawPath = ""
+			pr.Out.Host = target.Host
+			pr.SetXForwarded()
+			pr.Out.Header.Set("X-Forwarded-Prefix", prefix)
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			// Absolute-path redirects from the app would leave the proxy prefix.
+			if loc := resp.Header.Get("Location"); strings.HasPrefix(loc, "/") && !strings.HasPrefix(loc, "//") && !strings.HasPrefix(loc, prefix) {
+				resp.Header.Set("Location", prefix+loc)
+			}
+			return nil
+		},
+		Transport: &http.Transport{
+			// Pods that serve HTTPS almost always use self-signed certs, and the
+			// hop is loopback-to-SPDY, so verification buys nothing here.
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		FlushInterval: -1,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("[portforward] proxy %s → %s failed: %v", sessionID, target.Host, err)
+			s.writeError(w, http.StatusBadGateway, fmt.Sprintf("port forward %s: %v", sessionID, err))
+		},
+	}
+	proxy.ServeHTTP(w, r)
 }
 
 // handleStopPortForward stops an active port forward session

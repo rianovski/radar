@@ -49,7 +49,21 @@ interface PortForwardSession {
   error?: string
 }
 
+// A forward listens on the loopback of the machine running Radar. When the
+// browser is somewhere else (Radar in-cluster or on a shared server) that
+// port is unreachable, and Radar's own proxy endpoint is the only way in.
+function browserIsOnRadarHost(): boolean {
+  const host = window.location.hostname
+  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1'
+}
+
+function proxyUrl(session: PortForwardSession): string {
+  const path = apiUrl(`/portforwards/${session.id}/proxy/`)
+  return /^https?:\/\//.test(path) ? path : `${window.location.origin}${path}`
+}
+
 function sessionUrl(session: PortForwardSession): string {
+  if (!browserIsOnRadarHost()) return proxyUrl(session)
   return `${session.scheme || 'http'}://localhost:${session.localPort}`
 }
 
@@ -809,8 +823,9 @@ export function PortForwardPanel() {
                             {changingPortId === session.id && (
                               <Loader2 className="w-3 h-3 animate-spin inline mr-1" />
                             )}
-                            {session.listenAddress === '0.0.0.0' ? '0.0.0.0' : 'localhost'}:
-                            {session.localPort}
+                            {browserIsOnRadarHost()
+                              ? `${session.listenAddress === '0.0.0.0' ? '0.0.0.0' : 'localhost'}:${session.localPort}`
+                              : `via radar · :${session.localPort}`}
                             <PenLine className="w-3 h-3 text-theme-text-disabled opacity-0 group-hover/port:opacity-100 transition-opacity" />
                           </code>
                           </Tooltip>
