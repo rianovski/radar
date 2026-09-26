@@ -49,6 +49,13 @@ spec:
             {{- end }}
             {{- end }}
             - --history-limit={{ .Values.timeline.historyLimit }}
+            {{- if .Values.kubeconfig.existingSecret }}
+            - --kubeconfig-dir={{ .Values.kubeconfig.mountPath }}
+            {{- /* An explicit kubeconfig turns off in-cluster mode, which would
+                   otherwise hide the local terminal; the distroless image has
+                   no shell to back it. */}}
+            - --disable-local-terminal
+            {{- end }}
             {{- if .Values.traffic.prometheusUrl }}
             - --prometheus-url={{ .Values.traffic.prometheusUrl }}
             {{- end }}
@@ -193,6 +200,11 @@ spec:
               mountPath: /tmp
             - name: home
               mountPath: /home/nonroot
+            {{- if .Values.kubeconfig.existingSecret }}
+            - name: kubeconfig
+              mountPath: {{ .Values.kubeconfig.mountPath }}
+              readOnly: true
+            {{- end }}
             {{- if and .Values.persistence.enabled (eq .Values.timeline.storage "sqlite") }}
             - name: data
               mountPath: /data
@@ -202,6 +214,11 @@ spec:
           emptyDir: {}
         - name: home
           emptyDir: {}
+        {{- if .Values.kubeconfig.existingSecret }}
+        - name: kubeconfig
+          secret:
+            secretName: {{ .Values.kubeconfig.existingSecret }}
+        {{- end }}
         {{- if and .Values.persistence.enabled (eq .Values.timeline.storage "sqlite") }}
         - name: data
           persistentVolumeClaim:

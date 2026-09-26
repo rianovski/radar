@@ -116,6 +116,60 @@ radar.<cluster-name>.<domain>
 ```
 Example: `radar.prod-us-east1.example.com`
 
+## One Radar for Several Clusters
+
+Instead of one Radar per cluster, a single in-cluster Radar can serve several
+clusters and let users switch between them from the header. Mount a Secret of
+kubeconfig files and point the chart at it:
+
+```bash
+kubectl create secret generic radar-kubeconfig -n radar \
+  --from-file=prod.yaml=./prod.kubeconfig \
+  --from-file=staging.yaml=./staging.kubeconfig
+
+helm upgrade --install radar skyhook/radar -n radar \
+  --set kubeconfig.existingSecret=radar-kubeconfig \
+  --set auth.mode=proxy
+```
+
+Radar starts with `--kubeconfig-dir=/etc/radar/kubeconfig`, which turns off
+in-cluster mode: the ServiceAccount is no longer used, and every cluster —
+including the one Radar runs in — needs a context in one of the mounted files.
+Files are loaded in isolation, so contexts with the same name in different
+files do not collide.
+
+With `auth.mode=proxy` or `oidc`, the active context is tracked per signed-in
+user. Two users can be on different clusters at the same time, and one user
+switching does not affect the other. Without auth every visitor shares one
+context.
+
+Credentials in the kubeconfig must work without a helper binary — the image is
+distroless, so `aws eks get-token`, `gke-gcloud-auth-plugin` and `kubelogin`
+are not available. A simple option is a ServiceAccount on each target cluster
+with a long-lived token:
+
+```bash
+# On the target cluster
+kubectl create serviceaccount radar-reader -n kube-system
+kubectl create clusterrolebinding radar-reader --clusterrole=view \
+  --serviceaccount=kube-system:radar-reader
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: radar-reader-token
+  namespace: kube-system
+  annotations:
+    kubernetes.io/service-account.name: radar-reader
+type: kubernetes.io/service-account-token
+EOF
+```
+
+Then build a kubeconfig with that token (`kubectl config set-credentials
+--token=...`) and the cluster's CA, and add it to the Secret. Grant the
+ServiceAccount whatever the Radar features you use need — the same
+permissions the chart's `rbac.*` toggles grant on the local cluster.
+
 ## RBAC
 
 Radar uses its ServiceAccount to access the Kubernetes API. The Helm chart creates a ClusterRole with **read-only access** to common resources by default:

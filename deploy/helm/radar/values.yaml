@@ -205,6 +205,28 @@ timeline:
   # in-cluster deployments). Cleanup runs hourly + once at startup.
   retention: 168h
 
+# Multi-cluster: connect Radar to clusters other than the one it runs in.
+#
+# Mount a Secret whose keys are kubeconfig files. Radar loads every file in
+# isolation (--kubeconfig-dir), so contexts that share a name across files
+# do not collide, and users pick a cluster from the context switcher in the
+# header. With auth.mode=proxy or oidc each signed-in user switches
+# independently — one user's pick never affects another's.
+#
+# When set, the pod's ServiceAccount is no longer used to reach any API
+# server: every cluster, including the one Radar runs in, needs a context in
+# the mounted kubeconfig. The image is distroless, so exec-based credential
+# plugins (aws eks get-token, gke-gcloud-auth-plugin, kubelogin) cannot run —
+# use contexts that carry a bearer token or client certificate directly.
+#
+#   kubectl create secret generic radar-kubeconfig -n radar \
+#     --from-file=prod.yaml=./prod.kubeconfig \
+#     --from-file=staging.yaml=./staging.kubeconfig
+kubeconfig:
+  existingSecret: ""
+  # Directory the Secret's files are mounted at (passed as --kubeconfig-dir).
+  mountPath: /etc/radar/kubeconfig
+
 # Authentication and RBAC configuration
 auth:
   # Authentication mode: "none" (default), "proxy", or "oidc"

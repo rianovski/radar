@@ -77,6 +77,37 @@ applies to GitOps users: manage the Secret with SealedSecrets / SOPS /
 External Secrets and reference it via `cloud.existingSecret`; Helm never
 touches its contents.
 
+### Multi-cluster (mounted kubeconfig)
+
+By default Radar reaches the API server through the pod's ServiceAccount and
+only sees the cluster it runs in. To let users switch between clusters from
+the header, mount a Secret of kubeconfig files:
+
+```bash
+kubectl create secret generic radar-kubeconfig -n radar \
+  --from-file=prod.yaml=./prod.kubeconfig \
+  --from-file=staging.yaml=./staging.kubeconfig
+helm upgrade --install radar skyhook/radar -n radar \
+  --set kubeconfig.existingSecret=radar-kubeconfig \
+  --set auth.mode=proxy
+```
+
+Each file is loaded in isolation (`--kubeconfig-dir`), so a context named
+`default` in two files does not collide. With `auth.mode=proxy` or `oidc`
+every signed-in user has their own active context — one user switching does
+not move anyone else.
+
+Things to know:
+
+- The ServiceAccount is no longer used once a kubeconfig is mounted. Every
+  cluster, including the local one, must have a context in the Secret.
+- The image is distroless: exec credential plugins (`aws eks get-token`,
+  `gke-gcloud-auth-plugin`, `kubelogin`) cannot run. Use contexts with a
+  bearer token (for example a long-lived ServiceAccount token created on the
+  target cluster) or a client certificate.
+- Rotating credentials is a `kubectl apply` on the Secret; kubelet refreshes
+  the mounted files, and the change is picked up on the next connect.
+
 ## Configuration
 
 | Parameter | Description | Default |
@@ -92,6 +123,8 @@ touches its contents.
 | `timeline.retention` | SQLite retention (Go duration; `0` disables) | `168h` |
 | `persistence.enabled` | Enable PVC for SQLite | `false` |
 | `traffic.prometheusUrl` | Manual Prometheus/VictoriaMetrics URL (skips auto-discovery) | `""` |
+| `kubeconfig.existingSecret` | Secret of kubeconfig files to mount for multi-cluster switching (turns off in-cluster mode) | `""` |
+| `kubeconfig.mountPath` | Where the Secret is mounted; passed as `--kubeconfig-dir` | `/etc/radar/kubeconfig` |
 | `resources.limits.memory` | Memory limit | `512Mi` |
 | `resources.requests.memory` | Memory request | `128Mi` |
 

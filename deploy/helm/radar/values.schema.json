@@ -206,6 +206,19 @@
         }
       }
     },
+    "kubeconfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": {
+          "type": "string",
+          "description": "Secret whose keys are kubeconfig files; mounted and passed as --kubeconfig-dir. Turns off in-cluster mode."
+        },
+        "mountPath": {
+          "type": "string"
+        }
+      }
+    },
     "cloud": {
       "type": "object",
       "additionalProperties": false,
