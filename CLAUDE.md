@@ -607,7 +607,8 @@ See `internal/helm/handlers.go` and `server.helmContextFor` for a fully-worked e
 | Audit handlers | `s.cacheFor(r)` | |
 | Topology builds in handlers | `k8s.NewTopologyResourceProvider(s.cacheFor(r))` + `s.dynCacheFor(r)` | |
 | SSE broadcasting | `s.broadcasterFor(username)` + pool-entry `SSEBroadcaster` via `entryFunc = pool.EntryForContext(contextName)` | |
-| `context_changed` SSE event delivery | `BroadcastReliable` (blocking send with timeout) — NOT `Broadcast` | a dropped `context_changed` leaves the UI overlay stuck forever |
+| `context_changed` SSE event delivery | `BroadcastReliableTo(username, …)` (blocking send with timeout, filtered to that user's streams) — NOT `Broadcast` / `BroadcastReliable` | a dropped `context_changed` leaves the UI overlay stuck forever; an unfiltered one makes every other user on the same broadcaster wipe their UI and "switch" too. Each SSE client records its `Username` at subscribe time (`SubscribeAs`) |
+| `/api/connection/retry` | short-circuits when the user is on a non-default pool entry | otherwise it would `StopAllSessions()` for everyone and reconnect the global default context |
 
 ### Still wired to global state — KNOWN BUGS, prioritized
 

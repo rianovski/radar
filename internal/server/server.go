@@ -2847,6 +2847,11 @@ func (s *Server) handleSwitchContext(w http.ResponseWriter, r *http.Request) {
 	// Pool-based per-user switch: only affects the requesting user.
 	if s.pool != nil {
 		username := usernameFrom(r)
+		if username == "" && s.authConfig.Enabled() {
+			// The pool keys context by username, so an empty one collapses every
+			// such request onto a single shared slot and the switch hits everyone.
+			log.Printf("[context] switch to %q requested without an authenticated username — identity headers are not reaching radar", name)
+		}
 		// Capture the broadcaster the user is currently connected to BEFORE
 		// switching — pool.Switch changes ContextForUser, so broadcasterFor
 		// would resolve to the new context's broadcaster after the call.
@@ -2861,7 +2866,9 @@ func (s *Server) handleSwitchContext(w http.ResponseWriter, r *http.Request) {
 		// switching overlay stuck because waitingForTopologyAfterSwitch is
 		// only set in response to this event, and the buffered eventCh can
 		// fill up if a slow client/proxy is backpressuring topology updates.
-		prevBroadcaster.BroadcastReliable(SSEEvent{
+		// Target only this user's streams: the broadcaster is shared with
+		// every other user still on the old context.
+		prevBroadcaster.BroadcastReliableTo(username, SSEEvent{
 			Event: "context_changed",
 			Data:  map[string]any{"context": name},
 		}, 2*time.Second)
@@ -2937,6 +2944,16 @@ func (s *Server) handleConnectionRetry(w http.ResponseWriter, r *http.Request) {
 	if ctx == "" {
 		s.writeError(w, http.StatusBadRequest, "no context configured")
 		return
+	}
+
+	// A user on a non-default pool entry is already connected (entries only
+	// exist post-connect). Retrying here would tear down every user's
+	// sessions and reconnect the global default context instead of theirs.
+	if s.pool != nil {
+		if userCtx := s.pool.ContextForUser(usernameFrom(r)); userCtx != "" && userCtx != ctx {
+			s.writeJSON(w, k8s.ConnectionStatus{State: k8s.StateConnected, Context: userCtx})
+			return
+		}
 	}
 
 	// Stop all active sessions before retrying

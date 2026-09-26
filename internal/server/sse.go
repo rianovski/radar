@@ -53,6 +53,7 @@ type ClientInfo struct {
 	Namespaces       []string // Filter to specific namespaces (empty = all)
 	ViewMode         string   // "full" or "traffic"
 	ShowPolicyEffect bool     // Evaluate NetworkPolicies on edges
+	Username         string   // Authenticated user owning this stream (empty when auth is off)
 }
 
 type clientRegistration struct {
@@ -60,6 +61,7 @@ type clientRegistration struct {
 	namespaces       []string
 	viewMode         string
 	showPolicyEffect bool
+	username         string
 }
 
 // SSEEvent represents an event to send to clients
@@ -376,9 +378,9 @@ func (b *SSEBroadcaster) run() {
 				close(reg.ch) // Signal rejection by closing the channel
 				continue
 			}
-			b.clients[reg.ch] = ClientInfo{Namespaces: reg.namespaces, ViewMode: reg.viewMode, ShowPolicyEffect: reg.showPolicyEffect}
+			b.clients[reg.ch] = ClientInfo{Namespaces: reg.namespaces, ViewMode: reg.viewMode, ShowPolicyEffect: reg.showPolicyEffect, Username: reg.username}
 			b.mu.Unlock()
-			log.Printf("SSE client connected (namespaces=%v, view=%s), total clients: %d", reg.namespaces, reg.viewMode, len(b.clients))
+			log.Printf("SSE client connected (user=%q, namespaces=%v, view=%s), total clients: %d", reg.username, reg.namespaces, reg.viewMode, len(b.clients))
 
 		case ch := <-b.unregister:
 			b.mu.Lock()
@@ -680,18 +682,34 @@ func (b *SSEBroadcaster) Broadcast(event SSEEvent) {
 // the UI's "switching context" overlay never clears). Logs the number of
 // recipients that timed out so the drop is observable.
 func (b *SSEBroadcaster) BroadcastReliable(event SSEEvent, timeout time.Duration) {
+	b.broadcastReliable(event, timeout, nil)
+}
+
+// BroadcastReliableTo is BroadcastReliable restricted to the streams owned by
+// username. Broadcasters are shared by every user on the same context, so a
+// per-user control event (context_changed after one user switches) must not
+// reach the other users on that context — they would wipe their UI state and
+// reconnect even though their own context never changed.
+func (b *SSEBroadcaster) BroadcastReliableTo(username string, event SSEEvent, timeout time.Duration) {
+	b.broadcastReliable(event, timeout, func(info ClientInfo) bool { return info.Username == username })
+}
+
+func (b *SSEBroadcaster) broadcastReliable(event SSEEvent, timeout time.Duration, match func(ClientInfo) bool) {
 	b.mu.RLock()
 	chans := make([]chan SSEEvent, 0, len(b.clients))
-	for ch := range b.clients {
-		chans = append(chans, ch)
+	for ch, info := range b.clients {
+		if match == nil || match(info) {
+			chans = append(chans, ch)
+		}
 	}
+	total := len(b.clients)
 	b.mu.RUnlock()
 
 	tag := b.contextName
 	if tag == "" {
 		tag = "default"
 	}
-	log.Printf("SSE broadcaster[%s]: BroadcastReliable %q to %d clients", tag, event.Event, len(chans))
+	log.Printf("SSE broadcaster[%s]: BroadcastReliable %q to %d/%d clients", tag, event.Event, len(chans), total)
 
 	var timedOut int
 	for _, ch := range chans {
@@ -706,6 +724,12 @@ func (b *SSEBroadcaster) BroadcastReliable(event SSEEvent, timeout time.Duration
 
 // Subscribe adds a new SSE client. Returns nil if max clients reached.
 func (b *SSEBroadcaster) Subscribe(namespaces []string, viewMode string, showPolicyEffect ...bool) chan SSEEvent {
+	return b.SubscribeAs("", namespaces, viewMode, showPolicyEffect...)
+}
+
+// SubscribeAs is Subscribe with the owning username recorded on the client so
+// per-user control events can be targeted.
+func (b *SSEBroadcaster) SubscribeAs(username string, namespaces []string, viewMode string, showPolicyEffect ...bool) chan SSEEvent {
 	// Check client count before creating the channel to fail fast
 	b.mu.RLock()
 	clientCount := len(b.clients)
@@ -727,7 +751,7 @@ func (b *SSEBroadcaster) Subscribe(namespaces []string, viewMode string, showPol
 
 	policyEffect := len(showPolicyEffect) > 0 && showPolicyEffect[0]
 	ch := make(chan SSEEvent, 10)
-	b.register <- clientRegistration{ch: ch, namespaces: sortedNs, viewMode: viewMode, showPolicyEffect: policyEffect}
+	b.register <- clientRegistration{ch: ch, namespaces: sortedNs, viewMode: viewMode, showPolicyEffect: policyEffect, username: username}
 	return ch
 }
 
@@ -835,7 +859,7 @@ func (b *SSEBroadcaster) HandleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Subscribe to events
-	eventCh := b.Subscribe(namespaces, viewMode, policyEffect)
+	eventCh := b.SubscribeAs(usernameFrom(r), namespaces, viewMode, policyEffect)
 	if eventCh == nil {
 		http.Error(w, "Too many SSE connections", http.StatusServiceUnavailable)
 		return
