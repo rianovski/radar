@@ -29,6 +29,8 @@ interface TooltipProps {
   className?: string
   /** Whether tooltip is disabled */
   disabled?: boolean
+  /** Keep the wrapper mounted while disabled when child layout measurement requires stable DOM ancestry. */
+  preserveWrapperWhenDisabled?: boolean
   /** Additional class for the wrapper span (useful for positioning) */
   wrapperClassName?: string
   /** Inline styles for the wrapper span (useful for absolute positioning) */
@@ -42,6 +44,7 @@ export function Tooltip({
   position = 'top',
   className,
   disabled = false,
+  preserveWrapperWhenDisabled = false,
   wrapperClassName,
   wrapperStyle,
 }: TooltipProps) {
@@ -54,6 +57,7 @@ export function Tooltip({
   const triggerRef = useRef<HTMLSpanElement>(null)
   const tooltipRef = useRef<HTMLSpanElement>(null)
   const timeoutRef = useRef<number | null>(null)
+  const hideTimeoutRef = useRef<number | null>(null)
   const rafRef = useRef<number | null>(null)
 
   const updatePosition = useCallback(() => {
@@ -94,12 +98,27 @@ export function Tooltip({
       clearTimeout(timeoutRef.current)
       timeoutRef.current = null
     }
+    if (hideTimeoutRef.current) {
+      clearTimeout(hideTimeoutRef.current)
+      hideTimeoutRef.current = null
+    }
+    if (activeHide === hideRef.current) {
+      activeHide = null
+    }
     setIsVisible(false)
     setCoords(null)
   }
 
+  const cancelHide = () => {
+    if (hideTimeoutRef.current) {
+      clearTimeout(hideTimeoutRef.current)
+      hideTimeoutRef.current = null
+    }
+  }
+
   const showTooltip = () => {
     if (disabled || !content) return
+    cancelHide()
     timeoutRef.current = window.setTimeout(() => {
       // Singleton: hide whoever was visible before us, register self
       // as the new active tooltip. Guards against stuck duplicates.
@@ -116,11 +135,24 @@ export function Tooltip({
       clearTimeout(timeoutRef.current)
       timeoutRef.current = null
     }
+    if (hideTimeoutRef.current) {
+      clearTimeout(hideTimeoutRef.current)
+      hideTimeoutRef.current = null
+    }
     if (activeHide === hideRef.current) {
       activeHide = null
     }
     setIsVisible(false)
     setCoords(null)
+  }
+
+  const scheduleHideTooltip = () => {
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current)
+      timeoutRef.current = null
+    }
+    if (hideTimeoutRef.current) return
+    hideTimeoutRef.current = window.setTimeout(hideTooltip, 80)
   }
 
   useEffect(() => {
@@ -144,6 +176,9 @@ export function Tooltip({
       if (timeoutRef.current) {
         clearTimeout(timeoutRef.current)
       }
+      if (hideTimeoutRef.current) {
+        clearTimeout(hideTimeoutRef.current)
+      }
       if (rafRef.current !== null) {
         cancelAnimationFrame(rafRef.current)
       }
@@ -165,12 +200,7 @@ export function Tooltip({
   // pointer-events-none and never fires mouseleave.
   useEffect(() => {
     if (disabled) {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current)
-        timeoutRef.current = null
-      }
-      setIsVisible(false)
-      setCoords(null)
+      hideRef.current()
     }
   }, [disabled])
 
@@ -191,7 +221,7 @@ export function Tooltip({
     }
   }, [isVisible])
 
-  if (disabled || !content) {
+  if ((disabled && !preserveWrapperWhenDisabled) || !content) {
     return <>{children}</>
   }
 
@@ -202,7 +232,7 @@ export function Tooltip({
         className={clsx('inline-flex max-w-full', wrapperClassName)}
         style={wrapperStyle}
         onMouseEnter={showTooltip}
-        onMouseLeave={hideTooltip}
+        onMouseLeave={scheduleHideTooltip}
         onFocus={showTooltip}
         onBlur={hideTooltip}
         // pointerdown fires before click, so the tooltip is gone before
@@ -212,7 +242,7 @@ export function Tooltip({
       >
         {children}
       </span>
-      {isVisible &&
+      {isVisible && !disabled &&
         createPortal(
           <span
             ref={tooltipRef}
@@ -227,7 +257,7 @@ export function Tooltip({
               // max-w-xs (320px) + whitespace-normal, short tooltips
               // still fit on one line (content shorter than max-width)
               // and long ones wrap naturally near the trigger.
-              'max-w-xs whitespace-normal break-words pointer-events-none',
+              'max-w-xs whitespace-normal break-words',
               className
             )}
             style={{
@@ -238,6 +268,8 @@ export function Tooltip({
             }}
             role="tooltip"
             aria-hidden={coords ? undefined : true}
+            onMouseEnter={cancelHide}
+            onMouseLeave={scheduleHideTooltip}
           >
             {content}
           </span>,

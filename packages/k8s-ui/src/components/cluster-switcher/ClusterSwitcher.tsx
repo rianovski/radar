@@ -9,6 +9,7 @@ import {
 } from 'react'
 import { ChevronDown, Check, FolderOpen, Loader2, Search, Server, X } from 'lucide-react'
 import { ClusterName } from '../ui/ClusterName'
+import { Input } from '../ui/Input'
 import { MiddleEllipsis } from '../ui/MiddleEllipsis'
 import { StatusDot, type StatusTone } from '../ui/status-tone'
 
@@ -17,6 +18,9 @@ export interface ClusterSwitcherItem {
   /** Raw context / display string. ClusterName collapses GKE/EKS/AKS
    *  shapes; user-named clusters pass through unchanged. */
   name: string
+  /** Short qualifier rendered after the parsed name without affecting
+   *  provider detection, e.g. a source suffix for colliding contexts. */
+  nameQualifier?: string
   secondary?: string
   badge?: string
   /** Origin label, rendered as a folder-icon line under the name.
@@ -43,6 +47,8 @@ export interface ClusterSwitcherProps {
   /** Raw context / display string. Pass it as-is — the trigger renders
    *  through ClusterName, which handles parse + provider badge + tooltip. */
   currentName: string
+  /** Trigger-side counterpart to {@link ClusterSwitcherItem.nameQualifier}. */
+  currentNameQualifier?: string
   /** Trigger-side counterpart to {@link ClusterSwitcherItem.sourceLabel}.
    *  Only pass when 2+ kubeconfig sources are loaded. */
   currentSourceLabel?: string
@@ -58,6 +64,15 @@ export interface ClusterSwitcherProps {
   errorSlot?: ReactNode
   className?: string
   align?: 'left' | 'right'
+  /**
+   * 'chip' (default) renders a self-contained bordered pill. 'segment' renders
+   * a borderless label+value cell for embedding in a shared bordered container
+   * (the unified cluster+namespace scope control) — no border/background/min-w
+   * of its own, with an optional muted {@link label} before the value.
+   */
+  variant?: 'chip' | 'segment'
+  /** Muted label shown before the value in the 'segment' variant (e.g. "Cluster"). */
+  label?: string
 }
 
 // Trigger width cap. With middle-truncation kicking in, this is a
@@ -70,6 +85,7 @@ const TRIGGER_NAME_MAX_WIDTH = 'max-w-[140px] sm:max-w-[220px] xl:max-w-[340px]'
 export const ClusterSwitcher = forwardRef<ClusterSwitcherHandle, ClusterSwitcherProps>(({
   currentId,
   currentName,
+  currentNameQualifier,
   currentSourceLabel,
   items,
   onSelect,
@@ -83,6 +99,8 @@ export const ClusterSwitcher = forwardRef<ClusterSwitcherHandle, ClusterSwitcher
   errorSlot,
   className = '',
   align = 'left',
+  variant = 'chip',
+  label,
 }, ref) => {
   const [isOpen, setIsOpen] = useState(false)
   const [search, setSearch] = useState('')
@@ -102,6 +120,7 @@ export const ClusterSwitcher = forwardRef<ClusterSwitcherHandle, ClusterSwitcher
       if (!q) return true
       return (
         item.name.toLowerCase().includes(q) ||
+        item.nameQualifier?.toLowerCase().includes(q) ||
         item.secondary?.toLowerCase().includes(q) ||
         item.badge?.toLowerCase().includes(q) ||
         item.sourceLabel?.toLowerCase().includes(q) ||
@@ -195,14 +214,21 @@ export const ClusterSwitcher = forwardRef<ClusterSwitcherHandle, ClusterSwitcher
         type="button"
         onClick={() => setIsOpen(v => !v)}
         disabled={disabled || loading}
-        className={`
-          flex items-center gap-1.5 px-2.5 py-1.5 min-w-[140px]
-          bg-theme-elevated border border-theme-border rounded text-sm font-medium
-          text-theme-text-primary hover:bg-theme-hover hover:border-theme-border-light
-          transition-colors cursor-pointer
-          disabled:opacity-50 disabled:cursor-not-allowed
-        `}
+        className={
+          variant === 'segment'
+            ? `flex items-center gap-1.5 px-3 py-1.5 h-full min-w-[150px] max-w-[264px] overflow-hidden text-[13px] font-medium
+               text-theme-text-primary hover:bg-theme-hover transition-colors cursor-pointer
+               disabled:opacity-50 disabled:cursor-not-allowed`
+            : `flex items-center gap-1.5 px-2.5 py-1.5 min-w-[140px]
+               bg-theme-elevated border border-theme-border rounded text-sm font-medium
+               text-theme-text-primary hover:bg-theme-hover hover:border-theme-border-light
+               transition-colors cursor-pointer
+               disabled:opacity-50 disabled:cursor-not-allowed`
+        }
       >
+        {label && (
+          <span className="shrink-0 font-normal text-theme-text-tertiary">{label}</span>
+        )}
         {loading ? (
           <>
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -217,12 +243,25 @@ export const ClusterSwitcher = forwardRef<ClusterSwitcherHandle, ClusterSwitcher
           // context inline (per-row secondary line), and an extra hover
           // tooltip would just overlap the search input.
           <>
-            <ClusterName
-              name={currentName}
-              fallbackBadge={<Server className="w-3.5 h-3.5 text-theme-text-secondary" />}
-              className={TRIGGER_NAME_MAX_WIDTH}
-              noTooltip={isOpen}
-            />
+            {/* flex (not a plain span): ClusterName is inline-flex and would
+                otherwise baseline-align inside this wrapper's line box,
+                sitting a couple px above the segment's vertical center. */}
+            <span className={variant === 'segment' ? 'flex items-center min-w-0 flex-1' : 'flex items-center min-w-0'}>
+              <ClusterName
+                name={currentName}
+                fallbackBadge={<Server className="w-3.5 h-3.5 text-theme-text-secondary" />}
+                className={variant === 'segment' ? 'min-w-0 max-w-full' : TRIGGER_NAME_MAX_WIDTH}
+                noTooltip={isOpen}
+              />
+            </span>
+            {currentNameQualifier && (
+              <span
+                className="shrink-0 max-w-[80px] truncate text-xs font-normal text-theme-text-tertiary"
+                title={currentNameQualifier}
+              >
+                {currentNameQualifier}
+              </span>
+            )}
             {currentSourceLabel && (
               // Icon-only on the trigger: long folder paths (the very case
               // that motivates the chip) middle-truncate to something
@@ -240,7 +279,7 @@ export const ClusterSwitcher = forwardRef<ClusterSwitcherHandle, ClusterSwitcher
             )}
           </>
         )}
-        <ChevronDown className={`w-3 h-3 ml-auto transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+        <ChevronDown className={`w-3 h-3 shrink-0 transition-transform ${variant === 'segment' ? '' : 'ml-auto'} ${isOpen ? 'rotate-180' : ''}`} />
       </button>
 
       {isOpen && (
@@ -251,9 +290,8 @@ export const ClusterSwitcher = forwardRef<ClusterSwitcherHandle, ClusterSwitcher
             <div className="p-2 border-b border-theme-border">
               <div className="relative">
                 <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-theme-text-tertiary" />
-                <input
+                <Input
                   ref={searchInputRef}
-                  type="text"
                   value={search}
                   onChange={e => setSearch(e.target.value)}
                   onKeyDown={onSearchKeyDown}
@@ -340,6 +378,14 @@ export const ClusterSwitcher = forwardRef<ClusterSwitcherHandle, ClusterSwitcher
                                     : 'text-theme-text-primary'
                               }`}
                             />
+                            {item.nameQualifier && (
+                              <span
+                                className="shrink-0 max-w-[120px] truncate text-xs font-normal text-theme-text-tertiary"
+                                title={item.nameQualifier}
+                              >
+                                {item.nameQualifier}
+                              </span>
+                            )}
                             {item.badge && (
                               <span className="shrink-0 text-[10px] text-theme-text-tertiary bg-theme-elevated px-1 rounded">
                                 {item.badge}

@@ -13,6 +13,8 @@ import (
 	"helm.sh/helm/v3/pkg/storage"
 	"helm.sh/helm/v3/pkg/storage/driver"
 	helmtime "helm.sh/helm/v3/pkg/time"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 func memoryActionConfig(t *testing.T) *action.Configuration {
@@ -168,6 +170,71 @@ func TestPreInstallCheck_UnknownStatusFailsClosed(t *testing.T) {
 	}
 }
 
+func TestFreshInstallCheck_ClassifiesEveryHistoryState(t *testing.T) {
+	tests := []struct {
+		status release.Status
+		kind   string
+	}{
+		{release.StatusDeployed, "exists"},
+		{release.StatusPendingInstall, "pending"},
+		{release.StatusPendingUpgrade, "pending"},
+		{release.StatusPendingRollback, "pending"},
+		{release.StatusUninstalling, "pending"},
+		{release.StatusFailed, "history"},
+		{release.StatusSuperseded, "history"},
+		{release.StatusUninstalled, "history"},
+		{release.Status("future-state"), "pending"},
+	}
+	for _, tc := range tests {
+		t.Run(string(tc.status), func(t *testing.T) {
+			cfg := memoryActionConfig(t)
+			seedRelease(t, cfg, "radar", tc.status, 7)
+			err := freshInstallCheck(cfg, "radar", "radar")
+			switch tc.kind {
+			case "exists":
+				var target *ReleaseExistsError
+				if !errors.As(err, &target) || target.Revision != 7 {
+					t.Fatalf("expected ReleaseExistsError revision 7, got %T: %v", err, err)
+				}
+			case "pending":
+				var target *ReleasePendingError
+				if !errors.As(err, &target) || target.Status != string(tc.status) {
+					t.Fatalf("expected ReleasePendingError status %q, got %T: %v", tc.status, err, err)
+				}
+			case "history":
+				var target *ReleaseHistoryError
+				if !errors.As(err, &target) || target.Status != string(tc.status) || target.Revision != 7 {
+					t.Fatalf("expected ReleaseHistoryError status %q revision 7, got %T: %v", tc.status, err, err)
+				}
+			}
+		})
+	}
+}
+
+func TestInspectStoredRelease_NamespaceNotFoundMeansNoHistory(t *testing.T) {
+	missingNamespace := apierrors.NewNotFound(schema.GroupResource{Resource: "namespaces"}, "radar")
+	memory := driver.NewMemory()
+	cfg := memoryActionConfig(t)
+	cfg.Releases = storage.Init(&queryErrorDriver{Driver: memory, err: missingNamespace})
+
+	state, err := inspectStoredRelease(cfg, "radar")
+	if err != nil {
+		t.Fatalf("missing namespace should mean no release history: %v", err)
+	}
+	if state.kind != storedReleaseNone {
+		t.Fatalf("state = %+v, want no release history", state)
+	}
+}
+
+type queryErrorDriver struct {
+	driver.Driver
+	err error
+}
+
+func (d *queryErrorDriver) Query(map[string]string) ([]*release.Release, error) {
+	return nil, d.err
+}
+
 func TestClassifyHelmRBACError(t *testing.T) {
 	// Real Helm pre-flight error string from caretta install in cloud-mode.
 	raw := errors.New(`install failed: Unable to continue with install: ` +
@@ -208,7 +275,7 @@ func TestClassifyHelmRBACError_NotMatching(t *testing.T) {
 }
 
 // TestClassifyInstallError pins the (status, code, message) mapping for every
-// branch the SPA depends on. Streaming and non-streaming endpoints both go
+// branch the frontend depends on. Streaming and non-streaming endpoints both go
 // through this classifier, so a regression here breaks both UIs at once.
 func TestClassifyInstallError(t *testing.T) {
 	rbacErr := errors.New(`Unable to continue: clusterroles.rbac.authorization.k8s.io "x" is forbidden: ` +
@@ -245,7 +312,7 @@ func TestClassifyInstallError(t *testing.T) {
 
 // TestInstallStreamErrorEvent ensures the SSE envelope carries the same
 // friendly message and error_code as the JSON HTTP path. A typo in the
-// field name ("errorCode" vs "error_code") would silently break the SPA's
+// field name ("errorCode" vs "error_code") would silently break the frontend's
 // install-stream branching; this pins the wire format.
 func TestInstallStreamErrorEvent(t *testing.T) {
 	event := installStreamErrorEvent(&ReleasePendingError{Name: "x", Namespace: "y", Status: "pending-install", Revision: 1})

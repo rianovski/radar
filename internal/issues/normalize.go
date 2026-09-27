@@ -1,0 +1,236 @@
+package issues
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/pkg/issuesapi"
+	"github.com/skyhook-io/radar/pkg/resourceid"
+)
+
+// resolveGroup returns the explicit group if set, else falls back to the
+// built-in (Kind→Group) table. Some legacy Problem emission sites in
+// k8s.DetectProblems still leave Group="" for built-in workloads
+// (Deployment, StatefulSet, etc.) — without this fallback, the
+// group-aware consumer (computeIssueSummaryForResource) would silently
+// drop those rows when looking up by canonical group like "apps".
+// Centralised here so the (Kind→Group) map lives in one place across
+// packages (pkg/resourceid owns the table; this is a pass-through).
+func resolveGroup(group, kind string) string {
+	if group != "" {
+		return group
+	}
+	return resourceid.GroupForBuiltinKind(kind)
+}
+
+// issuesSeverity maps a detector/insights severity token onto the issuesapi
+// two-tier wire vocabulary. The live-issues stream is critical|warning only
+// (info-tier detections are dropped upstream in Compose). "alert" — the
+// intermediate insights tier — collapses to critical so a GitOps detector
+// that emits alert (e.g. a stuck-drift loop) is NOT silently downgraded to
+// warning; every other token (high, medium, warning, "") maps to warning.
+func issuesSeverity(token string) Severity {
+	switch token {
+	case "critical", "alert":
+		return SeverityCritical
+	default:
+		return SeverityWarning
+	}
+}
+
+func issueTimingIndependentOfOnset(basis string) bool {
+	switch basis {
+	case "owner_condition", "pod_creation", "spec":
+		return true
+	default:
+		return false
+	}
+}
+
+func timingSummary(i Issue) string {
+	if i.OnsetCoverage != nil && i.OnsetCoverage.Unknown > 0 {
+		if i.OnsetCoverage.Known > 0 && !i.FirstSeen.IsZero() {
+			summary := fmt.Sprintf("Some signals were active at least since %s; exact onset is unknown for %d other %s.",
+				i.FirstSeen.UTC().Format(time.RFC3339), i.OnsetCoverage.Unknown, pluralSignal(i.OnsetCoverage.Unknown))
+			if evidence := independentTimingSummary(i); evidence != "" {
+				return summary + " " + evidence
+			}
+			return summary
+		}
+		summary := fmt.Sprintf("Exact onset is unknown for all %d contributing %s.",
+			i.OnsetCoverage.Unknown, pluralSignal(i.OnsetCoverage.Unknown))
+		if evidence := independentTimingSummary(i); evidence != "" {
+			return summary + " " + evidence
+		}
+		return summary
+	}
+
+	if i.OnsetUnknown {
+		if evidence := independentTimingSummary(i); evidence != "" {
+			return "Exact onset of this specific issue is unknown. " + evidence
+		}
+	}
+	return ""
+}
+
+func independentTimingSummary(i Issue) string {
+	if i.OnsetCoverage != nil && i.OnsetCoverage.Known+i.OnsetCoverage.Unknown > 1 {
+		switch i.IssueTimingBasis {
+		case "owner_condition":
+			if i.IssueTiming == "started_at_resource_creation" {
+				return "Workload-level evidence shows the owner never became healthy after deployment."
+			}
+			if i.IssueTiming == "started_after_resource_was_healthy" {
+				return "Workload-level evidence shows the owner was healthy before its current health regression."
+			}
+		case "pod_creation":
+			if i.IssueTiming == "started_at_resource_creation" {
+				return "Pod-level evidence shows failures in pods created during workload startup."
+			}
+			if i.IssueTiming == "started_after_resource_was_healthy" {
+				return "Pod-level evidence shows failing pods were created after an earlier healthy period."
+			}
+		case "spec":
+			if i.IssueTiming == "started_at_resource_creation" {
+				return "Specification evidence shows failure from first reconciliation."
+			}
+		}
+	}
+
+	switch i.IssueTimingBasis {
+	case "owner_condition":
+		if i.IssueTiming == "started_at_resource_creation" {
+			return "Its owner workload never became healthy after deployment."
+		}
+		if i.IssueTiming == "started_after_resource_was_healthy" {
+			return "Its owner workload was healthy before its current health regression."
+		}
+	case "pod_creation":
+		if i.IssueTiming == "started_at_resource_creation" {
+			return "The affected pod failed during startup of its workload revision."
+		}
+		if i.IssueTiming == "started_after_resource_was_healthy" {
+			return "The affected pod belongs to a later workload revision after an earlier healthy period."
+		}
+	case "spec":
+		if i.IssueTiming == "started_at_resource_creation" {
+			return "The initial specification establishes that the resource was failing from its first reconciliation."
+		}
+	}
+	return ""
+}
+
+func pluralSignal(n int) string {
+	if n == 1 {
+		return "signal"
+	}
+	return "signals"
+}
+
+func fromProblem(p k8s.Detection, now time.Time, source Source) Issue {
+	sev := issuesSeverity(p.Severity)
+	var since time.Time
+	if p.OnsetUnknown {
+		since = time.Time{}
+	} else if !p.OnsetAt.IsZero() && !p.OnsetAt.After(now) {
+		since = p.OnsetAt.UTC()
+	}
+	reason := p.Reason
+	cause, action := p.Cause, p.Action
+	issueTiming, issueTimingBasis := p.IssueTiming, p.IssueTimingBasis
+	if since.IsZero() && !issueTimingIndependentOfOnset(issueTimingBasis) {
+		issueTiming = ""
+		issueTimingBasis = ""
+	}
+	if !p.OnsetAt.IsZero() && p.OnsetAt.After(now) {
+		issueTiming = ""
+		issueTimingBasis = ""
+	}
+	if isForbiddenMessage(p.Message) && !isBatchFailureProblem(p.Kind, p.Reason) {
+		if reason != "RBACForbidden" {
+			// Detector diagnoses describe the original reason and would mislead
+			// after the message promotes the issue to an RBAC failure.
+			cause, action = "", ""
+		}
+		reason = "RBACForbidden"
+	}
+	iss := Issue{
+		Severity:             sev,
+		Source:               source,
+		Kind:                 p.Kind,
+		Group:                resolveGroup(p.Group, p.Kind),
+		Namespace:            p.Namespace,
+		Name:                 p.Name,
+		Reason:               reason,
+		Message:              p.Message,
+		RawMessage:           p.RawMessage,
+		Cause:                cause,
+		Action:               action,
+		RemediationKind:      p.RemediationKind,
+		RemediationTarget:    p.RemediationTarget,
+		OperationRetryCount:  p.OperationRetryCount,
+		Stuck:                p.Stuck,
+		CapacityRelevant:     p.CapacityRelevant,
+		Fingerprint:          p.Fingerprint,
+		FirstSeen:            since,
+		OnsetUnknown:         since.IsZero(),
+		ResourceCreatedAt:    p.ResourceCreatedAt.UTC(),
+		LastSeen:             now,
+		Count:                1,
+		RestartCount:         p.RestartCount,
+		LastTerminatedReason: p.LastTerminatedReason,
+		IssueTiming:          issueTiming,
+		IssueTimingBasis:     issueTimingBasis,
+	}
+	if evidence := p.NodeStartupCorroboration; evidence != nil && reason == p.Reason {
+		iss.Message = p.MessageBeforeCorroboration
+		refs := make([]Ref, 0, min(len(evidence.Pods), maxDiagnosticRefs))
+		for _, pod := range evidence.Pods[:min(len(evidence.Pods), maxDiagnosticRefs)] {
+			refs = append(refs, Ref{Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name})
+		}
+		message := fmt.Sprintf("On node %s, %d visible Pods across %d workload owners have %s, including Pod %s/%s. Matching symptoms do not establish a node cause.", evidence.Node, evidence.PodCount, evidence.OwnerCount, p.Reason, p.Namespace, p.Name)
+		if len(refs) < evidence.PodCount {
+			message += fmt.Sprintf(" Showing %d of %d Pod links.", len(refs), evidence.PodCount)
+		}
+		iss.DiagnosticContext = &issuesapi.DiagnosticContext{Role: issuesapi.DiagnosticRoleContext, Facts: []issuesapi.DiagnosticFact{{Type: factNodeStartupCorroboration, Message: message, Refs: refs}}}
+	}
+	if p.OwnerKind != "" {
+		// Prefer the owner group resolved at detection (carries the real group
+		// for CRD controllers like Argo Rollout); fall back to the builtin
+		// Kind→Group table for legacy emitters that leave it empty.
+		ownerGroup := p.OwnerGroup
+		if ownerGroup == "" {
+			ownerGroup = resolveGroup("", p.OwnerKind)
+		}
+		iss.Owner = Ref{
+			Group:     ownerGroup,
+			Kind:      p.OwnerKind,
+			Namespace: p.Namespace,
+			Name:      p.OwnerName,
+		}
+	}
+	classifyIssue(&iss)
+	enrichIdentity(&iss)
+	return iss
+}
+
+// classifyIssue derives the user-facing Category + its CategoryGroup rollup
+// from the row's detection signal. Pure: same inputs always yield the same
+// labels, so the category stays stable across recomposes (a prerequisite for
+// the future category-in-issue-id contract).
+func classifyIssue(i *Issue) {
+	i.Category = Classify(classifyInput{
+		Source:               i.Source,
+		APIGroup:             i.Group,
+		Kind:                 i.Kind,
+		Reason:               i.Reason,
+		Message:              i.Message,
+		LastTerminatedReason: i.LastTerminatedReason,
+	})
+	i.CategoryGroup = issuesapi.GroupOf(i.Category)
+}
+
+// ---------------------------------------------------------------------------
+// Filter + sort helpers
+// ---------------------------------------------------------------------------

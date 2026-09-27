@@ -3,6 +3,7 @@ package k8score
 import (
 	"fmt"
 	"log"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -42,6 +43,7 @@ type ResourceDiscovery struct {
 	partial     bool
 	failedGroup map[string]bool
 	cacheTTL    time.Duration
+	refreshMu   sync.Mutex
 	mu          sync.RWMutex
 }
 
@@ -74,6 +76,20 @@ var coreAPIGroups = map[string]bool{
 	"flowcontrol.apiserver.k8s.io": true,
 	"node.k8s.io":                  true,
 	"scheduling.k8s.io":            true,
+}
+
+var dynamicallyWatchedBuiltInAPIGroups = map[string]bool{
+	"apiregistration.k8s.io": true,
+	"authentication.k8s.io":  true,
+	"authorization.k8s.io":   true,
+	"resource.k8s.io":        true,
+}
+
+// IsBuiltInAPIGroup reports whether group is shipped by Kubernetes rather than
+// introduced by a CRD. Some built-in groups remain outside coreAPIGroups so the
+// dynamic cache can observe them.
+func IsBuiltInAPIGroup(group string) bool {
+	return coreAPIGroups[group] || dynamicallyWatchedBuiltInAPIGroups[group]
 }
 
 // versionStability returns a score for API version stability.
@@ -123,8 +139,26 @@ func IsMoreStableVersion(newVersion, oldVersion string) bool {
 
 // NewResourceDiscovery creates a ResourceDiscovery backed by the given client.
 // It performs an initial refresh; returns an error only if the client is nil.
-func NewResourceDiscovery(client discovery.DiscoveryInterface, opts ...DiscoveryOption) (*ResourceDiscovery, error) {
+// isNilDiscoveryClient reports a client that cannot be called, including the
+// case a plain `client == nil` misses: a nil *discovery.DiscoveryClient stored
+// in this interface makes a non-nil interface value, so the guard passes and
+// the first method call dereferences nil. Callers reach that by handing over
+// the result of an accessor that returns a concrete pointer before the client
+// is built.
+func isNilDiscoveryClient(client discovery.DiscoveryInterface) bool {
 	if client == nil {
+		return true
+	}
+	v := reflect.ValueOf(client)
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func:
+		return v.IsNil()
+	}
+	return false
+}
+
+func NewResourceDiscovery(client discovery.DiscoveryInterface, opts ...DiscoveryOption) (*ResourceDiscovery, error) {
+	if isNilDiscoveryClient(client) {
 		return nil, fmt.Errorf("discovery client must not be nil")
 	}
 
@@ -148,6 +182,15 @@ func NewResourceDiscovery(client discovery.DiscoveryInterface, opts ...Discovery
 
 // Refresh fetches all API resources from the cluster.
 func (d *ResourceDiscovery) Refresh() error {
+	if d == nil {
+		return fmt.Errorf("discovery not initialized")
+	}
+	d.refreshMu.Lock()
+	defer d.refreshMu.Unlock()
+	return d.refresh()
+}
+
+func (d *ResourceDiscovery) refresh() error {
 	if d == nil || d.client == nil {
 		return fmt.Errorf("discovery not initialized")
 	}
@@ -156,6 +199,19 @@ func (d *ResourceDiscovery) Refresh() error {
 	_, apiResourceLists, err := d.client.ServerGroupsAndResources()
 	if err != nil {
 		log.Printf("Warning: partial error discovering API resources: %v", err)
+	}
+	hasResourceData := false
+	for _, apiList := range apiResourceLists {
+		if apiList != nil && len(apiList.APIResources) > 0 {
+			hasResourceData = true
+			break
+		}
+	}
+	if err != nil && !hasResourceData {
+		d.mu.Lock()
+		d.lastRefresh = time.Now()
+		d.mu.Unlock()
+		return err
 	}
 	failedGroups := make(map[string]bool)
 	if groups, ok := discovery.GroupDiscoveryFailedErrorGroups(err); ok {
@@ -172,7 +228,6 @@ func (d *ResourceDiscovery) Refresh() error {
 	d.resources = nil
 	d.resourceMap = make(map[string]APIResource)
 	d.gvrMap = make(map[string]schema.GroupVersionResource)
-
 	for _, apiList := range apiResourceLists {
 		if apiList == nil {
 			continue
@@ -264,23 +319,75 @@ func (d *ResourceDiscovery) indexResourceLocked(resource APIResource) {
 		Resource: resource.Name,
 	}
 
-	// Store in map by lowercase kind for lookup. Prefer non-CRD over CRD,
-	// then stable versions within the same group.
+	// Store in map by lowercase kind for lookup. Precedence, in order:
+	//   1. non-CRD over CRD,
+	//   2. within the same group + CRD-ness, a more stable version,
+	//   3. among same CRD-ness, a list/watch-capable resource over one that
+	//      lacks those verbs (e.g. a real CRD over an aggregated APIService),
+	//   4. a deterministic sorted-group tie-break so the winner does not depend
+	//      on discovery order when two groups are otherwise indistinguishable.
+	// Rules 3-4 resolve bare-kind collisions across groups deterministically: for
+	// localqueues in kueue.x-k8s.io vs visibility.kueue.x-k8s.io, the list/watch-
+	// capable real CRD wins over the aggregated APIService that lacks those verbs,
+	// and when candidates are otherwise indistinguishable the lowest group name
+	// wins so the result does not depend on discovery order.
 	kindKey := strings.ToLower(resource.Kind)
-	if existing, ok := d.resourceMap[kindKey]; !ok ||
-		(!resource.IsCRD && existing.IsCRD) ||
-		(resource.IsCRD == existing.IsCRD && existing.Group == resource.Group && IsMoreStableVersion(resource.Version, existing.Version)) {
+	if existing, ok := d.resourceMap[kindKey]; !ok || preferResource(resource, existing) {
 		d.resourceMap[kindKey] = resource
 		d.gvrMap[kindKey] = gvr
 	}
 
 	nameKey := strings.ToLower(resource.Name)
-	if existing, ok := d.resourceMap[nameKey]; !ok ||
-		(!resource.IsCRD && existing.IsCRD) ||
-		(resource.IsCRD == existing.IsCRD && existing.Group == resource.Group && IsMoreStableVersion(resource.Version, existing.Version)) {
+	if existing, ok := d.resourceMap[nameKey]; !ok || preferResource(resource, existing) {
 		d.resourceMap[nameKey] = resource
 		d.gvrMap[nameKey] = gvr
 	}
+}
+
+// preferResource reports whether resource should replace existing as the
+// bare-kind/name winner in the lookup maps. It encodes the precedence documented
+// in indexResourceLocked.
+func preferResource(resource, existing APIResource) bool {
+	// Non-CRD over CRD.
+	if !resource.IsCRD && existing.IsCRD {
+		return true
+	}
+	if resource.IsCRD != existing.IsCRD {
+		return false
+	}
+
+	// Same CRD-ness beyond this point.
+	// More stable version within the same group.
+	if existing.Group == resource.Group {
+		return IsMoreStableVersion(resource.Version, existing.Version)
+	}
+
+	// Different groups: prefer a list/watch-capable resource so a browsable
+	// resource wins over a list/watch-less aggregated API.
+	resourceLW := hasListWatch(resource.Verbs)
+	existingLW := hasListWatch(existing.Verbs)
+	if resourceLW != existingLW {
+		return resourceLW
+	}
+
+	// Otherwise break the tie deterministically by sorted group name so the
+	// result is stable regardless of discovery order.
+	return resource.Group < existing.Group
+}
+
+// hasListWatch reports whether verbs include both list and watch.
+func hasListWatch(verbs []string) bool {
+	hasList := false
+	hasWatch := false
+	for _, verb := range verbs {
+		if verb == "list" {
+			hasList = true
+		}
+		if verb == "watch" {
+			hasWatch = true
+		}
+	}
+	return hasList && hasWatch
 }
 
 // Stats returns lightweight stats without triggering a refresh.
@@ -306,6 +413,32 @@ func (d *ResourceDiscovery) Stats() DiscoveryStats {
 	}
 }
 
+// RefreshIfStale refreshes discovery when its cache TTL has elapsed. Concurrent
+// callers share one refresh.
+func (d *ResourceDiscovery) RefreshIfStale() error {
+	if d == nil {
+		return fmt.Errorf("resource discovery not initialized")
+	}
+
+	d.mu.RLock()
+	needsRefresh := time.Since(d.lastRefresh) > d.cacheTTL
+	d.mu.RUnlock()
+	if !needsRefresh {
+		return nil
+	}
+
+	d.refreshMu.Lock()
+	defer d.refreshMu.Unlock()
+
+	d.mu.RLock()
+	needsRefresh = time.Since(d.lastRefresh) > d.cacheTTL
+	d.mu.RUnlock()
+	if !needsRefresh {
+		return nil
+	}
+	return d.refresh()
+}
+
 // GetAPIResources returns all discovered API resources, deduplicating by
 // name+group and keeping the most stable version.
 func (d *ResourceDiscovery) GetAPIResources() ([]APIResource, error) {
@@ -313,14 +446,8 @@ func (d *ResourceDiscovery) GetAPIResources() ([]APIResource, error) {
 		return nil, fmt.Errorf("resource discovery not initialized")
 	}
 
-	d.mu.RLock()
-	needsRefresh := time.Since(d.lastRefresh) > d.cacheTTL
-	d.mu.RUnlock()
-
-	if needsRefresh {
-		if err := d.Refresh(); err != nil {
-			log.Printf("Warning: failed to refresh API resources: %v", err)
-		}
+	if err := d.RefreshIfStale(); err != nil {
+		log.Printf("Warning: failed to refresh API resources: %v", err)
 	}
 
 	d.mu.RLock()
@@ -348,8 +475,11 @@ func (d *ResourceDiscovery) GetAPIResources() ([]APIResource, error) {
 }
 
 // GetGVR returns the GroupVersionResource for a given kind or plural name.
-// WARNING: If multiple CRDs share the same Kind across different API groups,
-// this returns whichever was discovered first. Use GetGVRWithGroup to disambiguate.
+// NOTE: When multiple resources share the same Kind across different API groups,
+// this resolves the collision deterministically: a list/watch-capable resource
+// wins over one lacking those verbs, then the lowest group name breaks ties, so
+// the result does not depend on discovery order. Still use GetGVRWithGroup when a
+// caller needs a specific API group.
 func (d *ResourceDiscovery) GetGVR(kindOrName string) (schema.GroupVersionResource, bool) {
 	if d == nil {
 		return schema.GroupVersionResource{}, false
@@ -376,17 +506,26 @@ func (d *ResourceDiscovery) GetGVRWithGroup(kindOrName string, group string) (sc
 	defer d.mu.RUnlock()
 
 	kindLower := strings.ToLower(kindOrName)
-	for _, res := range d.resources {
+	var best *APIResource
+	for i := range d.resources {
+		res := &d.resources[i]
 		if (strings.ToLower(res.Kind) == kindLower || strings.ToLower(res.Name) == kindLower) && res.Group == group {
-			return schema.GroupVersionResource{
-				Group:    res.Group,
-				Version:  res.Version,
-				Resource: res.Name,
-			}, true
+			// Multiple served versions can coexist (e.g. Gateway v1beta1 + v1).
+			// Informers are registered against the most stable version, so a
+			// first-match return would hand back a version no informer watches.
+			if best == nil || IsMoreStableVersion(res.Version, best.Version) {
+				best = res
+			}
 		}
 	}
-
-	return schema.GroupVersionResource{}, false
+	if best == nil {
+		return schema.GroupVersionResource{}, false
+	}
+	return schema.GroupVersionResource{
+		Group:    best.Group,
+		Version:  best.Version,
+		Resource: best.Name,
+	}, true
 }
 
 // GetResource returns the APIResource for a given kind or plural name.
@@ -443,23 +582,30 @@ func (d *ResourceDiscovery) IsCRD(kindOrName string) bool {
 	return ok && res.IsCRD
 }
 
+// IsCRDGVR reports whether the exact discovered resource is a CRD.
+func (d *ResourceDiscovery) IsCRDGVR(gvr schema.GroupVersionResource) bool {
+	if d == nil {
+		return false
+	}
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	for _, res := range d.resources {
+		if res.Group == gvr.Group && res.Version == gvr.Version && res.Name == gvr.Resource {
+			return res.IsCRD
+		}
+	}
+	return false
+}
+
 // SupportsWatch checks if a resource supports list and watch verbs.
 func (d *ResourceDiscovery) SupportsWatch(kindOrName string) bool {
 	res, ok := d.GetResource(kindOrName)
 	if !ok {
 		return false
 	}
-	hasList := false
-	hasWatch := false
-	for _, verb := range res.Verbs {
-		if verb == "list" {
-			hasList = true
-		}
-		if verb == "watch" {
-			hasWatch = true
-		}
-	}
-	return hasList && hasWatch
+	return hasListWatch(res.Verbs)
 }
 
 // SupportsWatchGVR checks if a GVR supports list and watch verbs.
@@ -475,19 +621,90 @@ func (d *ResourceDiscovery) SupportsWatchGVR(gvr schema.GroupVersionResource) bo
 		if res.Group != gvr.Group || res.Version != gvr.Version || res.Name != gvr.Resource {
 			continue
 		}
-		hasList := false
-		hasWatch := false
-		for _, verb := range res.Verbs {
-			if verb == "list" {
-				hasList = true
-			}
-			if verb == "watch" {
-				hasWatch = true
-			}
-		}
-		return hasList && hasWatch
+		return hasListWatch(res.Verbs)
 	}
 	return false
+}
+
+// HasKindInGroup reports whether a specific Kind exists within an API
+// group. Use this when you depend on a specific CRD being registered.
+func (d *ResourceDiscovery) HasKindInGroup(kind, group string) bool {
+	if d == nil {
+		return false
+	}
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	kindLower := strings.ToLower(kind)
+	for _, res := range d.resources {
+		if res.Group == group && strings.ToLower(res.Kind) == kindLower {
+			return true
+		}
+	}
+	return false
+}
+
+// HasGroup reports whether any resource is registered under the given API
+// group. Use it when the group itself is the signal — i.e. the group is
+// owned by exactly one product, so any kind in it proves that product is
+// installed. When a specific CRD must exist, use HasKindInGroup instead.
+func (d *ResourceDiscovery) HasGroup(group string) bool {
+	if d == nil {
+		return false
+	}
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	for _, res := range d.resources {
+		if res.Group == group {
+			return true
+		}
+	}
+	return false
+}
+
+// KyvernoLegacyPolicyGroup is the original Kyverno API group, home of the
+// Policy/ClusterPolicy types deprecated in Kyverno 1.18 with removal
+// planned for 1.20.
+const KyvernoLegacyPolicyGroup = "kyverno.io"
+
+// KyvernoModernPolicyGroup is the CEL-based policy family Kyverno
+// stabilized in 1.17/1.18 (ValidatingPolicy, ImageValidatingPolicy,
+// MutatingPolicy, ...). It is the family that survives the 1.20 removal.
+const KyvernoModernPolicyGroup = "policies.kyverno.io"
+
+// IsKyvernoInstalled reports whether Kyverno's CRDs are present on the
+// cluster. Both API families count:
+//
+//   - kyverno.io — the legacy Policy/ClusterPolicy family, deprecated in
+//     1.18 with removal planned for 1.20.
+//   - policies.kyverno.io — the modern CEL family (ValidatingPolicy et al.)
+//     that replaces it.
+//
+// Detecting only the legacy family would report not-installed on a
+// modern-only cluster and silently drop the entire PolicyReport index —
+// the reports would still exist, Radar would just stop indexing them.
+// Whole-group presence is the right signal for the modern family because
+// policies.kyverno.io is owned exclusively by Kyverno, so no single kind
+// has to be nominated as the sentinel.
+//
+// Kyverno's own policy CRDs are the signal rather than the PolicyReport
+// CRDs (wgpolicyk8s.io / openreports.io) because those are emitted by
+// several engines (Trivy, Falco adapters, ...) and so do not by
+// themselves imply Kyverno is the source.
+//
+// The signal drives conditional eager warmup of PolicyReport informers:
+// clusters without Kyverno keep the reports in the deferred-fetch tier
+// and pay no extra memory or watch budget.
+func (d *ResourceDiscovery) IsKyvernoInstalled() bool {
+	if d == nil {
+		return false
+	}
+	return d.HasKindInGroup("Policy", KyvernoLegacyPolicyGroup) ||
+		d.HasKindInGroup("ClusterPolicy", KyvernoLegacyPolicyGroup) ||
+		d.HasGroup(KyvernoModernPolicyGroup)
 }
 
 // GetKindForGVR returns the Kind name for a given GVR

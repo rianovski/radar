@@ -1,16 +1,21 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/skyhook-io/radar/internal/cloud"
 )
 
 // echoUser is a handler that returns the authenticated user as JSON, or 204 if no user.
@@ -41,16 +46,17 @@ func TestMiddleware_ExemptPaths(t *testing.T) {
 		path string
 		want int
 	}{
-		{"/api/health", http.StatusNoContent},      // exempt
-		{"/api/connection", http.StatusNoContent},   // exempt
-		{"/auth/login", http.StatusNoContent},       // exempt
-		{"/auth/callback", http.StatusNoContent},    // exempt
-		{"/", http.StatusNoContent},                 // static asset — exempt
-		{"/index.html", http.StatusNoContent},       // static asset — exempt
-		{"/assets/main.js", http.StatusNoContent},   // static asset — exempt
-		{"/api/resources/pods", http.StatusUnauthorized}, // requires auth
-		{"/api/topology", http.StatusUnauthorized},       // requires auth
-		{"/mcp", http.StatusUnauthorized},                // requires auth
+		{"/api/health", http.StatusNoContent},              // exempt
+		{"/api/connection", http.StatusUnauthorized},       // requires auth
+		{"/api/connection/retry", http.StatusUnauthorized}, // requires auth — state-changing
+		{"/auth/login", http.StatusNoContent},              // exempt
+		{"/auth/callback", http.StatusNoContent},           // exempt
+		{"/", http.StatusNoContent},                        // static asset — exempt
+		{"/index.html", http.StatusNoContent},              // static asset — exempt
+		{"/assets/main.js", http.StatusNoContent},          // static asset — exempt
+		{"/api/resources/pods", http.StatusUnauthorized},   // requires auth
+		{"/api/topology", http.StatusUnauthorized},         // requires auth
+		{"/mcp", http.StatusUnauthorized},                  // requires auth
 	}
 
 	for _, tt := range tests {
@@ -102,6 +108,35 @@ func TestMiddleware_ProxyHeaders(t *testing.T) {
 	}
 }
 
+func TestMiddleware_ProxyHeaders_LogsAcceptedIdentity(t *testing.T) {
+	resetForwardedIdentityLog()
+
+	mw := Authenticate(proxyConfig())
+	handler := mw(http.HandlerFunc(echoUser))
+
+	var buf bytes.Buffer
+	defer log.SetOutput(log.Writer())
+	log.SetOutput(&buf)
+
+	req := httptest.NewRequest("GET", "/api/resources/pods", nil)
+	req.Header.Set("X-Forwarded-User", "dave")
+	req.Header.Set("X-Forwarded-Groups", "radar:idp:read-only-team")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	line := buf.String()
+	if !strings.Contains(line, "[auth] accepted forwarded identity") {
+		t.Fatalf("expected accepted-identity log line, got: %q", line)
+	}
+	if !strings.Contains(line, "dave") || !strings.Contains(line, "radar:idp:read-only-team") {
+		t.Errorf("log line missing user/group: %q", line)
+	}
+}
+
 func TestMiddleware_ProxyHeaders_NoUser(t *testing.T) {
 	mw := Authenticate(proxyConfig())
 	handler := mw(http.HandlerFunc(echoUser))
@@ -133,7 +168,7 @@ func TestMiddleware_SessionCookie(t *testing.T) {
 
 	// Create a valid session cookie
 	user := &User{Username: "bob", Groups: []string{"ops"}}
-	cookie := CreateSessionCookie(user, NewSessionID(), "", cfg.Secret, cfg.CookieTTL, false)
+	cookie := CreateSessionCookie(user, NewSessionID(), "", cfg.Secret, cfg.CookieTTL, false)[0]
 
 	req := httptest.NewRequest("GET", "/api/topology", nil)
 	req.AddCookie(cookie)
@@ -152,13 +187,67 @@ func TestMiddleware_SessionCookie(t *testing.T) {
 	}
 }
 
+func TestMiddleware_ProxyHeaders_RejectsReservedPrincipal(t *testing.T) {
+	handler := Authenticate(proxyConfig())(http.HandlerFunc(echoUser))
+
+	for name, hdr := range map[string][2]string{
+		"reserved group":    {"alice", "devs, system:masters"},
+		"reserved username": {"system:admin", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/api/resources/pods", nil)
+			req.Header.Set("X-Forwarded-User", hdr[0])
+			req.Header.Set("X-Forwarded-Groups", hdr[1])
+			rec := httptest.NewRecorder()
+
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403", rec.Code)
+			}
+			for _, c := range rec.Result().Cookies() {
+				if c.Name == DefaultCookieName && c.Value != "" {
+					t.Error("rejected identity must not be issued a session cookie")
+				}
+			}
+		})
+	}
+}
+
+func TestMiddleware_SessionCookie_RejectsReservedPrincipal(t *testing.T) {
+	cfg := proxyConfig()
+	handler := Authenticate(cfg)(http.HandlerFunc(echoUser))
+
+	user := &User{Username: "bob", Groups: []string{"ops", "system:masters"}}
+	cookie := CreateSessionCookie(user, NewSessionID(), "", cfg.Secret, cfg.CookieTTL, false)[0]
+
+	req := httptest.NewRequest("GET", "/api/topology", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	cleared := false
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == DefaultCookieName && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Error("session carrying a reserved principal should be cleared")
+	}
+}
+
 func TestMiddleware_SessionCookie_TakesPrecedence(t *testing.T) {
 	cfg := proxyConfig()
 	mw := Authenticate(cfg)
 	handler := mw(http.HandlerFunc(echoUser))
 
 	// Cookie says "bob", proxy header says "alice"
-	cookie := CreateSessionCookie(&User{Username: "bob"}, NewSessionID(), "", cfg.Secret, cfg.CookieTTL, false)
+	cookie := CreateSessionCookie(&User{Username: "bob"}, NewSessionID(), "", cfg.Secret, cfg.CookieTTL, false)[0]
 
 	req := httptest.NewRequest("GET", "/api/topology", nil)
 	req.AddCookie(cookie)
@@ -171,6 +260,81 @@ func TestMiddleware_SessionCookie_TakesPrecedence(t *testing.T) {
 	json.NewDecoder(rec.Body).Decode(&parsed)
 	if parsed.Username != "bob" {
 		t.Errorf("cookie should take precedence: got %q, want %q", parsed.Username, "bob")
+	}
+}
+
+func TestMiddleware_CloudProxyHeadersOverrideSessionWithoutSettingCookie(t *testing.T) {
+	t.Setenv("RADAR_CLOUD_MODE", "true")
+	cfg := proxyConfig()
+	handler := cloud.AuthenticatedTunnelHandler(Authenticate(cfg)(http.HandlerFunc(echoUser)))
+
+	cookie := CreateSessionCookie(
+		&User{Username: "stale-user", Groups: []string{"radar:owner"}},
+		NewSessionID(), "", cfg.Secret, cfg.CookieTTL, false,
+	)[0]
+	req := httptest.NewRequest(http.MethodGet, "/api/topology", nil)
+	req.AddCookie(cookie)
+	req.Header.Set(cfg.UserHeader, "current-user")
+	req.Header.Set(cfg.GroupsHeader, "radar:viewer, radar:org:org-1")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got User
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Username != "current-user" {
+		t.Fatalf("username = %q, want current Hub header identity", got.Username)
+	}
+	if len(got.Groups) != 2 || got.Groups[0] != "radar:viewer" || got.Groups[1] != "radar:org:org-1" {
+		t.Fatalf("groups = %v, want current Hub header groups", got.Groups)
+	}
+	if values := rec.Header().Values("Set-Cookie"); len(values) != 0 {
+		t.Fatalf("cloud proxy auth emitted Set-Cookie: %v", values)
+	}
+}
+
+func TestMiddleware_CloudProxyRequiresHeadersEvenWithSessionCookie(t *testing.T) {
+	t.Setenv("RADAR_CLOUD_MODE", "true")
+	cfg := proxyConfig()
+	handler := cloud.AuthenticatedTunnelHandler(Authenticate(cfg)(http.HandlerFunc(echoUser)))
+
+	cookie := CreateSessionCookie(&User{Username: "stale-user"}, NewSessionID(), "", cfg.Secret, cfg.CookieTTL, false)[0]
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 without Hub proxy headers", rec.Code)
+	}
+	if values := rec.Header().Values("Set-Cookie"); len(values) != 0 {
+		t.Fatalf("cloud proxy auth emitted Set-Cookie: %v", values)
+	}
+}
+
+func TestMiddleware_CloudProxyRejectsSpoofedHeadersOutsideTunnel(t *testing.T) {
+	t.Setenv("RADAR_CLOUD_MODE", "true")
+	cfg := proxyConfig()
+	handler := Authenticate(cfg)(http.HandlerFunc(echoUser))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/topology", nil)
+	req.Header.Set(cfg.UserHeader, "attacker")
+	req.Header.Set(cfg.GroupsHeader, "radar:owner")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for unmarked forwarded identity", rec.Code)
+	}
+	if values := rec.Header().Values("Set-Cookie"); len(values) != 0 {
+		t.Fatalf("rejected direct request emitted Set-Cookie: %v", values)
 	}
 }
 
@@ -195,7 +359,7 @@ func TestMiddleware_SoftAuthPath_WithUser(t *testing.T) {
 	handler := mw(http.HandlerFunc(echoUser))
 
 	// /api/auth/me with valid cookie should include user
-	cookie := CreateSessionCookie(&User{Username: "carol"}, NewSessionID(), "", cfg.Secret, cfg.CookieTTL, false)
+	cookie := CreateSessionCookie(&User{Username: "carol"}, NewSessionID(), "", cfg.Secret, cfg.CookieTTL, false)[0]
 	req := httptest.NewRequest("GET", "/api/auth/me", nil)
 	req.AddCookie(cookie)
 	rec := httptest.NewRecorder()
@@ -283,13 +447,18 @@ func TestIsExemptPath(t *testing.T) {
 	}{
 		{"/api/health", true},
 		{"/api/health/detailed", true},
-		{"/api/connection", true},
-		{"/api/connection/retry", true},
 		{"/auth/login", true},
 		{"/auth/callback", true},
+		// Static assets are exempt; /debug/* (pprof) is not — it leaks the
+		// in-memory K8s cache and must require auth whenever auth is on.
 		{"/", true},
 		{"/index.html", true},
 		{"/assets/main.js", true},
+		{"/debug/pprof/heap", false},
+		// API paths require auth. /api/connection is non-exempt in both
+		// modes (state-changing retry + kubeconfig context leak).
+		{"/api/connection", false},
+		{"/api/connection/retry", false},
 		{"/api/resources/pods", false},
 		{"/api/topology", false},
 		{"/api/auth/me", false},
@@ -306,11 +475,9 @@ func TestIsExemptPath(t *testing.T) {
 	}
 }
 
-// TestIsExemptPath_CloudMode verifies that cloud-mode narrows the exempt
-// set to /api/health + /auth/*. Under cloud-mode, static assets,
-// /api/connection, and /debug/pprof/* must all require auth — a regression
-// that silently re-added them would let an unauthenticated request through
-// the Cloud tunnel reach those paths.
+// TestIsExemptPath_CloudMode verifies that cloud-mode narrows the exempt set to
+// the exact kubelet health path. Cloud owns authentication, so Radar's local
+// /auth/* endpoints and static assets must not bypass the tunnel identity.
 func TestIsExemptPath_CloudMode(t *testing.T) {
 	t.Setenv("RADAR_CLOUD_MODE", "true")
 
@@ -319,12 +486,13 @@ func TestIsExemptPath_CloudMode(t *testing.T) {
 		want bool
 	}{
 		{"/api/health", true},
-		{"/auth/login", true},
-		{"/auth/callback", true},
-		// Under non-cloud mode these would be exempt. Under cloud-mode
-		// they must require auth.
+		{"/api/health/detailed", false},
+		{"/auth/login", false},
+		{"/auth/callback", false},
 		{"/api/connection", false},
 		{"/api/connection/retry", false},
+		// Under non-cloud mode static assets would be exempt. Under
+		// cloud-mode they must require auth.
 		{"/", false},
 		{"/index.html", false},
 		{"/assets/main.js", false},
@@ -372,7 +540,7 @@ func makeCookieWithExpiry(user *User, sid, secret string, expiresAt time.Time) *
 	// Use the public constructor, but we need to craft a specific expiry.
 	// We compute the TTL that would produce the desired ExpiresAt from now.
 	ttl := time.Until(expiresAt)
-	return CreateSessionCookie(user, sid, "", secret, ttl, false)
+	return CreateSessionCookie(user, sid, "", secret, ttl, false)[0]
 }
 
 func TestMiddleware_SlidingTTL_ReissuesPastHalfLife(t *testing.T) {
@@ -516,7 +684,7 @@ func TestMiddleware_SlidingTTL_PreservesIDToken(t *testing.T) {
 	sid := NewSessionID()
 	idToken := "eyJhbGciOiJSUzI1NiJ9.test-payload.test-sig"
 	ttl := time.Until(time.Now().Add(10 * time.Minute))
-	cookie := CreateSessionCookie(&User{Username: "alice"}, sid, idToken, cfg.Secret, ttl, false)
+	cookie := CreateSessionCookie(&User{Username: "alice"}, sid, idToken, cfg.Secret, ttl, false)[0]
 
 	req := httptest.NewRequest("GET", "/api/topology", nil)
 	req.AddCookie(cookie)
@@ -637,7 +805,7 @@ func TestMiddleware_RevokedSession_Returns401(t *testing.T) {
 
 	// Create a valid session cookie
 	sid := "revoke-me-sid-1234567890abcdef"
-	cookie := CreateSessionCookie(&User{Username: "alice"}, sid, "", cfg.Secret, cfg.CookieTTL, false)
+	cookie := CreateSessionCookie(&User{Username: "alice"}, sid, "", cfg.Secret, cfg.CookieTTL, false)[0]
 
 	// Revoke the session
 	revoker.Revoke(sid, time.Now().Add(1*time.Hour))
@@ -679,7 +847,7 @@ func TestMiddleware_NonRevokedSession_PassesThrough(t *testing.T) {
 
 	// Create a valid session cookie (NOT revoked)
 	sid := NewSessionID()
-	cookie := CreateSessionCookie(&User{Username: "bob"}, sid, "", cfg.Secret, cfg.CookieTTL, false)
+	cookie := CreateSessionCookie(&User{Username: "bob"}, sid, "", cfg.Secret, cfg.CookieTTL, false)[0]
 
 	req := httptest.NewRequest("GET", "/api/topology", nil)
 	req.AddCookie(cookie)
@@ -701,7 +869,7 @@ func TestMiddleware_NoRevoker_SkipsCheck(t *testing.T) {
 	handler := mw(http.HandlerFunc(echoUser))
 
 	sid := NewSessionID()
-	cookie := CreateSessionCookie(&User{Username: "carol"}, sid, "", cfg.Secret, cfg.CookieTTL, false)
+	cookie := CreateSessionCookie(&User{Username: "carol"}, sid, "", cfg.Secret, cfg.CookieTTL, false)[0]
 
 	req := httptest.NewRequest("GET", "/api/topology", nil)
 	req.AddCookie(cookie)

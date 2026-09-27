@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,11 +13,13 @@ import (
 
 	"github.com/skyhook-io/radar/internal/portforward"
 	promclient "github.com/skyhook-io/radar/internal/prometheus"
+	"github.com/skyhook-io/radar/pkg/prom"
 )
 
-const (
-	istiodName = "istiod"
-)
+// istiodSelector matches istiod Deployments by label rather than by name: a
+// revisioned install is named istiod-<rev>, but the istiod chart labels every
+// revision app=istiod.
+const istiodSelector = "app=istiod"
 
 // Namespaces where istiod is commonly deployed
 var istioNamespaces = []string{"istio-system", "istio", "default"}
@@ -47,10 +50,20 @@ func (s *IstioSource) Detect(ctx context.Context) (*DetectionResult, error) {
 	}
 
 	for _, ns := range istioNamespaces {
-		deploy, err := s.k8sClient.AppsV1().Deployments(ns).Get(ctx, istiodName, metav1.GetOptions{})
-		if err != nil {
+		list, err := s.k8sClient.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{LabelSelector: istiodSelector})
+		if err != nil || len(list.Items) == 0 {
 			continue
 		}
+
+		deploys := list.Items
+		sort.Slice(deploys, func(i, j int) bool {
+			iReady, jReady := deploys[i].Status.ReadyReplicas > 0, deploys[j].Status.ReadyReplicas > 0
+			if iReady != jReady {
+				return iReady
+			}
+			return deploys[i].Name < deploys[j].Name
+		})
+		deploy := &deploys[0]
 
 		totalReplicas := int32(1)
 		if deploy.Spec.Replicas != nil {
@@ -61,6 +74,22 @@ func (s *IstioSource) Detect(ctx context.Context) (*DetectionResult, error) {
 			result.Available = true
 			result.Message = fmt.Sprintf("Istio detected with istiod running in namespace %s (%d/%d ready)",
 				ns, deploy.Status.ReadyReplicas, totalReplicas)
+
+			var running []string
+			for _, d := range deploys {
+				if d.Status.ReadyReplicas > 0 {
+					rev := d.Spec.Template.Labels["istio.io/rev"]
+					if rev == "" {
+						rev = d.Name
+					}
+					running = append(running, rev)
+				}
+			}
+			sort.Strings(running)
+			if len(running) > 1 {
+				result.Message = fmt.Sprintf("Istio detected with %d istiod revisions running in namespace %s: %s",
+					len(running), ns, strings.Join(running, ", "))
+			}
 
 			// Try to get version from pod labels
 			if ver, ok := deploy.Spec.Template.Labels["istio.io/rev"]; ok && ver != "" {
@@ -80,12 +109,18 @@ func (s *IstioSource) Detect(ctx context.Context) (*DetectionResult, error) {
 			return result, nil
 		}
 
-		result.Message = fmt.Sprintf("istiod found in %s but not ready (%d/%d replicas)",
-			ns, deploy.Status.ReadyReplicas, totalReplicas)
-		return result, nil
+		// Keep looking: a stale revision here must not hide a ready istiod in
+		// a later namespace, so the first unready match is reported only if no
+		// namespace has a ready one.
+		if result.Message == "" {
+			result.Message = fmt.Sprintf("istiod found in %s but not ready (%d/%d replicas)",
+				ns, deploy.Status.ReadyReplicas, totalReplicas)
+		}
 	}
 
-	result.Message = "Istio not detected. Install Istio for service mesh traffic visibility."
+	if result.Message == "" {
+		result.Message = "Istio not detected. Install Istio for service mesh traffic visibility."
+	}
 	return result, nil
 }
 
@@ -153,7 +188,7 @@ func (s *IstioSource) queryHTTPFlows(ctx context.Context, client *promclient.Cli
 	// Main query: all requests, no response_code grouping
 	query := `sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace, destination_service_name, request_protocol, reporter) (rate(istio_requests_total{reporter="destination"}[5m]))`
 	if opts.Namespace != "" {
-		safeNS := promclient.SanitizeLabelValue(opts.Namespace)
+		safeNS := prom.SanitizeLabelValue(opts.Namespace)
 		query = fmt.Sprintf(`sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace, destination_service_name, request_protocol, reporter) (rate(istio_requests_total{reporter="destination", source_workload_namespace="%s"}[5m])) or sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace, destination_service_name, request_protocol, reporter) (rate(istio_requests_total{reporter="destination", destination_workload_namespace="%s"}[5m]))`,
 			safeNS, safeNS)
 	}
@@ -161,7 +196,7 @@ func (s *IstioSource) queryHTTPFlows(ctx context.Context, client *promclient.Cli
 	// Error query: 5xx only
 	errorQuery := `sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace, reporter) (rate(istio_requests_total{reporter="destination", response_code=~"5.."}[5m]))`
 	if opts.Namespace != "" {
-		safeNS := promclient.SanitizeLabelValue(opts.Namespace)
+		safeNS := prom.SanitizeLabelValue(opts.Namespace)
 		errorQuery = fmt.Sprintf(`sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace, reporter) (rate(istio_requests_total{reporter="destination", response_code=~"5..", source_workload_namespace="%s"}[5m])) or sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace, reporter) (rate(istio_requests_total{reporter="destination", response_code=~"5..", destination_workload_namespace="%s"}[5m]))`,
 			safeNS, safeNS)
 	}
@@ -294,14 +329,14 @@ func (s *IstioSource) queryByteMetrics(ctx context.Context, client *promclient.C
 	sentQuery := `sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace) (rate(istio_request_bytes_sum{reporter="destination"}[5m]))`
 	recvQuery := `sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace) (rate(istio_response_bytes_sum{reporter="destination"}[5m]))`
 	if opts.Namespace != "" {
-		safeNS := promclient.SanitizeLabelValue(opts.Namespace)
+		safeNS := prom.SanitizeLabelValue(opts.Namespace)
 		sentQuery = fmt.Sprintf(`sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace) (rate(istio_request_bytes_sum{reporter="destination", source_workload_namespace="%s"}[5m])) or sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace) (rate(istio_request_bytes_sum{reporter="destination", destination_workload_namespace="%s"}[5m]))`,
 			safeNS, safeNS)
 		recvQuery = fmt.Sprintf(`sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace) (rate(istio_response_bytes_sum{reporter="destination", source_workload_namespace="%s"}[5m])) or sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace) (rate(istio_response_bytes_sum{reporter="destination", destination_workload_namespace="%s"}[5m]))`,
 			safeNS, safeNS)
 	}
 
-	parseByteResult := func(result *promclient.QueryResult, target map[flowKey]float64) {
+	parseByteResult := func(result *prom.QueryResult, target map[flowKey]float64) {
 		if result == nil {
 			return
 		}
@@ -345,7 +380,7 @@ func (s *IstioSource) queryByteMetrics(ctx context.Context, client *promclient.C
 func (s *IstioSource) queryTCPFlows(ctx context.Context, client *promclient.Client, opts FlowOptions) ([]Flow, error) {
 	query := `sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace, destination_service_name, reporter) (rate(istio_tcp_connections_opened_total{reporter="destination"}[5m]))`
 	if opts.Namespace != "" {
-		safeNS := promclient.SanitizeLabelValue(opts.Namespace)
+		safeNS := prom.SanitizeLabelValue(opts.Namespace)
 		query = fmt.Sprintf(`sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace, destination_service_name, reporter) (rate(istio_tcp_connections_opened_total{reporter="destination", source_workload_namespace="%s"}[5m])) or sum by (source_workload, source_workload_namespace, destination_workload, destination_workload_namespace, destination_service_name, reporter) (rate(istio_tcp_connections_opened_total{reporter="destination", destination_workload_namespace="%s"}[5m]))`,
 			safeNS, safeNS)
 	}
@@ -485,6 +520,32 @@ func (s *IstioSource) Connect(ctx context.Context, contextName string) (*portfor
 	}
 
 	return info, nil
+}
+
+// ConnectionInfo implements ConnectionReporter. Istio's data path is the
+// shared Prometheus client (whose forwards belong to the prometheus owner, not
+// traffic), so its status is the only honest answer here.
+func (s *IstioSource) ConnectionInfo() *portforward.ConnectionInfo {
+	client, err := s.getPrometheusClient()
+	if err != nil {
+		return &portforward.ConnectionInfo{Connected: false}
+	}
+	return connectionInfoFromPromStatus(client.GetStatus())
+}
+
+// connectionInfoFromPromStatus maps the shared Prometheus client's status into
+// traffic connection info — used by the sources whose data path is that client.
+func connectionInfoFromPromStatus(status prom.Status) *portforward.ConnectionInfo {
+	info := &portforward.ConnectionInfo{
+		Connected:   status.Connected,
+		Address:     status.Address,
+		ContextName: status.ContextName,
+	}
+	if status.Service != nil {
+		info.Namespace = status.Service.Namespace
+		info.ServiceName = status.Service.Name
+	}
+	return info
 }
 
 // Close cleans up resources (no-op since we use the shared prometheus client)

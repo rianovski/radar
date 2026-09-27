@@ -1,0 +1,145 @@
+# ValidatingPolicy (policies.kyverno.io) — the four enforcement-posture cases.
+#
+# Radar computes an EFFECTIVE posture rather than echoing spec.validationActions,
+# because three fields interact: validationActions, evaluation.admission.enabled
+# and evaluation.mode. These four policies are the reason that computation
+# exists — each renders a different badge, and two of them contradict what a
+# quick read of the spec would suggest.
+---
+# CASE 1 — Deny, admission on. The straightforward one: actually blocks.
+# Renders "Deny" (red). Scoped by namespaceSelector so it only guards
+# policy-demo and can't interfere with the rest of the cluster.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: require-run-as-nonroot
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  evaluation:
+    admission:
+      enabled: true
+    background:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchLabels:
+        policy-demo: "true"
+  variables:
+    - name: allContainers
+      expression: "object.spec.containers"
+  validations:
+    - expression: "object.spec.containers.all(c, has(c.securityContext) && has(c.securityContext.runAsNonRoot) && c.securityContext.runAsNonRoot == true)"
+      message: "All containers must set securityContext.runAsNonRoot=true"
+    - expression: "!object.spec.?hostNetwork.orValue(false)"
+      message: "hostNetwork is not permitted"
+      reason: Forbidden
+---
+# CASE 2 — deliberate audit. Renders "Audit + Warn" (amber). Declared and
+# effective agree, so it stays in the deliberate tier, visually distinct from
+# the discrepancy tier below. Applying a Deployment without a `team` label
+# produces a live admission warning.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: audit-require-labels
+spec:
+  validationActions: [Audit, Warn]
+  failurePolicy: Ignore
+  evaluation:
+    admission:
+      enabled: true
+    background:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+  validations:
+    - expression: "has(object.metadata.labels) && has(object.metadata.labels.team)"
+      message: "Deployments should carry a 'team' label"
+---
+# CASE 3 — THE HEADLINE. Declares Deny, but admission evaluation is disabled,
+# so it blocks nothing and only produces background-scan findings.
+#
+# Renders "Background only" in the ORANGE discrepancy tier, with the reason
+# spelled out — never a red Deny badge, which would tell an operator the
+# cluster is protected when it isn't.
+#
+# Verify by hand: `kubectl run probe --image=nginx:latest -n default`
+# succeeds despite the policy saying Deny.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: background-only-no-latest-tag
+spec:
+  validationActions: [Deny]
+  evaluation:
+    admission:
+      enabled: false
+    background:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: "object.spec.containers.all(c, !c.image.endsWith(':latest'))"
+      message: "Images must not use the :latest tag"
+---
+# CASE 4 — no validationActions AT ALL, which Kyverno treats as Deny.
+#
+# This is undocumented upstream: the ValidatingPolicy docs show the field in
+# examples but never state its allowed values or what omission means. The
+# legacy family defaults the analogous field to *Audit*, so inheriting that
+# assumption would display "Audit" for a policy that blocks.
+#
+# Verify by hand — this really is rejected at admission:
+#   kubectl create configmap probe --from-literal=a=b -n policy-demo
+#   → admission webhook "vpol.validate.kyverno.svc-fail" denied the request
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: implicit-deny-configmap-labels
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["configmaps"]
+    namespaceSelector:
+      matchLabels:
+        policy-demo: "true"
+  validations:
+    - expression: "has(object.metadata.labels)"
+      message: "ConfigMaps in this namespace must carry labels"
+---
+# Namespaced twin — same spec shape, narrower scope. Shares its renderer and
+# cell logic with the cluster-scoped kind; present so the twin-collapsing is
+# exercised against a real object rather than only in unit tests.
+apiVersion: policies.kyverno.io/v1
+kind: NamespacedValidatingPolicy
+metadata:
+  name: ns-require-resources
+  namespace: policy-demo
+spec:
+  validationActions: [Audit]
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: "object.spec.containers.all(c, has(c.resources) && has(c.resources.limits))"
+      message: "Containers must declare resource limits"

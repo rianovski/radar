@@ -1,27 +1,32 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { flushSync } from 'react-dom'
-import { PaneLoader, useDockReservedHeight } from '@skyhook-io/k8s-ui'
+import { FetchResult, useDockReservedHeight, compareVersions } from '@skyhook-io/k8s-ui'
 import { startViewTransitionSafe } from '@skyhook-io/k8s-ui/utils/view-transition'
 import { TRANSITION_DRAWER } from '../../utils/animation'
 import { useRefreshAnimation } from '../../hooks/useRefreshAnimation'
-import { X, Copy, Check, RefreshCw, Package, Code, History, FileText, Settings, Link2, Anchor, GitFork, BookOpen, ArrowUpCircle, Trash2, GitBranch } from 'lucide-react'
+import { X, Copy, Check, RefreshCw, Package, Code, History, Settings, Link2, Anchor, GitFork, BookOpen, ArrowUpCircle, Trash2, GitBranch, AlertTriangle, RotateCcw, Clock, GitCompare, ExternalLink, SlidersHorizontal, Eye, Loader2 } from 'lucide-react'
+import yaml from 'yaml'
 import { useNavigate } from 'react-router-dom'
 import { clsx } from 'clsx'
-import { useHelmRelease, useHelmManifest, useHelmValues, useHelmManifestDiff, useHelmUpgradeInfo, useHelmUninstall, upgradeWithProgress, rollbackWithProgress } from '../../api/client'
+import { useHelmRelease, useHelmManifest, useHelmValues, useHelmUpgradeInfo, useHelmReleaseVersions, useHelmUninstall, upgradeWithProgress, rollbackWithProgress, useHelmPreviewValues } from '../../api/client'
+import { ValuesDiffPreview } from './ValuesDiffPreview'
 import { useQueryClient } from '@tanstack/react-query'
 import { ConfirmDialog } from '../ui/ConfirmDialog'
+import { Tooltip } from '../ui/Tooltip'
 import { Markdown } from '../ui/Markdown'
-import type { SelectedHelmRelease, HelmHook, ChartDependency } from '../../types'
-import type { NavigateToResource } from '../../utils/navigation'
+import type { SelectedHelmRelease, HelmHook, ChartDependency, HelmOperation, HelmOperationInsight, HelmOwnedResource, HookDiagnostic, HookLogEvidence, UpgradeInfo, ValuesPreviewResponse } from '../../types'
+import { apiVersionToGroup, kindToPluralWithGroup, type NavigateToResource } from '../../utils/navigation'
 import { formatDate } from './helm-utils'
-import { getHelmStatusColor, SEVERITY_BADGE, SEVERITY_TEXT } from '../../utils/badge-colors'
+import { getHelmStatusColor, getKindBadgeColor, getResourceStatusColor, SEVERITY_BADGE, SEVERITY_TEXT } from '../../utils/badge-colors'
 import { useCanHelmAct, useCloudRole } from '../../api/client'
 import { RoleGatedPanel } from './RoleGatedPanel'
 import { RevisionHistory } from './RevisionHistory'
 import { ManifestViewer } from './ManifestViewer'
 import { ValuesViewer } from './ValuesViewer'
 import { OwnedResources } from './OwnedResources'
-import { ManifestDiffViewer } from './ManifestDiffViewer'
+import { TrackChartSourceDialog } from './TrackChartSourceDialog'
+import { Collapse, CollapseChevron } from '@skyhook-io/k8s-ui/components/ui/Collapse'
+import { Disclosure } from '@skyhook-io/k8s-ui/components/ui/Disclosure'
 
 interface HelmReleaseDrawerProps {
   release: SelectedHelmRelease
@@ -29,28 +34,101 @@ interface HelmReleaseDrawerProps {
   onNavigateToResource?: NavigateToResource
   /** Controls slide-in/out animation (driven by useAnimatedUnmount) */
   isOpen?: boolean
+  /** Right inset in px so the drawer sits beside a docked side panel (AI), not under it. */
+  rightInset?: number
 }
 
-type TabId = 'overview' | 'history' | 'manifest' | 'values' | 'resources' | 'hooks' | 'diff'
+type TabId = 'overview' | 'history' | 'manifest' | 'values' | 'resources' | 'hooks'
+
+interface UpgradePreviewRequest {
+  targetVersion: string
+  values: Record<string, unknown>
+  repositoryName?: string
+}
+
+interface ParsedUpgradeValues {
+  values: Record<string, unknown> | null
+  error: string | null
+}
+
+type UpgradeSourceIssue = NonNullable<UpgradeInfo['sourceIssue']>
+type ActionableUpgradeSourceIssue = Exclude<UpgradeSourceIssue, 'ambiguous_repository'>
+
+function getUpgradeSourceIssue(upgradeInfo: UpgradeInfo): UpgradeSourceIssue | undefined {
+  return upgradeInfo.sourceIssue
+}
+
+function getUpgradeSourceIssueLabel(issue: UpgradeSourceIssue) {
+  switch (issue) {
+    case 'repo_index_error':
+      return 'upgrade source blocked'
+    case 'ambiguous_repository':
+      return 'upgrade source ambiguous'
+    case 'untracked':
+      return 'upgrade source not tracked'
+  }
+}
+
+function getUpgradeSourceIssueTooltip(issue: UpgradeSourceIssue, error: string | undefined, canHelmWrite: boolean, disabledReason: string | undefined) {
+  if (!canHelmWrite) {
+    return disabledReason ?? error ?? 'Helm actions are disabled.'
+  }
+  switch (issue) {
+    case 'repo_index_error':
+      return 'A configured Helm repo index failed. Fix or refresh that repo, or register an OCI prefix if this chart came from OCI.'
+    case 'ambiguous_repository':
+      return 'Multiple configured Helm repos match this chart. Fix the repo list or source metadata so Radar can identify one source.'
+    case 'untracked':
+      return "Radar can't tell where this chart was installed from. Register an OCI chart source to track upgrades."
+  }
+}
+
+function parseUpgradeValuesYaml(raw: string): ParsedUpgradeValues {
+  try {
+    const parsed = yaml.parse(raw)
+    if (parsed === null || parsed === undefined) return { values: {}, error: null }
+    if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { values: null, error: 'Values must be a YAML mapping (key: value), not a list or single value' }
+    }
+    return { values: parsed as Record<string, unknown>, error: null }
+  } catch (err) {
+    return { values: null, error: err instanceof Error ? err.message : 'Invalid YAML' }
+  }
+}
+
+export function isUpgradeSourceIssueActionable(issue: UpgradeInfo['sourceIssue']): issue is ActionableUpgradeSourceIssue {
+  return Boolean(issue && issue !== 'ambiguous_repository')
+}
 
 const MIN_WIDTH = 500
 const MAX_WIDTH_PERCENT = 0.8
 const DEFAULT_WIDTH = 1000
 
-export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOpen = true }: HelmReleaseDrawerProps) {
+export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOpen = true, rightInset = 0 }: HelmReleaseDrawerProps) {
   const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState<TabId>('overview')
   const [copied, setCopied] = useState<string | null>(null)
   const [drawerWidth, setDrawerWidth] = useState(DEFAULT_WIDTH)
+  const [viewportWidth, setViewportWidth] = useState(() => (typeof window === 'undefined' ? DEFAULT_WIDTH : window.innerWidth))
   const [isResizing, setIsResizing] = useState(false)
   const [selectedRevision, setSelectedRevision] = useState<number | undefined>(undefined)
   const [showAllValues, setShowAllValues] = useState(false)
-  const [diffRevisions, setDiffRevisions] = useState<{ rev1: number; rev2: number } | null>(null)
   const [rollbackRevision, setRollbackRevision] = useState<number | null>(null)
   const [showUninstallConfirm, setShowUninstallConfirm] = useState(false)
   const [showUpgradeConfirm, setShowUpgradeConfirm] = useState(false)
+  const [showTrackSource, setShowTrackSource] = useState(false)
+  const [selectedVersion, setSelectedVersion] = useState<string | null>(null)
+  const [adjustValues, setAdjustValues] = useState(false)
+  const [editedUpgradeYaml, setEditedUpgradeYaml] = useState('')
+  const [upgradeYamlError, setUpgradeYamlError] = useState<string | null>(null)
+  const [upgradeValuesSeeded, setUpgradeValuesSeeded] = useState(false)
+  const [upgradePreview, setUpgradePreview] = useState<ValuesPreviewResponse | null>(null)
+  const [upgradePreviewRequest, setUpgradePreviewRequest] = useState<UpgradePreviewRequest | null>(null)
+  const [showUpgradePreview, setShowUpgradePreview] = useState(false)
   const resizeStartX = useRef(0)
   const resizeStartWidth = useRef(DEFAULT_WIDTH)
+  const targetVersionRef = useRef('')
+  const editedUpgradeYamlRef = useRef('')
   const { allowed: canHelmWrite, reason: helmActReason } = useCanHelmAct()
   // Cloud viewers can't view release manifests / values / diffs
   // (backend gate at requireCloudRole('member')). Skip the queries
@@ -60,7 +138,7 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
   const canViewSensitive = canAtLeast('member')
   const helmNamespace = release.storageNamespace || release.namespace
 
-  const { data: releaseDetail, isLoading, refetch: refetchRelease } = useHelmRelease(
+  const { data: releaseDetail, isLoading, error: releaseError, refetch: refetchRelease } = useHelmRelease(
     helmNamespace,
     release.name
   )
@@ -80,15 +158,17 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
     release.name,
     showAllValues,
     canViewSensitive,
+    selectedRevision,
   )
-
-  // Fetch diff if comparing revisions
-  const { data: diffData, isLoading: diffLoading } = useHelmManifestDiff(
+  const {
+    data: upgradeValues,
+    isLoading: upgradeValuesLoading,
+    error: upgradeValuesError,
+  } = useHelmValues(
     helmNamespace,
     release.name,
-    diffRevisions?.rev1 || 0,
-    diffRevisions?.rev2 || 0,
-    canViewSensitive,
+    false,
+    canViewSensitive && showUpgradeConfirm && adjustValues,
   )
 
   // Lazy check for upgrade availability
@@ -97,14 +177,37 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
     release.name
   )
   const upgradeErrorMessage = upgradeError instanceof Error ? upgradeError.message : 'Upgrade check failed'
+  const upgradeSourceIssue = upgradeInfo ? getUpgradeSourceIssue(upgradeInfo) : undefined
+
+  // Available versions for the upgrade dialog's picker — only fetched while the
+  // confirm dialog is open. Default the selection to latest when it opens.
+  const {
+    data: availableVersions,
+    isLoading: availableVersionsLoading,
+    error: availableVersionsError,
+  } = useHelmReleaseVersions(helmNamespace, release.name, showUpgradeConfirm)
+  const targetVersion = selectedVersion ?? upgradeInfo?.latestVersion ?? ''
+  const selectableVersions = availableVersions && availableVersions.length > 1 ? availableVersions : null
+  // Semver compare, not list-position: the installed version may be older than
+  // the newest-N versions the picker shows, so it isn't always in the list.
+  const isDowngrade = Boolean(
+    targetVersion && upgradeInfo?.currentVersion &&
+    compareVersions(targetVersion, upgradeInfo.currentVersion) === -1
+  )
 
   // Mutations for actions
   const uninstallMutation = useHelmUninstall()
+  const upgradePreviewMutation = useHelmPreviewValues()
+  const isPreviewingUpgrade = upgradePreviewMutation.isPending
   const queryClient = useQueryClient()
   const [upgradeProgress, setUpgradeProgress] = useState<{ phase: string; message: string }[]>([])
   const [isUpgrading, setIsUpgrading] = useState(false)
   const [rollbackProgress, setRollbackProgress] = useState<{ phase: string; message: string }[]>([])
   const [isRollingBack, setIsRollingBack] = useState(false)
+
+  useEffect(() => {
+    targetVersionRef.current = targetVersion
+  }, [targetVersion])
 
   // ESC key handler
   useEffect(() => {
@@ -115,13 +218,24 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
     return () => document.removeEventListener('keydown', handleKeyDown)
   }, [onClose])
 
+  useEffect(() => {
+    const handleWindowResize = () => setViewportWidth(window.innerWidth)
+    handleWindowResize()
+    window.addEventListener('resize', handleWindowResize)
+    return () => window.removeEventListener('resize', handleWindowResize)
+  }, [])
+
+  const minDrawerWidth = Math.min(MIN_WIDTH, viewportWidth)
+  const maxDrawerWidth = viewportWidth < MIN_WIDTH ? viewportWidth : Math.max(MIN_WIDTH, viewportWidth * MAX_WIDTH_PERCENT)
+  const renderedDrawerWidth = Math.max(minDrawerWidth, Math.min(drawerWidth, maxDrawerWidth))
+
   // Resize handlers
   const handleResizeStart = useCallback((e: React.MouseEvent) => {
     e.preventDefault()
     setIsResizing(true)
     resizeStartX.current = e.clientX
-    resizeStartWidth.current = drawerWidth
-  }, [drawerWidth])
+    resizeStartWidth.current = renderedDrawerWidth
+  }, [renderedDrawerWidth])
 
   useEffect(() => {
     if (!isResizing) return
@@ -129,11 +243,13 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
     document.body.style.cursor = 'ew-resize'
     document.body.style.userSelect = 'none'
 
-    const maxWidth = window.innerWidth * MAX_WIDTH_PERCENT
     const handleMouseMove = (e: MouseEvent) => {
       const deltaX = resizeStartX.current - e.clientX
       const newWidth = resizeStartWidth.current + deltaX
-      setDrawerWidth(Math.max(MIN_WIDTH, Math.min(newWidth, maxWidth)))
+      const viewport = window.innerWidth
+      const minWidth = Math.min(MIN_WIDTH, viewport)
+      const maxWidth = viewport < MIN_WIDTH ? viewport : Math.max(MIN_WIDTH, viewport * MAX_WIDTH_PERCENT)
+      setDrawerWidth(Math.max(minWidth, Math.min(newWidth, maxWidth)))
     }
     const handleMouseUp = () => setIsResizing(false)
     document.addEventListener('mousemove', handleMouseMove)
@@ -159,10 +275,16 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
     startViewTransitionSafe(() => flushSync(() => setActiveTab(tab)))
   }, [])
 
-  const handleCompareRevisions = (rev1: number, rev2: number) => {
-    setDiffRevisions({ rev1, rev2 })
-    switchTab('diff')
-  }
+  const handleCompareRevisions = useCallback((rev1: number, rev2: number) => {
+    const params = new URLSearchParams()
+    const globalNamespaces = new URLSearchParams(window.location.search).get('namespaces')
+    if (globalNamespaces) params.set('namespaces', globalNamespaces)
+    params.set('release', `${release.namespace}/${release.name}`)
+    if (release.storageNamespace) params.set('releaseStorage', release.storageNamespace)
+    params.set('revision1', String(rev1))
+    params.set('revision2', String(rev2))
+    navigate({ pathname: '/helm/compare', search: params.toString() })
+  }, [navigate, release.name, release.namespace, release.storageNamespace])
 
   const handleViewRevision = (revision: number) => {
     setSelectedRevision(revision)
@@ -232,8 +354,88 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
     )
   }
 
-  const handleUpgradeConfirm = async () => {
-    if (!upgradeInfo?.latestVersion) return
+  const resetUpgradeDialog = () => {
+    setUpgradeProgress([])
+    setSelectedVersion(null)
+    setAdjustValues(false)
+    setEditedUpgradeYaml('')
+    editedUpgradeYamlRef.current = ''
+    setUpgradeYamlError(null)
+    setUpgradeValuesSeeded(false)
+    setUpgradePreview(null)
+    setUpgradePreviewRequest(null)
+    setShowUpgradePreview(false)
+    upgradePreviewMutation.reset()
+  }
+
+  useEffect(() => {
+    if (!adjustValues || !upgradeValues || upgradeValuesSeeded) return
+    const nextYaml = userSuppliedToYaml(upgradeValues.userSupplied)
+    editedUpgradeYamlRef.current = nextYaml
+    setEditedUpgradeYaml(nextYaml)
+    setUpgradeYamlError(null)
+    setUpgradeValuesSeeded(true)
+  }, [adjustValues, upgradeValues, upgradeValuesSeeded])
+
+  const handleToggleAdjustValues = () => {
+    if (adjustValues) {
+      setAdjustValues(false)
+      return
+    }
+
+    setEditedUpgradeYaml('')
+    editedUpgradeYamlRef.current = ''
+    setUpgradeYamlError(null)
+    setUpgradeValuesSeeded(false)
+    upgradePreviewMutation.reset()
+    setAdjustValues(true)
+  }
+
+  const getEditedUpgradeValues = () => {
+    if (!adjustValues) return {}
+    const parsed = parseUpgradeValuesYaml(editedUpgradeYamlRef.current)
+    setUpgradeYamlError(parsed.error)
+    return parsed.values
+  }
+
+  const handleUpgradePreview = async () => {
+    if (!targetVersion || upgradeValuesLoading || upgradeValuesError || !upgradeValuesSeeded) return
+    const editedValues = getEditedUpgradeValues()
+    if (!editedValues) return
+    const previewYaml = editedUpgradeYamlRef.current
+    const previewRequest: UpgradePreviewRequest = {
+      targetVersion,
+      values: editedValues,
+      repositoryName: upgradeInfo?.repositoryName,
+    }
+    try {
+      const result = await upgradePreviewMutation.mutateAsync({
+        namespace: helmNamespace,
+        name: release.name,
+        values: previewRequest.values,
+        version: previewRequest.targetVersion,
+        repository: previewRequest.repositoryName,
+      })
+      if (targetVersionRef.current !== previewRequest.targetVersion || editedUpgradeYamlRef.current !== previewYaml) return
+      setUpgradePreview(result)
+      setUpgradePreviewRequest(previewRequest)
+      setShowUpgradePreview(true)
+    } catch {
+      return
+    }
+  }
+
+  const runUpgrade = async (versionToApply: string, editedValuesOverride: Record<string, unknown> | undefined, repositoryName: string | undefined) => {
+    if (!versionToApply) return
+
+    let editedValues = editedValuesOverride
+    if (editedValues === undefined && adjustValues) {
+      if (upgradeValuesLoading || upgradeValuesError || !upgradeValuesSeeded) return
+      editedValues = getEditedUpgradeValues() ?? undefined
+      if (!editedValues) return
+    }
+
+    setShowUpgradePreview(false)
     setIsUpgrading(true)
     setUpgradeProgress([])
 
@@ -241,8 +443,8 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
       await upgradeWithProgress(
         helmNamespace,
         release.name,
-        upgradeInfo.latestVersion,
-        upgradeInfo.repositoryName,
+        versionToApply,
+        repositoryName,
         (event) => {
           if (event.type === 'progress' && event.message) {
             setUpgradeProgress(prev => [...prev, {
@@ -250,23 +452,25 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
               message: event.message || '',
             }])
           }
-        }
+        },
+        editedValues
       )
 
       setUpgradeProgress(prev => [...prev, {
         phase: 'complete',
-        message: `Successfully upgraded to ${upgradeInfo.latestVersion}`,
+        message: `Successfully upgraded to ${versionToApply}`,
       }])
 
       // Invalidate queries
       queryClient.invalidateQueries({ queryKey: ['helm-releases'] })
       queryClient.invalidateQueries({ queryKey: ['helm-release', helmNamespace, release.name] })
       queryClient.invalidateQueries({ queryKey: ['helm-upgrade-info', helmNamespace, release.name] })
+      queryClient.invalidateQueries({ queryKey: ['helm-values', helmNamespace, release.name] })
       queryClient.invalidateQueries({ queryKey: ['helm-batch-upgrade-info'] })
 
       setTimeout(() => {
         setShowUpgradeConfirm(false)
-        setUpgradeProgress([])
+        resetUpgradeDialog()
         refetch()
         switchTab('resources')
       }, 1500)
@@ -278,6 +482,15 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
     } finally {
       setIsUpgrading(false)
     }
+  }
+
+  const handleUpgradeConfirm = () => {
+    void runUpgrade(targetVersion, undefined, upgradeInfo?.repositoryName)
+  }
+
+  const handleApplyUpgradePreview = () => {
+    if (!upgradePreviewRequest) return
+    void runUpgrade(upgradePreviewRequest.targetVersion, upgradePreviewRequest.values, upgradePreviewRequest.repositoryName)
   }
 
   const headerHeight = 49
@@ -292,11 +505,6 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
     { id: 'hooks', label: 'Hooks', icon: Anchor },
   ]
 
-  // Add diff tab only when comparing
-  if (diffRevisions) {
-    tabs.push({ id: 'diff', label: 'Diff', icon: FileText })
-  }
-
   return (
     <div
       className={clsx(
@@ -304,7 +512,7 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
         TRANSITION_DRAWER,
         isOpen ? 'translate-x-0 opacity-100' : 'translate-x-full opacity-0'
       )}
-      style={{ width: drawerWidth, top: headerHeight, height: `calc(100vh - ${headerHeight}px - ${dockInset}px)` }}
+      style={{ width: renderedDrawerWidth, top: headerHeight, right: rightInset, height: `calc(100vh - ${headerHeight}px - ${dockInset}px)` }}
     >
       {/* Resize handle */}
       <div
@@ -334,63 +542,111 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
                 checking...
               </span>
             ) : upgradeError ? (
+              <Tooltip content={upgradeErrorMessage ?? ''}>
               <span
                 className="badge bg-theme-hover/50 text-theme-text-secondary"
-                title={upgradeErrorMessage}
               >
                 upgrade check failed
               </span>
+              </Tooltip>
+            ) : upgradeInfo?.updateAvailable && releaseDetail?.managedByFluxHelmRelease ? (
+              // Route-only for GitOps-managed releases: a direct `helm upgrade`
+              // would be reverted at the next reconcile, so surface the available
+              // version as info and point at GitOps rather than offer the upgrade.
+              <Tooltip content={`${upgradeInfo.latestVersion} available — managed by Flux, upgrade via the GitOps view (a direct upgrade would be reverted at the next reconcile).`}>
+              <span className={clsx('badge', SEVERITY_BADGE.warning, 'opacity-90')}>
+                <ArrowUpCircle className="w-3 h-3" />
+                {upgradeInfo.latestVersion}
+              </span>
+              </Tooltip>
             ) : upgradeInfo?.updateAvailable ? (
+              <Tooltip content={canHelmWrite ? `Click to upgrade: ${upgradeInfo.currentVersion} → ${upgradeInfo.latestVersion}${upgradeInfo.repositoryName ? ` (${upgradeInfo.repositoryName})` : upgradeInfo.sourceType === 'oci' ? ' (OCI)' : ''}` : helmActReason}>
               <button
                 onClick={() => setShowUpgradeConfirm(true)}
                 disabled={!canHelmWrite}
                 className={clsx(
-                  'badge transition-colors', SEVERITY_BADGE.warning,
+                  'badge transition-colors disabled:pointer-events-none', SEVERITY_BADGE.warning,
                   canHelmWrite ? 'hover:bg-amber-500/30 cursor-pointer' : 'opacity-50 cursor-not-allowed'
                 )}
-                title={canHelmWrite ? `Click to upgrade: ${upgradeInfo.currentVersion} → ${upgradeInfo.latestVersion}${upgradeInfo.repositoryName ? ` (${upgradeInfo.repositoryName})` : ''}` : helmActReason}
               >
                 <ArrowUpCircle className="w-3 h-3" />
                 {upgradeInfo.latestVersion}
               </button>
+              </Tooltip>
             ) : upgradeInfo && !upgradeInfo.error ? (
-              <span className={clsx('badge', SEVERITY_BADGE.success)} title="Chart is up to date">
+              <Tooltip content="Chart is up to date">
+              <span className={clsx('badge', SEVERITY_BADGE.success)}>
                 latest
               </span>
+              </Tooltip>
             ) : upgradeInfo?.error ? (
-              <span
-                className="badge bg-theme-hover/50 text-theme-text-secondary"
-                title={upgradeInfo.error}
-              >
-                upstream unknown
-              </span>
+              releaseDetail?.managedByFluxHelmRelease ? (
+                // Managed by Flux — the "Managed by Flux" badge routes to GitOps,
+                // where the chart source lives. Don't push a Helm source here.
+                <Tooltip content="Chart source is managed by Flux — track upgrades from the GitOps view.">
+                <span className="badge bg-theme-hover/50 text-theme-text-secondary">
+                  source via GitOps
+                </span>
+                </Tooltip>
+              ) : upgradeSourceIssue && !isUpgradeSourceIssueActionable(upgradeSourceIssue) ? (
+                <Tooltip content={getUpgradeSourceIssueTooltip(upgradeSourceIssue, upgradeInfo.error, canHelmWrite, helmActReason)}>
+                <span className="badge bg-theme-hover/50 text-theme-text-secondary">
+                  <Link2 className="w-3 h-3" />
+                  {getUpgradeSourceIssueLabel(upgradeSourceIssue)}
+                </span>
+                </Tooltip>
+              ) : isUpgradeSourceIssueActionable(upgradeSourceIssue) ? (
+                <Tooltip content={getUpgradeSourceIssueTooltip(upgradeSourceIssue, upgradeInfo.error, canHelmWrite, helmActReason)}>
+                <button
+                  onClick={() => canHelmWrite && setShowTrackSource(true)}
+                  disabled={!canHelmWrite}
+                  className={clsx(
+                    'badge transition-colors disabled:pointer-events-none bg-theme-hover/50 text-theme-text-secondary',
+                    canHelmWrite ? 'hover:bg-theme-hover cursor-pointer' : 'opacity-50 cursor-not-allowed'
+                  )}
+                >
+                  <Link2 className="w-3 h-3" />
+                  {getUpgradeSourceIssueLabel(upgradeSourceIssue)}
+                </button>
+                </Tooltip>
+              ) : (
+                <Tooltip content={upgradeInfo.error}>
+                <span className="badge bg-theme-hover/50 text-theme-text-secondary">
+                  upgrade source unresolved
+                </span>
+                </Tooltip>
+              )
             ) : null}
           </div>
           <div className="flex items-center gap-1">
+            <Tooltip content="Refresh">
             <button
               onClick={refetch}
               disabled={isRefreshAnimating}
-              className="p-1.5 text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded disabled:opacity-50"
-              title="Refresh"
+              className="p-1.5 text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded disabled:opacity-50 disabled:pointer-events-none"
             >
               <RefreshCw className={clsx('w-4 h-4', isRefreshAnimating && 'animate-spin')} />
             </button>
+            </Tooltip>
+            <Tooltip content={canHelmWrite ? 'Uninstall release' : helmActReason}>
             <button
               onClick={() => setShowUninstallConfirm(true)}
               disabled={!canHelmWrite}
               className={clsx(
-                'p-1.5 rounded',
+                'p-1.5 rounded disabled:pointer-events-none',
                 canHelmWrite
                   ? 'text-theme-text-secondary hover:text-red-400 hover:bg-red-500/10'
                   : 'text-theme-text-disabled cursor-not-allowed'
               )}
-              title={canHelmWrite ? 'Uninstall release' : helmActReason}
             >
               <Trash2 className="w-4 h-4" />
             </button>
-            <button onClick={onClose} className="p-1.5 text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded" title="Close (Esc)">
+            </Tooltip>
+            <Tooltip content="Close (Esc)">
+            <button onClick={onClose} className="p-1.5 text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded">
               <X className="w-4 h-4" />
             </button>
+            </Tooltip>
           </div>
         </div>
 
@@ -399,28 +655,30 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
           <div className="flex items-center gap-2">
             <Package className="w-5 h-5 text-purple-400" />
             <h2 className="text-lg font-semibold text-theme-text-primary truncate">{release.name}</h2>
+            <Tooltip content="Copy name" wrapperClassName="shrink-0">
             <button
               onClick={() => copyToClipboard(release.name, 'name')}
               className="p-1 text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded shrink-0"
-              title="Copy name"
             >
               {copied === 'name' ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Copy className="w-3.5 h-3.5" />}
             </button>
+            </Tooltip>
           </div>
           <p className="text-sm text-theme-text-tertiary">{release.namespace}</p>
           {releaseDetail?.managedByFluxHelmRelease && (
+            <Tooltip content={`Installed by Flux helm-controller via HelmRelease ${releaseDetail.managedByFluxHelmRelease}. Changes here would be reverted at the next reconcile.`} wrapperClassName="mt-1">
             <button
               type="button"
               onClick={() => {
                 const [ns, name] = releaseDetail.managedByFluxHelmRelease!.split('/')
                 navigate(`/gitops/detail/helmreleases/${encodeURIComponent(ns || '_')}/${encodeURIComponent(name)}`)
               }}
-              className="mt-1 inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[11px] text-amber-700 dark:text-amber-400 hover:bg-amber-500/20 transition-colors"
-              title={`Installed by Flux helm-controller via HelmRelease ${releaseDetail.managedByFluxHelmRelease}. Changes here would be reverted at the next reconcile.`}
+              className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[11px] text-amber-700 dark:text-amber-400 hover:bg-amber-500/20 transition-colors"
             >
               <GitBranch className="w-3 h-3" />
               Managed by Flux · {releaseDetail.managedByFluxHelmRelease}
             </button>
+            </Tooltip>
           )}
         </div>
 
@@ -446,12 +704,20 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto" style={{ viewTransitionName: 'helm-drawer-content' }}>
-        {isLoading ? (
-          <PaneLoader className="h-32" />
-        ) : !releaseDetail ? (
-          <div className="flex items-center justify-center h-32 text-theme-text-tertiary">Release not found</div>
+        {!releaseDetail ? (
+          <FetchResult loading={isLoading} error={releaseError} notFoundMessage="Release not found" className="h-32" />
         ) : (
           <>
+            <HelmOperationBanner
+              operation={releaseDetail.lastOperation}
+              operationInsight={releaseDetail.operationInsight}
+              releaseNamespace={releaseDetail.namespace}
+              managedByFluxHelmRelease={releaseDetail.managedByFluxHelmRelease}
+              hookDiagnostics={releaseDetail.hookDiagnostics}
+              canCompare={canViewSensitive}
+              onCompare={handleCompareRevisions}
+              onNavigateToResource={onNavigateToResource}
+            />
             {activeTab === 'overview' && (
               <OverviewTab release={releaseDetail} onCopy={copyToClipboard} copied={copied} />
             )}
@@ -459,6 +725,7 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
               <RevisionHistory
                 history={releaseDetail.history}
                 currentRevision={releaseDetail.revision}
+                operations={mergeHelmOperations(releaseDetail.operations, releaseDetail.lastOperation)}
                 onViewRevision={handleViewRevision}
                 onCompare={handleCompareRevisions}
                 onRollback={canHelmWrite ? handleRollbackRequest : undefined}
@@ -486,6 +753,8 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
                   copied={copied === 'values'}
                   namespace={helmNamespace}
                   name={release.name}
+                  revision={selectedRevision}
+                  currentRevision={releaseDetail.revision}
                   onApplySuccess={() => refetch()}
                 />
               </RoleGatedPanel>
@@ -497,21 +766,7 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
               />
             )}
             {activeTab === 'hooks' && (
-              <HooksTab hooks={releaseDetail.hooks || []} />
-            )}
-            {activeTab === 'diff' && diffRevisions && (
-              <RoleGatedPanel min="member" feature="release manifest diffs">
-                <ManifestDiffViewer
-                  diff={diffData?.diff || ''}
-                  isLoading={diffLoading}
-                  revision1={diffRevisions.rev1}
-                  revision2={diffRevisions.rev2}
-                  onClose={() => {
-                    setDiffRevisions(null)
-                    setActiveTab('history')
-                  }}
-                />
-              </RoleGatedPanel>
+              <HooksTab hooks={releaseDetail.hooks || []} hookDiagnostics={releaseDetail.hookDiagnostics || []} />
             )}
           </>
         )}
@@ -561,7 +816,7 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
         open={showUpgradeConfirm}
         onClose={() => {
           setShowUpgradeConfirm(false)
-          setUpgradeProgress([])
+          resetUpgradeDialog()
           if (isUpgrading) {
             // Upgrade continues server-side — switch to resources tab to monitor
             setIsUpgrading(false)
@@ -570,20 +825,190 @@ export function HelmReleaseDrawer({ release, onClose, onNavigateToResource, isOp
         }}
         onConfirm={handleUpgradeConfirm}
         title="Upgrade Release"
-        message={`Upgrade "${release.name}" to version ${upgradeInfo?.latestVersion}?`}
+        message={`Upgrade "${release.name}" to version ${targetVersion}?`}
         details={upgradeProgress.length === 0
-          ? `This will upgrade the chart from version ${upgradeInfo?.currentVersion} to ${upgradeInfo?.latestVersion}. Your existing values will be preserved. The upgrade will be applied to your cluster immediately.`
+          ? `The chart will move from version ${upgradeInfo?.currentVersion} to ${targetVersion}. ${adjustValues ? 'Your edited values will be applied.' : 'Your existing values will be preserved.'} The change is applied to your cluster immediately.`
           : undefined
         }
-        confirmLabel="Upgrade"
+        confirmLabel={isDowngrade ? 'Downgrade' : 'Upgrade'}
         variant="warning"
         isLoading={isUpgrading}
+        confirmDisabled={isPreviewingUpgrade || (adjustValues && (upgradeValuesLoading || !!upgradeValuesError || !upgradeValuesSeeded || !!upgradeYamlError))}
         isClosable
+        className="max-w-2xl"
       >
+        {upgradeProgress.length === 0 && (
+          <div className="mb-1">
+            <label
+              id="upgrade-version-label"
+              htmlFor={selectableVersions ? 'upgrade-version' : undefined}
+              className="block text-sm font-medium text-theme-text-secondary mb-1.5"
+            >
+              Target version
+            </label>
+            {availableVersionsLoading ? (
+              <div
+                aria-labelledby="upgrade-version-label"
+                aria-live="polite"
+                className="flex h-10 items-center gap-2 rounded-lg border border-theme-border-light bg-theme-elevated px-3 text-sm text-theme-text-secondary"
+              >
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Loading available versions...
+              </div>
+            ) : selectableVersions ? (
+              <select
+                id="upgrade-version"
+                value={targetVersion}
+                onChange={(e) => {
+                  targetVersionRef.current = e.target.value
+                  setSelectedVersion(e.target.value)
+                }}
+                disabled={isUpgrading || isPreviewingUpgrade}
+                className="w-full px-3 py-2 bg-theme-elevated border border-theme-border-light rounded-lg text-sm text-theme-text-primary focus:outline-none focus:ring-2 focus:ring-accent disabled:opacity-50"
+              >
+                {selectableVersions.map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                    {v === upgradeInfo?.latestVersion ? ' (latest)' : ''}
+                    {v === upgradeInfo?.currentVersion ? ' (current)' : ''}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <div
+                aria-labelledby="upgrade-version-label"
+                className="flex h-10 items-center rounded-lg border border-theme-border-light bg-theme-elevated px-3 text-sm text-theme-text-primary"
+              >
+                {targetVersion}
+              </div>
+            )}
+            {isDowngrade && (
+              <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                This is a downgrade from {upgradeInfo?.currentVersion}.
+              </p>
+            )}
+            {availableVersionsError && (
+              <p className="mt-1 text-xs text-theme-text-tertiary">
+                Version list unavailable; using the detected target version.
+              </p>
+            )}
+            {availableVersions && availableVersions.length >= 50 && (
+              <p className="mt-1 text-xs text-theme-text-tertiary">
+                Showing the 50 newest versions.
+              </p>
+            )}
+          </div>
+        )}
+        {upgradeProgress.length === 0 && canHelmWrite && canViewSensitive && (
+          <div className="mt-3 border-t border-theme-border pt-3">
+            <Tooltip content="Edit the user-supplied Helm values that Radar will pass to this upgrade.">
+              <button
+                type="button"
+                onClick={handleToggleAdjustValues}
+                disabled={isUpgrading || isPreviewingUpgrade}
+                aria-expanded={adjustValues}
+                aria-controls="helm-upgrade-values-panel"
+                className="flex items-center gap-1.5 text-sm font-medium text-theme-text-secondary hover:text-theme-text-primary disabled:opacity-50"
+              >
+                <CollapseChevron open={adjustValues} className="w-4 h-4" />
+                <SlidersHorizontal className="w-3.5 h-3.5" />
+                Adjust your values (optional)
+              </button>
+            </Tooltip>
+            {/* unmountOnExit: the editor (uncontrolled textarea + seeded values)
+                must reset between opens, and the values query only runs while
+                the panel is open. */}
+            <Collapse open={adjustValues} unmountOnExit id="helm-upgrade-values-panel">
+                  <div className="mt-2">
+                    <p className="mb-2 text-xs text-theme-text-tertiary">
+                      These are your current settings — edit them to carry into {targetVersion}. What you see here is exactly what gets applied.
+                    </p>
+                    {upgradeValuesError && (
+                      <div className="mt-2 px-3 py-2 text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded">
+                        Couldn’t load current values: {upgradeValuesError instanceof Error ? upgradeValuesError.message : 'Unknown error'}
+                      </div>
+                    )}
+                    {(upgradeValuesLoading || !upgradeValuesSeeded) && (
+                      <div className="flex min-h-[180px] items-center gap-2 rounded border border-theme-border bg-theme-elevated px-3 text-sm text-theme-text-secondary">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Loading current values...
+                      </div>
+                    )}
+                    {!upgradeValuesLoading && !upgradeValuesError && upgradeValuesSeeded && (
+                      <textarea
+                        defaultValue={editedUpgradeYaml}
+                        onChange={(event) => {
+                          editedUpgradeYamlRef.current = event.target.value
+                          if (upgradeYamlError) setUpgradeYamlError(null)
+                        }}
+                        onBlur={() => setUpgradeYamlError(parseUpgradeValuesYaml(editedUpgradeYamlRef.current).error)}
+                        aria-label="Edited Helm values YAML"
+                        readOnly={isPreviewingUpgrade || isUpgrading}
+                        spellCheck={false}
+                        autoCorrect="off"
+                        autoCapitalize="off"
+                        rows={9}
+                        className="max-h-[360px] min-h-[180px] w-full resize-y rounded-lg border border-theme-border bg-theme-elevated px-3 py-2 font-mono text-xs leading-5 text-theme-text-primary placeholder:text-theme-text-tertiary focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/30 read-only:opacity-70"
+                      />
+                    )}
+                    {upgradeYamlError && (
+                      <div className="mt-2 px-3 py-2 text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded">
+                        {upgradeYamlError}
+                      </div>
+                    )}
+                    {upgradePreviewMutation.error && (
+                      <div className="mt-2 px-3 py-2 text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded">
+                        Couldn’t preview against {targetVersion}: {upgradePreviewMutation.error.message}. You can still upgrade.
+                      </div>
+                    )}
+                    <div className="mt-2 flex justify-end">
+                      <Tooltip
+                        content="Render this release with the selected chart version and edited values, then show the manifest diff. Nothing is applied until you confirm from the preview."
+                        wrapperClassName="shrink-0"
+                      >
+                        <button
+                          type="button"
+                          onClick={handleUpgradePreview}
+                          disabled={upgradeValuesLoading || !!upgradeValuesError || !upgradeValuesSeeded || !!upgradeYamlError || isPreviewingUpgrade || isUpgrading}
+                          className="flex items-center gap-1 px-2.5 py-1 text-xs text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded border border-theme-border disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {upgradePreviewMutation.isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Eye className="w-3.5 h-3.5" />}
+                          Preview what changes
+                        </button>
+                      </Tooltip>
+                    </div>
+                  </div>
+            </Collapse>
+          </div>
+        )}
         {upgradeProgress.length > 0 && <ProgressLog entries={upgradeProgress} />}
       </ConfirmDialog>
+
+      {showUpgradePreview && upgradePreview && upgradePreviewRequest && (
+        <ValuesDiffPreview
+          previewData={upgradePreview}
+          onClose={() => setShowUpgradePreview(false)}
+          onApply={handleApplyUpgradePreview}
+          isApplying={isUpgrading}
+          title={`Preview upgrade to ${upgradePreviewRequest.targetVersion}`}
+          applyLabel={upgradeInfo?.currentVersion && compareVersions(upgradePreviewRequest.targetVersion, upgradeInfo.currentVersion) === -1 ? 'Downgrade' : 'Upgrade'}
+        />
+      )}
+
+      <TrackChartSourceDialog
+        open={showTrackSource}
+        onClose={() => setShowTrackSource(false)}
+        chartName={releaseDetail?.chart}
+        sourceIssue={upgradeSourceIssue}
+        sourceError={upgradeInfo?.error}
+      />
     </div>
   )
+}
+
+function userSuppliedToYaml(userSupplied: Record<string, unknown> | undefined): string {
+  if (!userSupplied || Object.keys(userSupplied).length === 0) return ''
+  return yaml.stringify(userSupplied, { lineWidth: 0 })
 }
 
 // Shared progress log for streaming Helm operations
@@ -613,6 +1038,319 @@ function ProgressLog({ entries }: { entries: { phase: string; message: string }[
   )
 }
 
+function mergeHelmOperations(operations: HelmOperation[] | undefined, lastOperation: HelmOperation | undefined): HelmOperation[] {
+  const merged: HelmOperation[] = []
+  const seen = new Set<string>()
+  for (const op of [...(operations || []), ...(lastOperation ? [lastOperation] : [])]) {
+    const key = helmOperationKey(op)
+    if (seen.has(key)) continue
+    seen.add(key)
+    merged.push(op)
+  }
+  return merged
+}
+
+function helmOperationKey(operation: HelmOperation): string {
+  return [
+    operation.kind,
+    operation.status,
+    operation.revision || 0,
+    operation.failedRevision || 0,
+    operation.rollbackRevision || 0,
+    operation.targetRevision || 0,
+  ].join(':')
+}
+
+function HelmOperationBanner({
+  operation,
+  operationInsight,
+  releaseNamespace,
+  managedByFluxHelmRelease,
+  hookDiagnostics,
+  canCompare,
+  onCompare,
+  onNavigateToResource,
+}: {
+  operation?: HelmOperation
+  operationInsight?: HelmOperationInsight
+  releaseNamespace: string
+  managedByFluxHelmRelease?: string
+  hookDiagnostics?: HookDiagnostic[]
+  canCompare?: boolean
+  onCompare?: (rev1: number, rev2: number) => void
+  onNavigateToResource?: NavigateToResource
+}) {
+  const primaryHookDiagnostic = hookDiagnostics?.[0]
+  if ((!operation || !shouldShowOperationBanner(operation)) && !primaryHookDiagnostic) {
+    return null
+  }
+  if (!operation || !shouldShowOperationBanner(operation)) {
+    const tone = hookDiagnosticTone(primaryHookDiagnostic!)
+    return (
+      <div className="m-4 mb-0 card-inner-lg">
+        <div className="flex items-start gap-3">
+          <AlertTriangle className={clsx('mt-0.5 h-5 w-5 shrink-0', SEVERITY_TEXT[tone])} />
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-medium text-theme-text-primary">Helm hook needs attention</span>
+              <span className={clsx('badge-sm', SEVERITY_BADGE[tone])}>{primaryHookDiagnostic!.phase}</span>
+            </div>
+            <HookSignal diagnostic={primaryHookDiagnostic!} />
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const isFailure = operation.status === 'failed'
+  const isPending = operation.status === 'stuck_pending'
+  const tone: 'error' | 'warning' | 'info' = isFailure ? 'error' : operation.kind === 'rollback' ? 'info' : 'warning'
+  const Icon = operation.kind === 'upgrade_rolled_back' || operation.kind === 'rollback' ? RotateCcw : isPending ? Clock : AlertTriangle
+  const title = operationTitle(operation)
+  const statusLabel = operation.status.replace(/_/g, ' ')
+  const showStatusBadge = !(operation.status === 'failed' && title.toLowerCase().includes('failed'))
+  const rawMessage = operation.rawMessage?.trim()
+  const hasRawMessage = !!rawMessage && rawMessage !== operation.message.trim()
+
+  return (
+    <div className="m-4 mb-0 card-inner-lg">
+      <div className="flex items-start gap-3">
+        <Icon className={clsx('mt-0.5 h-5 w-5 shrink-0', SEVERITY_TEXT[tone])} />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-medium text-theme-text-primary">{title}</span>
+            {showStatusBadge && (
+              <span className={clsx('badge-sm', SEVERITY_BADGE[tone])}>{statusLabel}</span>
+            )}
+            <OperationRevisionChips operation={operation} />
+          </div>
+          <p className="mt-1 text-sm text-theme-text-secondary">{operation.message}</p>
+          {hasRawMessage && (
+            <Disclosure className="mt-2" summaryClassName="select-none text-xs font-medium text-theme-text-tertiary hover:text-theme-text-secondary" summary="Show raw Helm error">
+              <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-theme-base/60 p-2 font-mono text-[11px] leading-relaxed text-theme-text-tertiary">
+                {rawMessage}
+              </pre>
+            </Disclosure>
+          )}
+          {operation.failureDescription && !hasRawMessage && (
+            <Tooltip content={operation.failureDescription} wrapperClassName="mt-1 flex">
+              <span className="line-clamp-2 text-xs text-theme-text-tertiary">
+                {operation.failureDescription}
+              </span>
+            </Tooltip>
+          )}
+          {operation.kind === 'upgrade_rolled_back' && (
+            <p className="mt-1 text-xs text-theme-text-tertiary">
+              Helm history does not record whether <code className="inline-code text-[11px]">--atomic</code> was set; the rollback is inferred from adjacent release revisions.
+            </p>
+          )}
+          <OperationInsightSignals
+            insight={operationInsight}
+            releaseNamespace={releaseNamespace}
+            canCompare={Boolean(canCompare)}
+            onCompare={onCompare}
+            onNavigateToResource={onNavigateToResource}
+          />
+          {primaryHookDiagnostic && <HookSignal diagnostic={primaryHookDiagnostic} />}
+          {managedByFluxHelmRelease && (
+            <p className="mt-1 text-xs text-theme-text-tertiary">
+              This release is managed by Flux HelmRelease {managedByFluxHelmRelease}; direct Helm changes may be reconciled back.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function OperationInsightSignals({
+  insight,
+  releaseNamespace,
+  canCompare,
+  onCompare,
+  onNavigateToResource,
+}: {
+  insight?: HelmOperationInsight
+  releaseNamespace: string
+  canCompare: boolean
+  onCompare?: (rev1: number, rev2: number) => void
+  onNavigateToResource?: NavigateToResource
+}) {
+  const compare = insight?.suggestedCompare
+  const primaryResource = insight?.primaryResource
+  const relatedCount = primaryResource
+    ? Math.max(0, (insight?.signalCount ?? 0) - 1)
+    : insight?.relatedResources?.length ?? 0
+  const showCompare = Boolean(compare && canCompare && onCompare)
+  if (!primaryResource && !showCompare) {
+    return null
+  }
+
+  return (
+    <div className="mt-2 space-y-2">
+      {primaryResource && (
+        <PrimaryOperationResourceSignal
+          resource={primaryResource}
+          releaseNamespace={releaseNamespace}
+          relatedCount={relatedCount}
+          onNavigateToResource={onNavigateToResource}
+        />
+      )}
+      {showCompare && compare && (
+        <Tooltip content={compare.reason || 'Compare the two Helm revisions'}>
+          <button
+            type="button"
+            onClick={() => onCompare?.(compare.revision1, compare.revision2)}
+            className="inline-flex items-center gap-1.5 rounded-md border border-theme-border-light bg-theme-elevated px-2.5 py-1.5 text-xs font-medium text-theme-text-primary shadow-theme-sm transition-colors hover:bg-theme-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            <GitCompare className="h-3.5 w-3.5" />
+            Compare rev {compare.revision1} to {compare.revision2}
+          </button>
+        </Tooltip>
+      )}
+    </div>
+  )
+}
+
+function PrimaryOperationResourceSignal({
+  resource,
+  releaseNamespace,
+  relatedCount,
+  onNavigateToResource,
+}: {
+  resource: HelmOwnedResource
+  releaseNamespace: string
+  relatedCount: number
+  onNavigateToResource?: NavigateToResource
+}) {
+  const canNavigate = Boolean(onNavigateToResource)
+  const resourceLabel = `${resource.kind}/${resource.name}`
+  const resourceTarget = resource.namespace ? `${resource.namespace}/${resource.name}` : resource.name
+  const showNamespace = Boolean(resource.namespace && resource.namespace !== releaseNamespace)
+  const resourceTooltip = `Open ${resource.kind} ${resourceTarget}`
+  const showInlineReady = Boolean(resource.ready && !resource.summary)
+  const openResource = () => {
+    const group = apiVersionToGroup(resource.apiVersion)
+    onNavigateToResource?.({
+      kind: kindToPluralWithGroup(resource.kind, group),
+      namespace: resource.namespace,
+      name: resource.name,
+      group,
+    })
+  }
+
+  return (
+    <div className="rounded-md bg-theme-base/50 p-2 text-xs">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-medium text-theme-text-secondary">Likely resource to inspect</span>
+        {canNavigate ? (
+          <Tooltip content={resourceTooltip}>
+            <button
+              type="button"
+              onClick={openResource}
+              aria-label={resourceTooltip}
+              className={clsx(
+                'badge-sm max-w-full min-w-0 transition-colors hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-1 focus:ring-offset-theme-base',
+                getKindBadgeColor(resource.kind)
+              )}
+            >
+              <span className="min-w-0 truncate">{resourceLabel}</span>
+              <ExternalLink className="h-3 w-3 shrink-0 opacity-70" />
+            </button>
+          </Tooltip>
+        ) : (
+          <span className={clsx('badge-sm max-w-full min-w-0', getKindBadgeColor(resource.kind))}>
+            <span className="min-w-0 truncate">{resourceLabel}</span>
+          </span>
+        )}
+        {showNamespace && <span className="text-theme-text-tertiary">ns/{resource.namespace}</span>}
+        {showInlineReady && <span className="font-mono text-theme-text-secondary">{resource.ready}</span>}
+        {resource.status && (
+          <span className={clsx('badge-sm', getResourceStatusColor(resource.status))}>{resource.status}</span>
+        )}
+      </div>
+      {(resource.issue || resource.summary || resource.message || relatedCount > 0) && (
+        <div className="mt-1 text-theme-text-tertiary">
+          {[
+            resource.issue || resource.summary || resource.message,
+            relatedCount > 0 ? `${relatedCount} more affected resource${relatedCount === 1 ? '' : 's'} in Resources tab` : null,
+          ]
+            .filter(Boolean)
+            .join(' - ')}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function hookDiagnosticTone(diagnostic: HookDiagnostic): 'error' | 'warning' {
+  return diagnostic.phase.toLowerCase() === 'failed' ? 'error' : 'warning'
+}
+
+function HookSignal({ diagnostic }: { diagnostic: HookDiagnostic }) {
+  return (
+    <div className="mt-2 rounded-md bg-theme-base/50 p-2 text-xs">
+      <div className="font-medium text-theme-text-secondary">
+        Hook signal: {formatHookRef(diagnostic)} is {diagnostic.phase}
+      </div>
+      <div className="mt-1 text-theme-text-tertiary">{diagnostic.message}</div>
+      {diagnostic.evidence?.summary && (
+        <div className="mt-1 text-theme-text-secondary">{diagnostic.evidence.summary}</div>
+      )}
+      {diagnostic.evidenceUnavailableReason && (
+        <div className="mt-1 text-theme-text-tertiary">{diagnostic.evidenceUnavailableReason}</div>
+      )}
+    </div>
+  )
+}
+
+function shouldShowOperationBanner(operation: HelmOperation): boolean {
+  return operation.kind === 'upgrade_rolled_back' || operation.kind === 'rollback' || operation.status === 'failed' || operation.status === 'stuck_pending'
+}
+
+function operationTitle(operation: HelmOperation): string {
+  switch (operation.kind) {
+    case 'upgrade_rolled_back':
+      return 'Helm rolled back after failed upgrade'
+    case 'rollback':
+      return 'Helm rollback applied'
+    case 'pending':
+      return 'Helm operation may be stuck'
+    case 'upgrade_failed':
+      return 'Helm upgrade failed'
+    case 'release_failed':
+      return 'Helm release failed'
+    default:
+      return 'Helm operation'
+  }
+}
+
+function OperationRevisionChips({ operation }: { operation: HelmOperation }) {
+  const chips: Array<{ key: string; label: string; className: string }> = []
+  if (operation.failedRevision) {
+    chips.push({ key: 'failed', label: `failed rev ${operation.failedRevision}`, className: SEVERITY_BADGE.error })
+  }
+  if (operation.rollbackRevision) {
+    chips.push({ key: 'rollback', label: `rollback rev ${operation.rollbackRevision}`, className: SEVERITY_BADGE.warning })
+  }
+  if (operation.targetRevision) {
+    chips.push({ key: 'target', label: `target rev ${operation.targetRevision}`, className: SEVERITY_BADGE.info })
+  }
+  if (!operation.failedRevision && !operation.rollbackRevision && operation.revision) {
+    chips.push({ key: 'revision', label: `rev ${operation.revision}`, className: SEVERITY_BADGE.neutral })
+  }
+  if (chips.length === 0) {
+    return null
+  }
+  return (
+    <>
+      {chips.map((chip) => (
+        <span key={chip.key} className={clsx('badge-sm', chip.className)}>{chip.label}</span>
+      ))}
+    </>
+  )
+}
+
 // Overview tab content
 interface OverviewTabProps {
   release: {
@@ -625,12 +1363,15 @@ interface OverviewTabProps {
     notes: string
     readme?: string
     dependencies?: ChartDependency[]
+    lastOperation?: HelmOperation
   }
   onCopy: (text: string, key: string) => void
   copied: string | null
 }
 
 function OverviewTab({ release, onCopy, copied }: OverviewTabProps) {
+  const showDescription = !!release.description && !isDuplicateOperationRawDescription(release.description, release.lastOperation)
+
   return (
     <div className="p-4 space-y-4">
       {/* Chart info */}
@@ -661,7 +1402,7 @@ function OverviewTab({ release, onCopy, copied }: OverviewTabProps) {
       </div>
 
       {/* Description */}
-      {release.description && (
+      {showDescription && (
         <div className="bg-theme-elevated/30 rounded-lg p-4">
           <h3 className="text-sm font-medium text-theme-text-secondary mb-2">Description</h3>
           <p className="text-sm text-theme-text-secondary">{release.description}</p>
@@ -745,12 +1486,23 @@ function OverviewTab({ release, onCopy, copied }: OverviewTabProps) {
   )
 }
 
+function isDuplicateOperationRawDescription(description: string, operation?: HelmOperation): boolean {
+  const desc = normalizeComparableText(description)
+  const raw = normalizeComparableText(operation?.rawMessage || '')
+  return desc !== '' && raw.includes(desc)
+}
+
+function normalizeComparableText(value: string): string {
+  return value.trim().replace(/\s+/g, ' ')
+}
+
 // Hooks tab content
 interface HooksTabProps {
   hooks: HelmHook[]
+  hookDiagnostics: HookDiagnostic[]
 }
 
-function HooksTab({ hooks }: HooksTabProps) {
+function HooksTab({ hooks, hookDiagnostics }: HooksTabProps) {
   if (hooks.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-48 text-theme-text-tertiary">
@@ -782,23 +1534,31 @@ function HooksTab({ hooks }: HooksTabProps) {
     return SEVERITY_BADGE.neutral
   }
 
+  const diagnostics = new Map<string, HookDiagnostic>()
+  for (const diagnostic of hookDiagnostics) {
+    diagnostics.set(hookDiagnosticKey(diagnostic.namespace, diagnostic.kind, diagnostic.name), diagnostic)
+    diagnostics.set(hookDiagnosticKey(undefined, diagnostic.kind, diagnostic.name), diagnostic)
+  }
+
   return (
     <div className="p-4 space-y-3">
-      <p className="text-sm text-theme-text-secondary mb-4">
-        Helm hooks are executed at specific points during the release lifecycle.
-      </p>
-      {hooks.map((hook) => (
-        <div key={hook.name} className="bg-theme-elevated/30 rounded-lg p-4">
-          <div className="flex items-start justify-between mb-2">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-theme-text-primary font-medium">{hook.name}</span>
-                <span className="badge-sm bg-theme-hover/50 text-theme-text-secondary">
+      {hooks.map((hook) => {
+        const diagnostic = diagnostics.get(hookDiagnosticKey(hook.namespace, hook.kind, hook.name))
+          || diagnostics.get(hookDiagnosticKey(undefined, hook.kind, hook.name))
+        return (
+        <div key={`${hook.namespace || '_'}:${hook.kind}:${hook.name}`} className="bg-theme-elevated/30 rounded-lg p-4">
+          <div className="flex items-start justify-between gap-3 mb-2">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="break-all text-theme-text-primary font-medium">{hook.name}</span>
+                <span className="badge-sm shrink-0 bg-theme-hover/50 text-theme-text-secondary">
                   {hook.kind}
                 </span>
               </div>
-              <div className="flex items-center gap-2 mt-1 text-xs text-theme-text-tertiary">
+              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-theme-text-tertiary">
+                {hook.namespace && <span className="break-all">Namespace: {hook.namespace}</span>}
                 <span>Weight: {hook.weight}</span>
+                {hook.path && <span className="break-all">Path: {hook.path}</span>}
               </div>
             </div>
             {hook.status && (
@@ -817,8 +1577,172 @@ function HooksTab({ hooks }: HooksTabProps) {
               </span>
             ))}
           </div>
+          {(hook.startedAt || hook.completedAt || hook.deletePolicies?.length || hook.outputLogPolicies?.length) && (
+            <div className="mt-3 grid grid-cols-1 gap-2 text-xs text-theme-text-tertiary sm:grid-cols-2">
+              {hook.startedAt && (
+                <div>
+                  <span className="text-theme-text-disabled">Started: </span>
+                  <span>{formatDate(hook.startedAt)}</span>
+                </div>
+              )}
+              {hook.completedAt && (
+                <div>
+                  <span className="text-theme-text-disabled">Completed: </span>
+                  <span>{formatDate(hook.completedAt)}</span>
+                </div>
+              )}
+              {hook.deletePolicies && hook.deletePolicies.length > 0 && (
+                <div className="sm:col-span-2">
+                  <span className="text-theme-text-disabled">Delete policies: </span>
+                  <span>{hook.deletePolicies.join(', ')}</span>
+                </div>
+              )}
+              {hook.outputLogPolicies && hook.outputLogPolicies.length > 0 && (
+                <div className="sm:col-span-2">
+                  <span className="text-theme-text-disabled">Output log policies: </span>
+                  <span>{hook.outputLogPolicies.join(', ')}</span>
+                </div>
+              )}
+            </div>
+          )}
+          {diagnostic && <HookDiagnosticEvidence diagnostic={diagnostic} />}
         </div>
-      ))}
+        )
+      })}
+    </div>
+  )
+}
+
+function hookDiagnosticKey(namespace: string | undefined, kind: string | undefined, name: string | undefined): string {
+  return `${namespace || ''}/${(kind || '').toLowerCase()}/${name || ''}`
+}
+
+function formatHookRef(hook: Pick<HookDiagnostic, 'namespace' | 'kind' | 'name'>): string {
+  return `${hook.namespace ? `${hook.namespace}/` : ''}${hook.name} (${hook.kind})`
+}
+
+function HookDiagnosticEvidence({ diagnostic }: { diagnostic: HookDiagnostic }) {
+  const evidence = diagnostic.evidence
+
+  return (
+    <div className="mt-3 border-t border-theme-border/60 pt-3 text-xs">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-medium text-theme-text-secondary">Diagnostic evidence</span>
+        <span className={clsx('badge-sm', diagnostic.phase.toLowerCase() === 'failed' ? SEVERITY_BADGE.error : SEVERITY_BADGE.warning)}>
+          {diagnostic.phase}
+        </span>
+        {evidence?.summary && <span className="text-theme-text-tertiary">{evidence.summary}</span>}
+      </div>
+      <div className="mt-1 text-theme-text-tertiary">{diagnostic.message}</div>
+      {diagnostic.evidenceUnavailableReason && (
+        <div className="mt-1 text-theme-text-tertiary">{diagnostic.evidenceUnavailableReason}</div>
+      )}
+      {evidence && (
+        <div className="mt-3 space-y-3">
+          {evidence.jobs && evidence.jobs.length > 0 && (
+            <div className="space-y-1">
+              {evidence.jobs.map((job) => (
+                <div key={`${job.namespace || ''}/${job.name}`} className="grid grid-cols-[80px_1fr] gap-2 rounded bg-theme-base/40 px-2 py-1">
+                  <span className="text-theme-text-tertiary">Job</span>
+                  <span className="min-w-0 text-theme-text-primary">
+                    <span className="break-all font-medium">{job.namespace ? `${job.namespace}/` : ''}{job.name}</span>
+                    {job.status && <span className="ml-2 text-theme-text-secondary">{job.status}</span>}
+                    <span className="ml-2 text-theme-text-tertiary">
+                      active {job.active || 0} · succeeded {job.succeeded || 0} · failed {job.failed || 0}
+                    </span>
+                  </span>
+                  {job.conditions?.map((condition) => (
+                    <span key={condition} className="col-start-2 text-theme-text-tertiary">{condition}</span>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {evidence.pods && evidence.pods.length > 0 && (
+            <div className="space-y-1">
+              {evidence.pods.map((pod) => (
+                <div key={`${pod.namespace || ''}/${pod.name}`} className="grid grid-cols-[80px_1fr] gap-2 rounded bg-theme-base/40 px-2 py-1">
+                  <span className="text-theme-text-tertiary">Pod</span>
+                  <span className="min-w-0 text-theme-text-primary">
+                    <span className="break-all font-medium">{pod.namespace ? `${pod.namespace}/` : ''}{pod.name}</span>
+                    {pod.phase && <span className="ml-2 text-theme-text-secondary">{pod.phase}</span>}
+                    {pod.ready && <span className="ml-2 text-theme-text-tertiary">{pod.ready} ready</span>}
+                    {Boolean(pod.restartCount) && <span className="ml-2 text-theme-text-tertiary">{pod.restartCount} restarts</span>}
+                  </span>
+                  {(pod.reason || pod.message) && (
+                    <span className="col-start-2 text-theme-text-tertiary">
+                      {pod.reason && <span className="font-medium">{pod.reason}: </span>}
+                      {pod.message}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {evidence.events && evidence.events.length > 0 && (
+            <div className="space-y-1">
+              {evidence.events.map((event, index) => (
+                <div key={`${event.involvedKind}/${event.involvedName}/${event.reason || index}`} className="grid grid-cols-[80px_1fr] gap-2 rounded bg-theme-base/40 px-2 py-1">
+                  <span className="text-theme-text-tertiary">Event</span>
+                  <span className="min-w-0 text-theme-text-primary">
+                    <span className={clsx('badge-sm mr-2', event.type === 'Warning' ? SEVERITY_BADGE.warning : SEVERITY_BADGE.neutral)}>
+                      {event.type || 'Event'}
+                    </span>
+                    <span className="font-medium">{event.reason || 'Unknown'}</span>
+                    <span className="ml-2 break-all text-theme-text-tertiary">{event.involvedKind}/{event.involvedName}</span>
+                  </span>
+                  {event.message && <span className="col-start-2 text-theme-text-tertiary">{event.message}</span>}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {evidence.logs && evidence.logs.length > 0 && (
+            <div className="space-y-2">
+              {evidence.logs.map((log, index) => (
+                <HookLogEvidenceBlock key={`${log.pod}/${log.container}/${log.previous ? 'previous' : 'current'}/${index}`} log={log} />
+              ))}
+            </div>
+          )}
+
+          {evidence.errors && evidence.errors.length > 0 && (
+            <div className="space-y-1 text-theme-text-tertiary">
+              {evidence.errors.map((error) => (
+                <div key={error}>Evidence read error: {error}</div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function HookLogEvidenceBlock({ log }: { log: HookLogEvidence }) {
+  const visibleLines = (log.lines || []).slice(0, 8)
+
+  return (
+    <div className="rounded bg-theme-base/40 px-2 py-2">
+      <div className="mb-1 flex flex-wrap items-center gap-2 text-theme-text-secondary">
+        <span className="font-medium">Logs</span>
+        <span className="break-all">{log.pod}/{log.container}</span>
+        {log.previous && <span className="badge-sm bg-theme-hover/50 text-theme-text-secondary">previous</span>}
+        {log.fallback && <span className="text-theme-text-tertiary">fallback tail</span>}
+      </div>
+      {log.error ? (
+        <div className="text-theme-text-tertiary">{log.error}</div>
+      ) : (
+        <>
+          <pre className="max-h-44 overflow-auto whitespace-pre-wrap rounded bg-theme-base px-2 py-1 font-mono text-[11px] leading-5 text-theme-text-secondary">
+            {visibleLines.join('\n')}
+          </pre>
+          {log.lines && log.lines.length > visibleLines.length && (
+            <div className="mt-1 text-theme-text-tertiary">+{log.lines.length - visibleLines.length} more lines in API response</div>
+          )}
+        </>
+      )}
     </div>
   )
 }

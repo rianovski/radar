@@ -1,0 +1,23 @@
+# Supersession fixture - applied in filename order with a pause between
+# each, so creationTimestamps are distinct. See the script's
+# assert_supersession_ordering: identical timestamps would make the
+# ordering test pass on the name tie-break instead of on time.
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: nightly-20260806010000
+  namespace: velero
+  labels:
+    velero.io/schedule-name: nightly
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  completionTimestamp: "@now-4746m"
+  errors: 12
+  failureReason: nightly run failed - object store unreachable
+  phase: Failed
+  startTimestamp: "@now-4750m"

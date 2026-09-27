@@ -1,12 +1,14 @@
 package insights
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	"github.com/skyhook-io/radar/pkg/gitops/diagnose"
 	gitopstree "github.com/skyhook-io/radar/pkg/gitops/tree"
 )
 
@@ -18,6 +20,7 @@ func argoApp(status map[string]any) *unstructured.Unstructured {
 		"apiVersion": "argoproj.io/v1alpha1",
 		"kind":       "Application",
 		"metadata":   map[string]any{"namespace": "argocd", "name": "billing"},
+		"spec":       map[string]any{"destination": map[string]any{"server": "https://kubernetes.default.svc"}},
 		"status":     status,
 	}}
 }
@@ -42,6 +45,74 @@ func TestBuildIssuesArgoFailedOperationProducesCritical(t *testing.T) {
 	}
 }
 
+func TestBuildArgoCleansControllerMessages(t *testing.T) {
+	rawOperation := "rpc error: code = Unknown desc = app path does not exist"
+	rawResource := "rpc error: code = Unknown desc = resource hook failed"
+	root := argoApp(map[string]any{
+		"operationState": map[string]any{
+			"phase":     "Failed",
+			"message":   rawOperation,
+			"startedAt": "2026-05-03T12:00:00Z",
+		},
+		"resources": []any{
+			map[string]any{
+				"group":     "apps",
+				"kind":      "Deployment",
+				"namespace": "apps",
+				"name":      "api",
+				"status":    "OutOfSync",
+				"syncResult": map[string]any{
+					"status":  "SyncFailed",
+					"message": rawResource,
+				},
+			},
+		},
+	})
+
+	got := Build(root, nil, nil)
+	if got.Summary.OperationMessage != "app path does not exist" {
+		t.Fatalf("summary operation message = %q, want cleaned app path error", got.Summary.OperationMessage)
+	}
+	if got.Summary.RawOperationMessage != rawOperation {
+		t.Fatalf("summary raw operation message = %q, want %q", got.Summary.RawOperationMessage, rawOperation)
+	}
+	var opIssue *Issue
+	for i := range got.Issues {
+		if got.Issues[i].Scope == ScopeOperation {
+			opIssue = &got.Issues[i]
+			break
+		}
+	}
+	if opIssue == nil || opIssue.Message != "app path does not exist" {
+		t.Fatalf("operation issue did not carry cleaned message: %+v", got.Issues)
+	}
+	if opIssue.RawMessage != rawOperation {
+		t.Fatalf("operation issue raw message = %q, want %q", opIssue.RawMessage, rawOperation)
+	}
+	if len(got.History) != 1 || got.History[0].Message != "app path does not exist" {
+		t.Fatalf("history did not carry cleaned message: %+v", got.History)
+	}
+	if got.History[0].RawMessage != rawOperation {
+		t.Fatalf("history raw message = %q, want %q", got.History[0].RawMessage, rawOperation)
+	}
+	if len(got.Changes) != 1 || got.Changes[0].SyncError != "resource hook failed" {
+		t.Fatalf("resource change did not carry cleaned sync error: %+v", got.Changes)
+	}
+	if got.Changes[0].RawSyncError != rawResource {
+		t.Fatalf("resource change raw sync error = %q, want %q", got.Changes[0].RawSyncError, rawResource)
+	}
+	for _, msg := range []string{
+		got.Summary.OperationMessage,
+		opIssue.Message,
+		got.History[0].Message,
+		got.Changes[0].SyncError,
+	} {
+		if strings.Contains(msg, "rpc error") || strings.Contains(msg, "Unknown desc") {
+			t.Fatalf("Argo controller message leaked gRPC envelope: %q", msg)
+		}
+	}
+}
+
 func TestBuildIssuesArgoRunningOperationProducesInfo(t *testing.T) {
 	root := argoApp(map[string]any{
 		"operationState": map[string]any{"phase": "Running"},
@@ -56,17 +127,13 @@ func TestBuildIssuesArgoRunningOperationProducesInfo(t *testing.T) {
 }
 
 func TestBuildIssuesArgoSortsCriticalBeforeWarning(t *testing.T) {
-	// Resource list with a Degraded (critical) and an OutOfSync (warning).
-	// The Degraded resource is listed second to verify sort order, not input order.
+	// A Degraded resource (critical, resource scope) plus an app-level
+	// ManualDrift warning (OutOfSync with auto-sync off). The detector chain
+	// appends the warning first; the severity-stable sort must hoist the
+	// critical resource issue above it.
 	root := argoApp(map[string]any{
+		"sync": map[string]any{"status": "OutOfSync"},
 		"resources": []any{
-			map[string]any{
-				"kind":   "Service",
-				"name":   "auth",
-				"sync":   map[string]any{"status": "OutOfSync"},
-				"health": map[string]any{"status": "Healthy"},
-				"status": "OutOfSync",
-			},
 			map[string]any{
 				"kind":   "Deployment",
 				"name":   "auth",
@@ -77,7 +144,7 @@ func TestBuildIssuesArgoSortsCriticalBeforeWarning(t *testing.T) {
 	})
 	issues := buildIssues(root, nil, "argocd", nil)
 	if len(issues) != 2 {
-		t.Fatalf("expected 2 issues, got %d", len(issues))
+		t.Fatalf("expected 2 issues, got %d (%+v)", len(issues), issues)
 	}
 	if issues[0].Severity != "critical" {
 		t.Fatalf("expected critical first, got %q (%+v)", issues[0].Severity, issues[0])
@@ -171,6 +238,49 @@ func TestDescribeArgoAutoSync(t *testing.T) {
 	}
 }
 
+// An ApplicationSet's spec.syncPolicy controls how generated Applications are
+// created and deleted; it never carries `automated`. Read as an Application's
+// policy it yields "Manual" for every ApplicationSet, which the detail header
+// and the rollback gating both consume as a real sync mode.
+func TestDescribeArgoAutoSyncApplicationSet(t *testing.T) {
+	cases := []struct {
+		name string
+		spec map[string]any
+	}{
+		{name: "no syncPolicy", spec: map[string]any{}},
+		{name: "applicationsSync policy is not a sync mode", spec: map[string]any{
+			"syncPolicy": map[string]any{"applicationsSync": "create-update"},
+		}},
+		{name: "template automated belongs to generated apps, not the set", spec: map[string]any{
+			"template": map[string]any{"spec": map[string]any{
+				"syncPolicy": map[string]any{"automated": map[string]any{"prune": true}},
+			}},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := &unstructured.Unstructured{Object: map[string]any{
+				"kind": "ApplicationSet",
+				"spec": tc.spec,
+			}}
+			if got := describeArgoAutoSync(root); got != "" {
+				t.Fatalf("describeArgoAutoSync = %q, want empty for an ApplicationSet", got)
+			}
+		})
+	}
+}
+
+// An Application with the same shape must keep reporting its real mode.
+func TestDescribeArgoAutoSyncApplicationUnaffected(t *testing.T) {
+	root := &unstructured.Unstructured{Object: map[string]any{
+		"kind": "Application",
+		"spec": map[string]any{"syncPolicy": map[string]any{"automated": map[string]any{"prune": true}}},
+	}}
+	if got := describeArgoAutoSync(root); got != "Auto · prune" {
+		t.Fatalf("describeArgoAutoSync = %q, want %q", got, "Auto · prune")
+	}
+}
+
 // argoResourceChanges' syncResult-status gating decides whether a per-resource
 // failure message surfaces in the UI as a red SyncError. Pin the contract so
 // a future refactor that simplifies the status check (e.g. `if status != ""`)
@@ -198,7 +308,7 @@ func TestArgoResourceChangesSyncResultGating(t *testing.T) {
 					"syncResult": tc.syncResult,
 				}},
 			})
-			out := argoResourceChanges(root, nil)
+			out := argoResourceChanges(root, nil, nil)
 			if len(out) != 1 {
 				t.Fatalf("expected 1 change, got %d", len(out))
 			}
@@ -212,158 +322,35 @@ func TestArgoResourceChangesSyncResultGating(t *testing.T) {
 	}
 }
 
-func TestParseArgoOperationError(t *testing.T) {
-	cases := []struct {
-		name      string
-		msg       string
-		wantCause string // substring match — full text is brittle to copy edits
-		wantKind  string
-		wantName  string
-		wantRetry int
-		wantStuck bool
-	}{
-		{
-			name:      "annotation too long with affected CRD and retry suffix",
-			msg:       `one or more objects failed to apply, reason: error when patching "/dev/shm/foo": CustomResourceDefinition.apiextensions.k8s.io "scaledjobs.keda.sh" is invalid: metadata.annotations: Too long: may not be more than 262144 bytes (retried 5 times)`,
-			wantCause: "256 KB metadata limit",
-			wantKind:  "CustomResourceDefinition",
-			wantName:  "scaledjobs.keda.sh",
-			wantRetry: 5,
-			wantStuck: true,
-		},
-		{
-			name:      "admission webhook rejection",
-			msg:       `admission webhook "validation.gatekeeper.sh" denied the request: missing required label "owner"`,
-			wantCause: "admission webhook rejected",
-			wantRetry: 0,
-			wantStuck: false,
-		},
-		{
-			name:      "rbac forbidden with resource extracted",
-			msg:       `Deployment.apps "billing" is forbidden: User "system:serviceaccount:argocd:argocd-controller" cannot patch resource`,
-			wantCause: "RBAC denied",
-			wantKind:  "Deployment",
-			wantName:  "billing",
-		},
-		{
-			name:      "unrecognized message → no cause but raw still preserved by caller",
-			msg:       "something completely novel went wrong",
-			wantCause: "",
-		},
-		{
-			name:      "single retry → not stuck",
-			msg:       `whatever (retried 1 times)`,
-			wantRetry: 1,
-			wantStuck: false,
-		},
-		{
-			name: "empty input → all zero values",
-			msg:  "",
-		},
-		// Patterns below extend coverage to the rest of argoErrorPatterns —
-		// each table row pins a regex that was previously untested. A
-		// reorder of argoErrorPatterns or a regex regression would surface
-		// here as a substring miss.
-		{
-			name:      "namespace not found populates Remediation",
-			msg:       `failed to apply: namespaces "demo-broken-sync" not found`,
-			wantCause: "destination namespace does not exist",
-		},
-		{
-			name:      "labels too long",
-			msg:       `Service "foo" is invalid: metadata.labels: Too long: must have at most 63 chars per key`,
-			wantCause: "64-character-per-key limit",
-			// argoAffectedRefRE happens to also capture from this fixture —
-			// pin the values so a regex change is visible. Functionally these
-			// flow into Issue.Refs and add a same-row ref to the failure card.
-			wantKind: "Service",
-			wantName: "foo",
-		},
-		{
-			name:      "resource already exists outside GitOps",
-			msg:       `Job.batch "migrate" already exists`,
-			wantCause: "already exists",
-			wantKind:  "Job",
-			wantName:  "migrate",
-		},
-		{
-			name:      "CRD not registered",
-			msg:       `no matches for kind "Tenant" in version "capsule.clastix.io/v1beta1"`,
-			wantCause: "CustomResourceDefinition for this kind isn't registered",
-		},
-		{
-			name:      "cluster unreachable (i/o timeout)",
-			msg:       `dial tcp 10.0.0.1:443: i/o timeout`,
-			wantCause: "Cluster unreachable",
-		},
-		{
-			name:      "cluster unreachable (connection refused)",
-			msg:       `dial tcp 10.0.0.1:443: connect: connection refused`,
-			wantCause: "Cluster unreachable",
-		},
-		{
-			name:      "immutable field changed",
-			msg:       `Service.spec.clusterIP: field is immutable`,
-			wantCause: "Kubernetes treats as immutable",
-		},
-		{
-			name: "unknown apiVersion (no 'no matches' clause)",
-			// argoErrorPatterns intentionally matches 'no matches for kind'
-			// first because it's the more actionable diagnosis; pin a fixture
-			// that only triggers 'unable to recognize' so the more-generic
-			// pattern is exercised on its own.
-			msg:       `unable to recognize the resource: invalid manifest "foo.yaml"`,
-			wantCause: "API version the cluster doesn't recognize",
-		},
-		{
-			name:      "concurrent modification",
-			msg:       `Operation cannot be fulfilled on deployments.apps "x": the object has been modified; please apply your changes to the latest version`,
-			wantCause: "modified concurrently",
-		},
+// TestRemediationFromParsed_CreateNamespace pins the adapter that maps the
+// vocabulary-neutral remediation primitives from pkg/gitops/diagnose onto the
+// insights Remediation wire type. The pure parse-table coverage lives in
+// pkg/gitops/diagnose; this asserts the one-click fix still reaches the
+// failure card after the boundary crossing.
+func TestRemediationFromParsed_CreateNamespace(t *testing.T) {
+	parsed := diagnose.ParseArgoOperationError(`failed to create resource: namespaces "demo-broken-sync" not found`)
+	got := remediationFromParsed(parsed)
+	if got == nil {
+		t.Fatalf("expected Remediation, got nil")
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := parseArgoOperationError(tc.msg)
-			if tc.wantCause != "" && !strings.Contains(got.Cause, tc.wantCause) {
-				t.Errorf("Cause = %q, want substring %q", got.Cause, tc.wantCause)
-			}
-			if tc.wantCause == "" && got.Cause != "" {
-				t.Errorf("Cause = %q, want empty (unrecognized pattern)", got.Cause)
-			}
-			if got.AffectedKind != tc.wantKind {
-				t.Errorf("AffectedKind = %q, want %q", got.AffectedKind, tc.wantKind)
-			}
-			if got.AffectedName != tc.wantName {
-				t.Errorf("AffectedName = %q, want %q", got.AffectedName, tc.wantName)
-			}
-			if got.RetryCount != tc.wantRetry {
-				t.Errorf("RetryCount = %d, want %d", got.RetryCount, tc.wantRetry)
-			}
-			if got.Stuck != tc.wantStuck {
-				t.Errorf("Stuck = %v, want %v", got.Stuck, tc.wantStuck)
-			}
-		})
+	if got.Kind != RemediationCreateNamespace {
+		t.Errorf("Kind = %q, want %q", got.Kind, RemediationCreateNamespace)
+	}
+	if got.Target != "demo-broken-sync" {
+		t.Errorf("Target = %q, want %q", got.Target, "demo-broken-sync")
+	}
+	if err := got.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil", err)
 	}
 }
 
-// TestParseArgoOperationError_PopulatesNamespaceRemediation pins the
-// structured-Remediation path. The missing-namespace pattern is the only
-// pattern that drives a one-click fix; a regex regression that loses the
-// capture group would silently downgrade the failure-card UX to
-// diagnosis-only.
-func TestParseArgoOperationError_PopulatesNamespaceRemediation(t *testing.T) {
-	got := parseArgoOperationError(`failed to create resource: namespaces "demo-broken-sync" not found`)
-	if got.Remediation == nil {
-		t.Fatalf("expected Remediation, got nil")
-	}
-	if got.Remediation.Kind != RemediationCreateNamespace {
-		t.Errorf("Kind = %q, want %q", got.Remediation.Kind, RemediationCreateNamespace)
-	}
-	if got.Remediation.Target != "demo-broken-sync" {
-		t.Errorf("Target = %q, want %q", got.Remediation.Target, "demo-broken-sync")
-	}
-	if err := got.Remediation.Validate(); err != nil {
-		t.Errorf("Validate() = %v, want nil", err)
+// TestRemediationFromParsed_NoRemediation confirms a parsed failure without a
+// structured fix yields a nil Remediation (the common case) rather than a
+// broken button.
+func TestRemediationFromParsed_NoRemediation(t *testing.T) {
+	parsed := diagnose.ParseArgoOperationError(`Deployment.apps "billing" is forbidden: User "x" cannot patch resource`)
+	if got := remediationFromParsed(parsed); got != nil {
+		t.Errorf("remediationFromParsed = %+v, want nil for non-remediable failure", got)
 	}
 }
 
@@ -386,8 +373,8 @@ func TestFluxPhaseLabel(t *testing.T) {
 		{"True", "Reconciling", "Reconciling"},
 		{"True", "Suspended", "Suspended"},
 		{"True", "WeirdNovelReason", "WeirdNovelReason"}, // unknown → raw reason
-		{"True", "", "True"},                              // empty reason → status
-		{"", "", ""},                                      // both empty → empty
+		{"True", "", "True"},                             // empty reason → status
+		{"", "", ""},                                     // both empty → empty
 	}
 	for _, tc := range cases {
 		if got := fluxPhaseLabel(tc.status, tc.reason); got != tc.want {
@@ -403,6 +390,18 @@ func TestRemediationValidate_RejectsEmptyTarget(t *testing.T) {
 	}
 }
 
+// TestRemediationConstantMatchesDiagnose pins the cross-package contract: the
+// issues-engine path ships diagnose.RemediationCreateNamespace while the
+// insights path ships insights.RemediationCreateNamespace, and both must equal
+// the literal the frontend dispatches on. This is the only package that can
+// import both, so the equality assertion lives here.
+func TestRemediationConstantMatchesDiagnose(t *testing.T) {
+	if diagnose.RemediationCreateNamespace != string(RemediationCreateNamespace) {
+		t.Errorf("diagnose.RemediationCreateNamespace=%q != insights.RemediationCreateNamespace=%q — one-click fix wiring would silently break",
+			diagnose.RemediationCreateNamespace, string(RemediationCreateNamespace))
+	}
+}
+
 func TestNewCreateNamespaceRemediation_NilOnEmpty(t *testing.T) {
 	if r := NewCreateNamespaceRemediation("", "hint"); r != nil {
 		t.Errorf("NewCreateNamespaceRemediation(\"\", …) = %v, want nil", r)
@@ -414,7 +413,7 @@ func TestNewCreateNamespaceRemediation_NilOnEmpty(t *testing.T) {
 
 func TestBuildIssuesSuppressesResourceIssueDuplicatedByOperationFailure(t *testing.T) {
 	// When the operation message names CRD scaledjobs.keda.sh AND the
-	// resources[] list also flags the same CRD as OutOfSync, we want only
+	// resources[] list also flags the same CRD as Missing, we want only
 	// the operation issue. The resource issue is the same root cause from
 	// a different angle and adds noise.
 	root := argoApp(map[string]any{
@@ -426,14 +425,15 @@ func TestBuildIssuesSuppressesResourceIssueDuplicatedByOperationFailure(t *testi
 			"kind":   "CustomResourceDefinition",
 			"name":   "scaledjobs.keda.sh",
 			"status": "OutOfSync",
+			"health": map[string]any{"status": "Missing"},
 		}},
 	})
 	issues := buildIssues(root, nil, "argocd", nil)
 	for _, iss := range issues {
-		if iss.Scope == "resource" && iss.Reason == "OutOfSync" {
+		if iss.Scope == ScopeResource {
 			for _, ref := range iss.Refs {
 				if ref.Kind == "CustomResourceDefinition" && ref.Name == "scaledjobs.keda.sh" {
-					t.Fatalf("expected the resource OutOfSync issue for the same CRD to be suppressed when the operation failure already names it; issues=%v", issues)
+					t.Fatalf("expected the resource issue for the same CRD to be suppressed when the operation failure already names it; issues=%v", issues)
 				}
 			}
 		}
@@ -457,14 +457,15 @@ func TestBuildIssuesSuppressesResourceIssueForNamespacedKind(t *testing.T) {
 			"name":      "guestbook-ui",
 			"namespace": "demo-healthy",
 			"status":    "OutOfSync",
+			"health":    map[string]any{"status": "Missing"},
 		}},
 	})
 	issues := buildIssues(root, nil, "argocd", nil)
 	for _, iss := range issues {
-		if iss.Scope == ScopeResource && iss.Reason == "OutOfSync" {
+		if iss.Scope == ScopeResource {
 			for _, ref := range iss.Refs {
 				if ref.Kind == "Deployment" && ref.Name == "guestbook-ui" && ref.Namespace == "demo-healthy" {
-					t.Fatalf("expected namespaced Deployment OutOfSync issue to be suppressed by the operation failure that already names it; issues=%v", issues)
+					t.Fatalf("expected namespaced Deployment issue to be suppressed by the operation failure that already names it; issues=%v", issues)
 				}
 			}
 		}
@@ -599,6 +600,15 @@ func TestDetectStuckDriftLoop_DoesNotFireForVariousReasons(t *testing.T) {
 				unstructured.RemoveNestedField(u.Object, "status", "reconciledAt")
 			},
 		},
+		{
+			// Auto-sync configured but self-heal off: persistent post-sync drift
+			// is expected (Argo won't re-correct it), so this is not a loop —
+			// detectAutoDriftSelfHealOff owns it.
+			name: "auto-sync on but self-heal off",
+			mut: func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, false, "spec", "syncPolicy", "automated", "selfHeal")
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -607,6 +617,76 @@ func TestDetectStuckDriftLoop_DoesNotFireForVariousReasons(t *testing.T) {
 				t.Errorf("expected no issue, got %+v", got)
 			}
 		})
+	}
+}
+
+func TestDetectAutoDriftSelfHealOff(t *testing.T) {
+	cases := []struct {
+		name     string
+		mut      func(*unstructured.Unstructured)
+		wantFire bool
+	}{
+		{
+			name: "OutOfSync + auto-sync + self-heal off → fires",
+			mut: func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, false, "spec", "syncPolicy", "automated", "selfHeal")
+			},
+			wantFire: true,
+		},
+		{
+			// stuckLoopApp defaults to selfHeal: true.
+			name:     "OutOfSync + auto-sync + self-heal on → no fire (StuckDriftLoop owns it)",
+			mut:      func(u *unstructured.Unstructured) {},
+			wantFire: false,
+		},
+		{
+			name: "OutOfSync + manual → no fire (ManualDrift owns it)",
+			mut: func(u *unstructured.Unstructured) {
+				unstructured.RemoveNestedField(u.Object, "spec", "syncPolicy", "automated")
+			},
+			wantFire: false,
+		},
+		{
+			name: "Synced + auto-sync + self-heal off → no fire",
+			mut: func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, false, "spec", "syncPolicy", "automated", "selfHeal")
+				_ = unstructured.SetNestedField(u.Object, "Synced", "status", "sync", "status")
+			},
+			wantFire: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := detectAutoDriftSelfHealOff(stuckLoopApp(t, tc.mut))
+			if (got != nil) != tc.wantFire {
+				t.Errorf("fire = %v, want %v; issue=%+v", got != nil, tc.wantFire, got)
+			}
+			if got != nil && got.Reason != "SelfHealDisabled" {
+				t.Errorf("Reason = %q, want SelfHealDisabled", got.Reason)
+			}
+		})
+	}
+}
+
+// The gap that dropping per-resource OutOfSync issues could otherwise open:
+// auto-sync configured but self-heal off + an OutOfSync app. No per-resource
+// issue is emitted for plain drift, so the app-level SelfHealDisabled warning
+// must be the band signal that nothing will reconcile this.
+func TestBuildIssuesArgoAutoSyncSelfHealOffSurfacesDrift(t *testing.T) {
+	root := argoApp(map[string]any{
+		"sync":           map[string]any{"status": "OutOfSync"},
+		"operationState": map[string]any{"phase": "Succeeded"},
+	})
+	_ = unstructured.SetNestedMap(root.Object, map[string]any{"prune": true}, "spec", "syncPolicy", "automated")
+	issues := buildIssues(root, nil, "argocd", nil)
+	var found bool
+	for _, iss := range issues {
+		if iss.Reason == "SelfHealDisabled" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a SelfHealDisabled issue for auto-sync-without-self-heal drift; got %+v", issues)
 	}
 }
 
@@ -650,37 +730,10 @@ func TestDetectManualDriftWithoutAutoSync(t *testing.T) {
 	}
 }
 
-func TestParseArgoOperationError_HookFailures(t *testing.T) {
-	cases := []struct {
-		name      string
-		msg       string
-		wantCause string
-	}{
-		{
-			name:      "PreSync hook failed",
-			msg:       `PreSync phase failed: hook "db-migration" exited with status 1`,
-			wantCause: "sync hook failed",
-		},
-		{
-			name:      "generic hook failed wording",
-			msg:       `hook "drain-cache" failed: timed out after 5m`,
-			wantCause: "sync hook failed",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := parseArgoOperationError(tc.msg)
-			if !strings.Contains(strings.ToLower(got.Cause), tc.wantCause) {
-				t.Errorf("Cause = %q, want substring %q", got.Cause, tc.wantCause)
-			}
-		})
-	}
-}
-
 func TestArgoApplicationConditions_MapsTypesToSeverity(t *testing.T) {
 	root := argoApp(map[string]any{
 		"conditions": []any{
-			map[string]any{"type": "ComparisonError", "message": "rpc error: revision not found"},
+			map[string]any{"type": "ComparisonError", "message": "rpc error: code = Unknown desc = revision not found"},
 			map[string]any{"type": "OrphanedResourceWarning", "message": "ConfigMap foo has no owner"},
 			map[string]any{"type": "SomeUnrelatedInfo", "message": "noise"},
 			map[string]any{"type": "", "message": ""}, // skipped
@@ -694,8 +747,18 @@ func TestArgoApplicationConditions_MapsTypesToSeverity(t *testing.T) {
 	for _, iss := range got {
 		bySev[iss.Reason] = iss.Severity
 	}
+	byMessage := map[string]string{}
+	for _, iss := range got {
+		byMessage[iss.Reason] = iss.Message
+	}
 	if bySev["ComparisonError"] != SeverityCritical {
 		t.Errorf("ComparisonError severity = %q, want critical", bySev["ComparisonError"])
+	}
+	if byMessage["ComparisonError"] != "revision not found" {
+		t.Errorf("ComparisonError message = %q, want cleaned revision error", byMessage["ComparisonError"])
+	}
+	if strings.Contains(byMessage["ComparisonError"], "rpc error") || strings.Contains(byMessage["ComparisonError"], "Unknown desc") {
+		t.Errorf("ComparisonError message leaked gRPC envelope: %q", byMessage["ComparisonError"])
 	}
 	if bySev["OrphanedResourceWarning"] != SeverityWarning {
 		t.Errorf("OrphanedResourceWarning severity = %q, want warning", bySev["OrphanedResourceWarning"])
@@ -723,7 +786,7 @@ func TestBuildHistoryArgo_AutomatedBoolBecomesInitiator(t *testing.T) {
 			},
 		},
 	})
-	hist := buildHistory(root, "argocd")
+	hist := BuildHistory(root)
 	// First entry should be the only history row (no operationState set).
 	if len(hist) != 1 {
 		t.Fatalf("expected 1 history entry, got %d", len(hist))
@@ -757,7 +820,7 @@ func TestBuildHistoryArgo_RunningOpStaysOnTop(t *testing.T) {
 			},
 		},
 	})
-	hist := buildHistory(root, "argocd")
+	hist := BuildHistory(root)
 	if len(hist) < 1 || hist[0].Phase != "Running" {
 		t.Fatalf("expected the running operation to sort to the top; got hist=%+v", hist)
 	}
@@ -864,19 +927,248 @@ func TestBuildIssues_TerminatingFiresFirst(t *testing.T) {
 // through to FinalizerOwnerStatus and surfaces the returned text in
 // Issue.Cause.
 type fakeResolver struct {
-	statuses map[string]string // finalizer → status string
-	calls    []string          // finalizers passed (in order)
+	statuses map[string]string            // finalizer → status string
+	calls    []string                     // finalizers passed (in order)
+	problems map[string][]ResourceProblem // resource name → workload problems
+	events   map[string][]EventSummary    // resource name → recent events
 }
 
 func (f *fakeResolver) GetLive(string, string, string, string) *unstructured.Unstructured {
 	return nil
 }
-func (f *fakeResolver) RecentEvents(string, string, string, string) []EventSummary {
-	return nil
+func (f *fakeResolver) RecentEvents(_, _, _, name string) []EventSummary {
+	return f.events[name]
+}
+func (f *fakeResolver) ResourceProblems(_, _, _, name string) []ResourceProblem {
+	return f.problems[name]
 }
 func (f *fakeResolver) FinalizerOwnerStatus(finalizer string, _ *unstructured.Unstructured) string {
 	f.calls = append(f.calls, finalizer)
 	return f.statuses[finalizer]
+}
+
+// TestBuildIssues_EnrichesDegradedResourceWithWorkloadCause pins the L4 bridge:
+// a managed resource Argo reports as Degraded gets the concrete workload "why"
+// (from the issues engine, via the resolver) attached as Issue.Cause — instead
+// of only "open the resource drawer". A nil resolver keeps the generic guidance.
+func TestBuildIssues_EnrichesDegradedResourceWithWorkloadCause(t *testing.T) {
+	root := argoApp(map[string]any{
+		"resources": []any{
+			map[string]any{
+				"group": "apps", "kind": "Deployment", "namespace": "argocd", "name": "billing",
+				"health": map[string]any{"status": "Degraded"},
+				"status": "Synced",
+			},
+		},
+	})
+	resourceIssue := func(out []Issue) *Issue {
+		for i := range out {
+			if out[i].Scope == ScopeResource {
+				return &out[i]
+			}
+		}
+		return nil
+	}
+
+	// With a resolver that classifies the Deployment, the cause is attached.
+	r := &fakeResolver{problems: map[string][]ResourceProblem{
+		"billing": {{Reason: "CrashLoopBackOff", Message: "1/1 pods crashlooping (last exit OOMKilled)", Category: "crashloop", Severity: "critical"}},
+	}}
+	got := resourceIssue(buildIssues(root, nil, "argocd", r))
+	if got == nil {
+		t.Fatalf("expected a resource-scope issue for the Degraded Deployment")
+	}
+	if got.Cause != "1/1 pods crashlooping (last exit OOMKilled)" {
+		t.Errorf("Cause = %q, want the workload reason from the issues engine", got.Cause)
+	}
+
+	// With a nil resolver, the issue still emits but carries no fabricated cause.
+	plain := resourceIssue(buildIssues(root, nil, "argocd", nil))
+	if plain == nil || plain.Cause != "" {
+		t.Errorf("nil resolver should yield a resource issue with empty Cause, got %+v", plain)
+	}
+}
+
+// TestBuildIssues_DegradedAppFallsBackToLoudestResourceEvent pins the
+// weakest attribution tier: an Application whose aggregate health is
+// Degraded with no per-resource health.status in status.resources[] (the
+// Argo CD 3.x default — resource health is no longer persisted in the CR),
+// and nothing classified by the issues engine for any managed resource. The
+// fallback attributes the app-level Degraded badge to the managed resource
+// with the loudest Warning event instead of leaving it unexplained.
+func TestBuildIssues_DegradedAppFallsBackToLoudestResourceEvent(t *testing.T) {
+	root := argoApp(map[string]any{
+		"health": map[string]any{"status": "Degraded"},
+		"resources": []any{
+			map[string]any{
+				"group": "external-secrets.io", "kind": "ClusterSecretStore", "name": "platform-secret-store",
+				"status": "Synced",
+			},
+			map[string]any{
+				"kind": "Namespace", "name": "platform-secrets",
+				"status": "Synced",
+			},
+		},
+	})
+	r := &fakeResolver{events: map[string][]EventSummary{
+		"platform-secret-store": {
+			{Type: "Warning", Reason: "InvalidProviderConfig", Message: "no route to host", Count: 17},
+			{Type: "Normal", Reason: "Synced", Message: "resource synced", Count: 40},
+		},
+	}}
+	issues := buildIssues(root, nil, "argocd", r)
+	if len(issues) != 1 {
+		t.Fatalf("expected exactly 1 fallback issue, got %d: %+v", len(issues), issues)
+	}
+	got := issues[0]
+	if got.Scope != ScopeResource {
+		t.Errorf("Scope = %q, want %q", got.Scope, ScopeResource)
+	}
+	if len(got.Refs) != 1 || got.Refs[0].Name != "platform-secret-store" {
+		t.Errorf("Refs = %+v, want a single ref to platform-secret-store", got.Refs)
+	}
+	if got.Reason != "PossibleCause" || got.Severity != SeverityWarning || got.Cause != "no route to host" {
+		t.Errorf("issue = %+v, want a warning-tier PossibleCause lead carrying the winning event's message as Cause", got)
+	}
+
+	empty := buildIssues(root, nil, "argocd", &fakeResolver{})
+	if len(empty) != 0 {
+		t.Errorf("expected no issues when no resource has a Warning event, got %+v", empty)
+	}
+
+	// A nil resolver can't look up events → no fabricated issue either.
+	plain := buildIssues(root, nil, "argocd", nil)
+	if len(plain) != 0 {
+		t.Errorf("expected no issues with a nil resolver, got %+v", plain)
+	}
+}
+
+// TestBuildIssues_DegradedAppLeadIsGatedAndDoesNotExplain: the live-state
+// tier only runs for an app deploying to this cluster (Radar's engine and
+// events describe local objects), still runs alongside an informational
+// Running row, and an events lead leaves the degraded-resources summary
+// visible because it is a pointer, not an explanation.
+func TestBuildIssues_DegradedAppLeadIsGatedAndDoesNotExplain(t *testing.T) {
+	status := func() map[string]any {
+		return map[string]any{
+			"health":         map[string]any{"status": "Degraded"},
+			"operationState": map[string]any{"phase": "Running"},
+			"resources": []any{
+				map[string]any{"group": "apps", "kind": "Deployment", "namespace": "prod", "name": "web", "status": "Synced"},
+			},
+		}
+	}
+	r := &fakeResolver{events: map[string][]EventSummary{"web": {{Type: "Warning", Reason: "BackOff", Message: "restarting", Count: 3}}}}
+	tree := &gitopstree.ResourceTree{Summary: gitopstree.Summary{Degraded: 2}}
+
+	local := buildIssues(argoApp(status()), tree, "argocd", r)
+	var lead, running, summary bool
+	for _, iss := range local {
+		switch iss.Reason {
+		case "PossibleCause":
+			lead = true
+		case "Running":
+			running = true
+		case "DegradedResources":
+			summary = true
+		}
+	}
+	if !lead || !running || !summary {
+		t.Errorf("want the events lead, the Running info row AND the degraded summary together, got %+v", local)
+	}
+
+	remoteApp := argoApp(status())
+	remoteApp.Object["spec"] = map[string]any{"destination": map[string]any{"server": "https://spoke-1.example.com:6443"}}
+	for _, iss := range buildIssues(remoteApp, tree, "argocd", r) {
+		if iss.Reason == "PossibleCause" {
+			t.Errorf("remote-destination app must not get a locally derived lead, got %+v", iss)
+		}
+	}
+}
+
+// TestBuildIssues_DriftLoopDoesNotHideDegradedFallback: StuckDriftLoop is a
+// sync signal, not a health explanation; a Degraded app in a drift loop
+// still gets the live-state attribution and the tree summary.
+func TestBuildIssues_DriftLoopDoesNotHideDegradedFallback(t *testing.T) {
+	root := argoApp(map[string]any{
+		"health":         map[string]any{"status": "Degraded"},
+		"sync":           map[string]any{"status": "OutOfSync"},
+		"reconciledAt":   time.Now().UTC().Format(time.RFC3339),
+		"operationState": map[string]any{"phase": "Succeeded", "finishedAt": time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)},
+		"resources": []any{
+			map[string]any{"group": "apps", "kind": "Deployment", "namespace": "prod", "name": "web", "status": "OutOfSync"},
+		},
+	})
+	root.Object["spec"] = map[string]any{
+		"destination": map[string]any{"server": "https://kubernetes.default.svc"},
+		"syncPolicy":  map[string]any{"automated": map[string]any{"selfHeal": true}},
+	}
+	r := &fakeResolver{events: map[string][]EventSummary{"web": {{Type: "Warning", Reason: "BackOff", Message: "restarting", Count: 3}}}}
+	issues := buildIssues(root, &gitopstree.ResourceTree{Summary: gitopstree.Summary{Degraded: 1}}, "argocd", r)
+	var drift, lead, summary bool
+	for _, iss := range issues {
+		switch iss.Reason {
+		case "StuckDriftLoop":
+			drift = true
+		case "PossibleCause":
+			lead = true
+		case "DegradedResources":
+			summary = true
+		}
+	}
+	if !drift {
+		t.Fatalf("fixture did not trigger the StuckDriftLoop detector, got %+v", issues)
+	}
+	if !lead || !summary {
+		t.Errorf("drift loop must suppress neither the events lead nor the degraded summary, got %+v", issues)
+	}
+}
+
+// TestBuildIssues_DegradedAppFallsBackEvenWhenEventCountIsZero pins that a
+// genuine single-occurrence Warning event isn't treated as "no signal" just
+// because it has no explicit Count — the events.k8s.io/v1 API only sets a
+// count once an event has repeated into a series, so a real, first-time
+// Warning commonly reports Count == 0 on modern clusters.
+func TestBuildIssues_DegradedAppFallsBackEvenWhenEventCountIsZero(t *testing.T) {
+	root := argoApp(map[string]any{
+		"health": map[string]any{"status": "Degraded"},
+		"resources": []any{
+			map[string]any{
+				"group": "external-secrets.io", "kind": "ClusterSecretStore", "name": "platform-secret-store",
+				"status": "Synced",
+			},
+		},
+	})
+	r := &fakeResolver{events: map[string][]EventSummary{
+		"platform-secret-store": {
+			{Type: "Warning", Reason: "InvalidProviderConfig", Message: "no route to host", Count: 0},
+		},
+	}}
+	issues := buildIssues(root, nil, "argocd", r)
+	if len(issues) != 1 {
+		t.Fatalf("expected exactly 1 fallback issue for a zero-count Warning, got %d: %+v", len(issues), issues)
+	}
+	if issues[0].Cause != "no route to host" {
+		t.Errorf("Cause = %q, want the zero-count event's message", issues[0].Cause)
+	}
+}
+
+func TestResourceProblemCause(t *testing.T) {
+	if got := resourceProblemCause(nil); got != "" {
+		t.Errorf("no problems → %q, want empty", got)
+	}
+	// Critical wins over a warning regardless of order.
+	got := resourceProblemCause([]ResourceProblem{
+		{Reason: "OutOfSync", Message: "drifted", Severity: "warning"},
+		{Reason: "OOMKilled", Message: "out of memory", Severity: "critical"},
+	})
+	if got != "out of memory" {
+		t.Errorf("critical should win, got %q", got)
+	}
+	// Falls back to Reason when Message is empty.
+	if got := resourceProblemCause([]ResourceProblem{{Reason: "ImagePullBackOff", Severity: "critical"}}); got != "ImagePullBackOff" {
+		t.Errorf("empty message → reason, got %q", got)
+	}
 }
 
 // TestDetectPendingDeletion_EnrichesWithControllerHealth pins the contract
@@ -1133,6 +1425,89 @@ func TestBuildSummary_TerminatingFields(t *testing.T) {
 	}
 }
 
+// TestBuildSummary_IgnoredDifferences pins the Argo comparison-coverage
+// disclosure: RuleCount counts every spec.ignoreDifferences entry,
+// UnsupportedRuleCount counts those using jqPathExpressions OR
+// managedFieldsManagers (Radar's drift filter applies neither — the drift
+// panel may surface fields Argo's UI suppresses), and Kinds is the sorted
+// unique Group/Kind targets with a group-wildcard rule (kind omitted)
+// rendered as "group/*".
+func TestBuildSummary_IgnoredDifferences(t *testing.T) {
+	root := argoApp(map[string]any{})
+	root.Object["spec"] = map[string]any{
+		"ignoreDifferences": []any{
+			// jsonPointers rule, namespaced group + kind → "apps/Deployment".
+			map[string]any{
+				"group":        "apps",
+				"kind":         "Deployment",
+				"jsonPointers": []any{"/spec/replicas"},
+			},
+			// jqPathExpressions rule, core resource (empty group) → "ConfigMap".
+			map[string]any{
+				"kind":              "ConfigMap",
+				"jqPathExpressions": []any{".data.checksum"},
+			},
+			// managedFieldsManagers rule — the other exclusion shape Radar's
+			// drift filter doesn't apply.
+			map[string]any{
+				"group":                 "apps",
+				"kind":                  "Deployment",
+				"managedFieldsManagers": []any{"kube-controller-manager"},
+			},
+			// Group-wildcard rule: group set, kind omitted → "networking.k8s.io/*".
+			map[string]any{
+				"group":        "networking.k8s.io",
+				"jsonPointers": []any{"/spec/rules"},
+			},
+		},
+	}
+
+	s := buildSummary(root, "argocd")
+	if s.IgnoredDifferences == nil {
+		t.Fatal("expected IgnoredDifferences to be populated")
+	}
+	if s.IgnoredDifferences.RuleCount != 4 {
+		t.Errorf("RuleCount = %d, want 4", s.IgnoredDifferences.RuleCount)
+	}
+	if s.IgnoredDifferences.UnsupportedRuleCount != 2 {
+		t.Errorf("UnsupportedRuleCount = %d, want 2", s.IgnoredDifferences.UnsupportedRuleCount)
+	}
+	want := []string{"ConfigMap", "apps/Deployment", "networking.k8s.io/*"}
+	if !reflect.DeepEqual(s.IgnoredDifferences.Kinds, want) {
+		t.Errorf("Kinds = %v, want %v", s.IgnoredDifferences.Kinds, want)
+	}
+}
+
+// TestBuildSummary_IgnoredDifferences_NilWhenAbsent confirms the field stays
+// nil (and json-omitted) when the Application declares no exclusions.
+func TestBuildSummary_IgnoredDifferences_NilWhenAbsent(t *testing.T) {
+	s := buildSummary(argoApp(map[string]any{}), "argocd")
+	if s.IgnoredDifferences != nil {
+		t.Errorf("expected nil IgnoredDifferences when spec.ignoreDifferences absent, got %+v", s.IgnoredDifferences)
+	}
+}
+
+// TestBuildSummary_IgnoredDifferences_NilForFlux pins that the disclosure is
+// Argo-only: it describes Argo's comparison pipeline, so a Flux root leaves the
+// field nil even if it somehow carried spec.ignoreDifferences.
+func TestBuildSummary_IgnoredDifferences_NilForFlux(t *testing.T) {
+	root := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "kustomize.toolkit.fluxcd.io/v1",
+		"kind":       "Kustomization",
+		"metadata":   map[string]any{"namespace": "flux-system", "name": "apps"},
+		"spec": map[string]any{
+			"ignoreDifferences": []any{
+				map[string]any{"kind": "ConfigMap", "jsonPointers": []any{"/data"}},
+			},
+		},
+		"status": map[string]any{},
+	}}
+	s := buildSummary(root, "fluxcd")
+	if s.IgnoredDifferences != nil {
+		t.Errorf("expected nil IgnoredDifferences for Flux root, got %+v", s.IgnoredDifferences)
+	}
+}
+
 // TestCategorizeArgoChange pins the closed mapping from Argo's per-resource
 // sync + health vocabularies onto the typed Category constants. A mapping
 // gap would silently drop a row into changeRank's default bucket and
@@ -1222,5 +1597,292 @@ func TestChangeRank(t *testing.T) {
 	// values don't silently mix with valid ones in the sorted output.
 	if got := changeRank(Category("Bogus")); got <= 4 {
 		t.Errorf("changeRank(Bogus) = %d, want > 4 (default branch must rank below all named constants)", got)
+	}
+}
+
+func TestDedupeIssues_SameNameDifferentNamespaceKept(t *testing.T) {
+	// Two genuinely distinct Degraded resources sharing a kind+name across
+	// namespaces (an ApplicationSet fanning out an identically-named workload)
+	// must BOTH survive dedup — the namespace is part of the key.
+	in := []Issue{
+		{Scope: "resource", Severity: "critical", Reason: "Degraded", Message: "Deployment api is Degraded", Refs: []Ref{{Kind: "Deployment", Namespace: "team-a", Name: "api"}}},
+		{Scope: "resource", Severity: "critical", Reason: "Degraded", Message: "Deployment api is Degraded", Refs: []Ref{{Kind: "Deployment", Namespace: "team-b", Name: "api"}}},
+	}
+	got := dedupeIssues(in)
+	if len(got) != 2 {
+		t.Fatalf("expected both namespaces' issues kept, got %d: %+v", len(got), got)
+	}
+}
+
+func TestArgoResourceChanges_TakesTreeHealthWhenCRHasNone(t *testing.T) {
+	root := argoApp(map[string]any{
+		"resourceHealthSource": "appTree",
+		"resources": []any{
+			map[string]any{"group": "apps", "kind": "Deployment", "namespace": "staging", "name": "radar-hub", "status": "Synced"},
+			map[string]any{"kind": "Service", "namespace": "staging", "name": "radar-hub", "status": "Synced", "health": map[string]any{"status": "Progressing", "message": "argo says so"}},
+			map[string]any{"kind": "ConfigMap", "namespace": "staging", "name": "vars", "status": "Synced"},
+			map[string]any{"kind": "SealedSecret", "namespace": "staging", "name": "x", "status": "Synced"},
+		},
+	})
+	tree := &gitopstree.ResourceTree{HealthMode: gitopstree.HealthModeAppTree, Nodes: []gitopstree.Node{
+		{Ref: gitopstree.ResourceRef{Group: "apps", Kind: "Deployment", Namespace: "staging", Name: "radar-hub"}, Health: "Degraded", HealthSource: gitopstree.HealthSourceRadar, HealthReason: "CrashLoopBackOff", HealthMessage: "back-off restarting failed container", HealthSeverity: "critical"},
+		{Ref: gitopstree.ResourceRef{Kind: "Service", Namespace: "staging", Name: "radar-hub"}, Health: "Healthy", HealthSource: gitopstree.HealthSourceRadar},
+		{Ref: gitopstree.ResourceRef{Kind: "ConfigMap", Namespace: "staging", Name: "vars"}, Health: ""},
+	}}
+	byName := map[string]Change{}
+	for _, c := range argoResourceChanges(root, tree, nil) {
+		byName[c.Ref.Name+"/"+c.Ref.Kind] = c
+	}
+	dep := byName["radar-hub/Deployment"]
+	if dep.Health != "Degraded" || dep.HealthSource != "radar" || dep.HealthReason != "CrashLoopBackOff" || dep.Message != "back-off restarting failed container" || dep.Category != CategoryDegraded {
+		t.Errorf("Deployment should take the tree's Radar-derived health with provenance, got %+v", dep)
+	}
+	svc := byName["radar-hub/Service"]
+	if svc.Health != "Progressing" || svc.HealthSource != "controller" || svc.Message != "argo says so" {
+		t.Errorf("Service has controller health in the CR; it must win over the tree, got %+v", svc)
+	}
+	if cm := byName["vars/ConfigMap"]; cm.Health != "" || cm.HealthSource != "" {
+		t.Errorf("ConfigMap has no health anywhere; must stay empty, got %+v", cm)
+	}
+	if ss := byName["x/SealedSecret"]; ss.Health != "" {
+		t.Errorf("SealedSecret is not in the tree; must stay empty, got %+v", ss)
+	}
+}
+
+// TestArgoResourceChanges_APIOverlayBeatsInlineValue: when the host filled
+// the tree from Argo's API, a value the CR still carries inline is older
+// and must not win.
+func TestArgoResourceChanges_APIOverlayBeatsInlineValue(t *testing.T) {
+	root := argoApp(map[string]any{
+		"resourceHealthSource": "appTree",
+		"resources": []any{
+			map[string]any{"group": "apps", "kind": "Deployment", "namespace": "p", "name": "web", "status": "Synced", "health": map[string]any{"status": "Degraded", "message": "old story"}},
+		},
+	})
+	tree := &gitopstree.ResourceTree{HealthMode: gitopstree.HealthModeAppTree, HealthFromAPI: true, Nodes: []gitopstree.Node{
+		{Role: gitopstree.RoleDeclared, Ref: gitopstree.ResourceRef{Group: "apps", Kind: "Deployment", Namespace: "p", Name: "web"}, Health: "Healthy", HealthSource: gitopstree.HealthSourceControllerAPI},
+	}}
+	out := argoResourceChanges(root, tree, nil)
+	if len(out) != 1 || out[0].Health != "Healthy" || out[0].HealthSource != "controllerApi" || out[0].Message != "" {
+		t.Errorf("API overlay must beat the CR's inline value, got %+v", out)
+	}
+}
+
+// TestBuildIssues_RadarDerivedHealthYieldsEngineIssue pins the Argo 3
+// shape: no per-resource health in the CR, the tree carries the issues
+// engine's finding (overlaid by the host), and the resulting Issue is the
+// engine's finding — its reason, message and severity, with source=radar —
+// not an Argo-vocabulary "is Degraded" row.
+func TestBuildIssues_RadarDerivedHealthYieldsEngineIssue(t *testing.T) {
+	root := argoApp(map[string]any{
+		"health":               map[string]any{"status": "Degraded"},
+		"resourceHealthSource": "appTree",
+		"resources": []any{
+			map[string]any{"group": "external-secrets.io", "kind": "ClusterSecretStore", "name": "platform", "status": "Synced"},
+			map[string]any{"group": "apps", "kind": "Deployment", "namespace": "platform", "name": "web", "status": "Synced"},
+		},
+	})
+	tree := &gitopstree.ResourceTree{HealthMode: gitopstree.HealthModeAppTree, Nodes: []gitopstree.Node{
+		{Role: gitopstree.RoleDeclared, Ref: gitopstree.ResourceRef{Group: "external-secrets.io", Kind: "ClusterSecretStore", Name: "platform"}, Health: "Degraded", HealthSource: gitopstree.HealthSourceRadar, HealthReason: "Ready: InvalidProviderConfig", HealthMessage: "no route to host", HealthSeverity: "warning"},
+		{Role: gitopstree.RoleDeclared, Ref: gitopstree.ResourceRef{Group: "apps", Kind: "Deployment", Namespace: "platform", Name: "web"}, Health: "Degraded", HealthSource: gitopstree.HealthSourceRadar, HealthReason: "CrashLoopBackOff", HealthMessage: "back-off restarting", HealthSeverity: "critical"},
+	}}
+	tree.Summary = gitopstree.Summarize(tree.Nodes)
+	issues := buildIssues(root, tree, "argocd", &fakeResolver{})
+	if len(issues) != 2 {
+		t.Fatalf("expected one Issue per Radar-derived Degraded resource, got %d: %+v", len(issues), issues)
+	}
+	// Severity-sorted: the critical crashloop first.
+	if issues[0].Reason != "CrashLoopBackOff" || issues[0].Severity != SeverityCritical || issues[0].Source != "radar" {
+		t.Errorf("crashloop Issue = %+v, want engine reason, critical, source=radar", issues[0])
+	}
+	if issues[1].Reason != "Ready: InvalidProviderConfig" || issues[1].Severity != SeverityWarning || issues[1].Source != "radar" {
+		t.Errorf("condition Issue = %+v, want engine reason, WARNING (engine severity, not promoted), source=radar", issues[1])
+	}
+	if !strings.Contains(issues[1].Message, "no route to host") {
+		t.Errorf("Message = %q, want the engine message", issues[1].Message)
+	}
+	for _, iss := range issues {
+		if iss.Reason == "DegradedResources" {
+			t.Errorf("tree-summary fallback must not fire when per-resource findings exist: %+v", iss)
+		}
+	}
+
+	// Warning-tier findings alone still name their resources; the count
+	// must not stack on them either.
+	tree.Nodes = tree.Nodes[:1]
+	tree.Summary = gitopstree.Summarize(tree.Nodes)
+	for _, iss := range buildIssues(root, tree, "argocd", &fakeResolver{}) {
+		if iss.Reason == "DegradedResources" || iss.Reason == "PossibleCause" {
+			t.Errorf("neither the count nor an events lead may stack on a warning-tier finding: %+v", iss)
+		}
+	}
+}
+
+// TestBuildIssues_TopologyReadIsWarningAndSilentOnHealthyApp: Radar's own
+// topology read (no engine reason) is an observation, not a verdict — a
+// warning-tier Issue on a Degraded app, and no Issue at all when Argo calls
+// the app Healthy.
+func TestBuildIssues_TopologyReadIsWarningAndSilentOnHealthyApp(t *testing.T) {
+	mk := func(health string) *unstructured.Unstructured {
+		return argoApp(map[string]any{
+			"health":               map[string]any{"status": health},
+			"resourceHealthSource": "appTree",
+			"resources": []any{
+				map[string]any{"group": "apps", "kind": "Deployment", "namespace": "prod", "name": "web", "status": "Synced"},
+			},
+		})
+	}
+	tree := &gitopstree.ResourceTree{HealthMode: gitopstree.HealthModeAppTree, Nodes: []gitopstree.Node{
+		{Role: gitopstree.RoleDeclared, Ref: gitopstree.ResourceRef{Group: "apps", Kind: "Deployment", Namespace: "prod", Name: "web"}, Health: "Degraded", HealthSource: gitopstree.HealthSourceRadar},
+	}}
+	tree.Summary = gitopstree.Summarize(tree.Nodes)
+	degraded := buildIssues(mk("Degraded"), tree, "argocd", &fakeResolver{})
+	if len(degraded) != 1 || degraded[0].Severity != SeverityWarning || degraded[0].Source != "radar" {
+		t.Errorf("topology read on a Degraded app = %+v, want one warning-tier radar Issue", degraded)
+	}
+	for _, iss := range buildIssues(mk("Healthy"), tree, "argocd", &fakeResolver{}) {
+		if iss.Scope == ScopeResource || iss.Reason == "DegradedResources" {
+			t.Errorf("neither a per-resource Issue nor the degraded count may contradict a Healthy app, got %+v", iss)
+		}
+	}
+}
+
+// TestBuildIssues_EventsLeadYieldsToRadarFinding: once the tree carries a
+// Radar-sourced finding for a resource (even a warning-tier one), the
+// Warning-event lead stays out — it would only restate the same app.
+func TestBuildIssues_EventsLeadYieldsToRadarFinding(t *testing.T) {
+	root := argoApp(map[string]any{
+		"health":               map[string]any{"status": "Degraded"},
+		"resourceHealthSource": "appTree",
+		"resources": []any{
+			map[string]any{"group": "radar.demo", "kind": "Gadget", "namespace": "demo", "name": "g", "status": "Synced"},
+		},
+	})
+	tree := &gitopstree.ResourceTree{HealthMode: gitopstree.HealthModeAppTree, Nodes: []gitopstree.Node{
+		{Role: gitopstree.RoleDeclared, Ref: gitopstree.ResourceRef{Group: "radar.demo", Kind: "Gadget", Namespace: "demo", Name: "g"}, Health: "Degraded", HealthSource: gitopstree.HealthSourceRadar, HealthReason: "Ready: NotConfigured", HealthMessage: "no config", HealthSeverity: "warning"},
+	}}
+	tree.Summary = gitopstree.Summarize(tree.Nodes)
+	r := &fakeResolver{events: map[string][]EventSummary{"g": {{Type: "Warning", Reason: "Bad", Message: "boom", Count: 9}}}}
+	for _, iss := range buildIssues(root, tree, "argocd", r) {
+		if iss.Reason == "PossibleCause" {
+			t.Errorf("events lead must not stack on a Radar finding, got %+v", iss)
+		}
+	}
+}
+
+func TestBuildIssues_ControllerHealthIssueKeepsArgoVocabulary(t *testing.T) {
+	root := argoApp(map[string]any{
+		"health": map[string]any{"status": "Degraded"},
+		"resources": []any{
+			map[string]any{"group": "apps", "kind": "Deployment", "namespace": "platform", "name": "web", "status": "Synced", "health": map[string]any{"status": "Degraded"}},
+		},
+	})
+	issues := buildIssues(root, nil, "argocd", nil)
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 issue, got %d: %+v", len(issues), issues)
+	}
+	if issues[0].Reason != "Degraded" || issues[0].Source != "controller" || issues[0].Severity != SeverityCritical {
+		t.Errorf("controller-sourced Issue = %+v, want Reason=Degraded, Source=controller, critical", issues[0])
+	}
+}
+
+// TestBuildIssues_TreeFallbackNotSuppressedByInfoIssue: a running sync is
+// informational and does not explain degraded resources, so the tree-summary
+// fallback must still fire alongside it.
+func TestBuildIssues_TreeFallbackNotSuppressedByInfoIssue(t *testing.T) {
+	root := argoApp(map[string]any{
+		"health":         map[string]any{"status": "Degraded"},
+		"operationState": map[string]any{"phase": "Running"},
+		"resources":      []any{},
+	})
+	tree := &gitopstree.ResourceTree{Summary: gitopstree.Summary{Degraded: 2}}
+	issues := buildIssues(root, tree, "argocd", nil)
+	var sawRunning, sawTree bool
+	for _, iss := range issues {
+		if iss.Reason == "Running" {
+			sawRunning = true
+		}
+		if iss.Reason == "DegradedResources" {
+			sawTree = true
+		}
+	}
+	if !sawRunning || !sawTree {
+		t.Errorf("want both the Running info row and the DegradedResources fallback, got %+v", issues)
+	}
+}
+
+func TestBuildIssues_RemoteDestinationSkipsLocalCauseBridge(t *testing.T) {
+	root := argoApp(map[string]any{
+		"health": map[string]any{"status": "Degraded"},
+		"resources": []any{
+			map[string]any{"group": "apps", "kind": "Deployment", "namespace": "prod", "name": "web", "status": "Synced", "health": map[string]any{"status": "Degraded"}},
+		},
+	})
+	r := &fakeResolver{problems: map[string][]ResourceProblem{"web": {{Reason: "CrashLoopBackOff", Message: "a LOCAL deployment's problem", Severity: "critical"}}}}
+	issues := buildIssues(root, &gitopstree.ResourceTree{RemoteDestination: true}, "argocd", r)
+	if len(issues) != 1 || issues[0].Cause != "" {
+		t.Errorf("remote app must not borrow a local resource's cause, got %+v", issues)
+	}
+	local := buildIssues(root, &gitopstree.ResourceTree{}, "argocd", r)
+	if len(local) != 1 || local[0].Cause == "" {
+		t.Errorf("in-cluster app keeps the cause bridge, got %+v", local)
+	}
+}
+
+func TestBuildChanges_RemoteDestinationSkipsLocalEnrichment(t *testing.T) {
+	root := argoApp(map[string]any{
+		"resources": []any{
+			map[string]any{"group": "apps", "kind": "Deployment", "namespace": "prod", "name": "web", "status": "OutOfSync"},
+		},
+	})
+	r := &fakeResolver{events: map[string][]EventSummary{"web": {{Type: "Warning", Reason: "BackOff", Message: "local pod"}}}}
+	remote := buildChanges(root, &gitopstree.ResourceTree{RemoteDestination: true}, "argocd", r)
+	if len(remote) != 1 || len(remote[0].RecentEvents) != 0 || remote[0].Drift != nil {
+		t.Errorf("remote app must not carry local events/drift, got %+v", remote)
+	}
+	local := buildChanges(root, &gitopstree.ResourceTree{}, "argocd", r)
+	if len(local) != 1 || len(local[0].RecentEvents) != 1 {
+		t.Errorf("in-cluster app keeps event enrichment, got %+v", local)
+	}
+}
+
+func TestBuild_SummaryCarriesHealthModeAndDestination(t *testing.T) {
+	root := argoApp(map[string]any{"resourceHealthSource": "appTree"})
+	tree := &gitopstree.ResourceTree{HealthMode: gitopstree.HealthModeAppTree, RemoteDestination: true}
+	out := Build(root, tree, nil)
+	if out.Summary.ResourceHealthMode != "appTree" || !out.Summary.RemoteDestination {
+		t.Errorf("Summary = %+v, want resourceHealthMode=appTree, remoteDestination=true", out.Summary)
+	}
+}
+
+func TestBuildIssues_RemoteDestinationOffersNoLocalRemediation(t *testing.T) {
+	root := argoApp(map[string]any{
+		"operationState": map[string]any{"phase": "Failed", "message": `namespaces "payments" not found`},
+	})
+	root.Object["spec"] = map[string]any{"destination": map[string]any{"name": "prod-spoke"}}
+	issues := buildIssues(root, nil, "argocd", nil)
+	var op *Issue
+	for i := range issues {
+		if issues[i].Scope == ScopeOperation {
+			op = &issues[i]
+		}
+	}
+	if op == nil {
+		t.Fatalf("no operation issue in %+v", issues)
+	}
+	if op.Remediation != nil {
+		t.Errorf("remote Application must not offer a fix that acts on this cluster, got %+v", op.Remediation)
+	}
+	if !strings.Contains(op.Action, "destination cluster") || !strings.Contains(op.Action, "payments") {
+		t.Errorf("Action = %q, want the namespace named on the destination cluster", op.Action)
+	}
+}
+
+func TestBuild_DestinationlessAppIsNotReportedRemote(t *testing.T) {
+	root := argoApp(map[string]any{})
+	delete(root.Object, "spec")
+	tree := &gitopstree.ResourceTree{RemoteDestination: true}
+	if out := Build(root, tree, nil); out.Summary.RemoteDestination {
+		t.Error("an Application with no destination is invalid, not deploying elsewhere")
 	}
 }

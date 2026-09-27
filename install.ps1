@@ -10,11 +10,38 @@ $InstallDir = "$env:LOCALAPPDATA\radar"
 # Only amd64 is supported on Windows
 $Arch = "amd64"
 
-# Get latest release version
+# Resolve the ordinary GitHub web redirect instead of using the REST API.
+# The API's unauthenticated per-IP quota can be exhausted by unrelated users
+# behind the same NAT, while this redirect is the same path browsers use.
 Write-Host "Fetching latest release..." -ForegroundColor Cyan
 try {
-    $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest"
-    $Version = $Release.tag_name -replace '^v', ''
+    $Release = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" -UseBasicParsing -MaximumRedirection 5
+
+    # Windows PowerShell 5.1 and PowerShell 7 expose the final response URI on
+    # different response objects. Both runtimes are supported by this script.
+    if ($Release.BaseResponse.PSObject.Properties["ResponseUri"]) {
+        $LatestReleaseUri = $Release.BaseResponse.ResponseUri
+    } elseif ($Release.BaseResponse.PSObject.Properties["RequestMessage"]) {
+        $LatestReleaseUri = $Release.BaseResponse.RequestMessage.RequestUri
+    } else {
+        throw "GitHub response did not include the final release URL"
+    }
+
+    $ExpectedPathPrefix = "/$Repo/releases/tag/v"
+    if ($LatestReleaseUri.Scheme -ne "https" -or
+        $LatestReleaseUri.Host -ne "github.com" -or
+        $LatestReleaseUri.UserInfo -ne "" -or
+        $LatestReleaseUri.Port -ne 443 -or
+        $LatestReleaseUri.Query -ne "" -or
+        $LatestReleaseUri.Fragment -ne "" -or
+        -not $LatestReleaseUri.AbsolutePath.StartsWith($ExpectedPathPrefix, [StringComparison]::Ordinal)) {
+        throw "GitHub redirected to an unexpected release URL: $LatestReleaseUri"
+    }
+
+    $Version = $LatestReleaseUri.AbsolutePath.Substring($ExpectedPathPrefix.Length)
+    if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
+        throw "GitHub returned an unexpected release tag: v$Version"
+    }
 } catch {
     Write-Host "Failed to fetch latest version: $_" -ForegroundColor Red
     exit 1
@@ -52,9 +79,7 @@ Move-Item -Path (Join-Path $TmpDir $BinaryName) -Destination $InstallDir -Force
 
 # Create radar.exe symlink/copy for convenience
 $RadarExe = Join-Path $InstallDir "radar.exe"
-if (-not (Test-Path $RadarExe)) {
-    Copy-Item -Path (Join-Path $InstallDir $BinaryName) -Destination $RadarExe
-}
+Copy-Item -Path (Join-Path $InstallDir $BinaryName) -Destination $RadarExe -Force
 
 # Cleanup
 Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue

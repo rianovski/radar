@@ -1,0 +1,67 @@
+# DeletingPolicy — the only modern family that is scheduled rather than
+# admission-driven. No failurePolicy, no evaluation block, no
+# webhookConfiguration; instead a cron schedule and deletion conditions.
+#
+# Its table carries a "Last Run" column rather than a readiness one, because
+# Kyverno never populates status.conditionStatus.ready on this kind (the CRD
+# declares a READY printer column that stays blank even after the cron fires),
+# and an uncompilable policy is rejected at admission so a broken one never
+# exists to flag. What does go wrong is a policy that never runs.
+---
+# Six-hourly, so it renders "Never run" for a while after bootstrap — which is
+# the state the Last Run column exists to surface.
+apiVersion: policies.kyverno.io/v1
+kind: DeletingPolicy
+metadata:
+  name: cleanup-completed-jobs
+spec:
+  schedule: "0 */6 * * *"
+  deletionPropagationPolicy: Foreground
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["jobs"]
+  conditions:
+    - name: completed
+      expression: "has(object.status.succeeded) && object.status.succeeded > 0"
+---
+# Every-minute schedule, so within ~2 minutes of bootstrap this one flips to
+# "43s ago" while the six-hourly one above still says "Never run". That
+# contrast is the point — one table, both states, no hand-patching.
+#
+# The condition deliberately never matches, so it runs without deleting
+# anything.
+apiVersion: policies.kyverno.io/v1
+kind: DeletingPolicy
+metadata:
+  name: probe-every-minute
+spec:
+  schedule: "* * * * *"
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["configmaps"]
+  conditions:
+    - name: never-matches
+      expression: "has(object.metadata.labels) && object.metadata.labels['delete-me'] == 'yes'"
+---
+apiVersion: policies.kyverno.io/v1
+kind: NamespacedDeletingPolicy
+metadata:
+  name: ns-cleanup-old-pods
+  namespace: policy-demo
+spec:
+  schedule: "*/30 * * * *"
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  conditions:
+    - name: succeeded
+      expression: "object.status.phase == 'Succeeded'"

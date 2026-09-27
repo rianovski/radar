@@ -1,8 +1,17 @@
 import { clsx } from 'clsx'
+import { Badge } from '../../ui/Badge'
 import { Tooltip } from '../../ui/Tooltip'
+import {
+  NETWORK_POLICY_PEER_DOTS,
+  NETWORK_POLICY_PEER_STYLES,
+  type NetworkPolicyPeerType,
+} from './network-policy-peer-styles'
+import { effectivePolicyTypes, formatNetworkPolicyPort } from '../../../utils/network-policy'
+import { formatKubernetesLabelSelector } from '../resource-utils-calico'
 
 interface NetworkPolicyDiagramProps {
   spec: any
+  staged?: boolean
 }
 
 /**
@@ -11,24 +20,27 @@ interface NetworkPolicyDiagramProps {
  * Each rule is a horizontal band. Peers within a rule are OR'd (stacked).
  * Pure CSS/SVG — no ReactFlow needed for this static diagram.
  */
-export function NetworkPolicyDiagram({ spec }: NetworkPolicyDiagramProps) {
+export function NetworkPolicyDiagram({ spec, staged = false }: NetworkPolicyDiagramProps) {
   const podSelector = spec.podSelector || {}
-  const matchLabels = podSelector.matchLabels || {}
-  const policyTypes: string[] = spec.policyTypes || []
   const ingress: any[] | undefined = spec.ingress
   const egress: any[] | undefined = spec.egress
 
-  const hasIngress = policyTypes.includes('Ingress')
-  const hasEgress = policyTypes.includes('Egress')
-  const targetLabel = Object.keys(matchLabels).length > 0
-    ? Object.entries(matchLabels).map(([k, v]) => `${k}=${v}`).join(', ')
-    : 'All pods'
+  const { ingress: hasIngress, egress: hasEgress } = effectivePolicyTypes(spec)
+  const target = formatSelector(podSelector)
+  const targetLabel = target === 'all' ? 'All pods' : target
 
   const ingressDenied = hasIngress && (!ingress || ingress.length === 0)
   const egressDenied = hasEgress && (!egress || egress.length === 0)
 
   return (
     <div className="card-inner-lg space-y-3">
+      {staged && (
+        <div className="flex items-center gap-2 text-[11px] text-theme-text-tertiary">
+          <Badge severity="warning" size="sm">Staged preview</Badge>
+          <span>Dashed paths are evaluated but not enforced</span>
+        </div>
+      )}
+
       {/* Ingress flows */}
       {hasIngress && (
         <div className="space-y-2">
@@ -43,6 +55,7 @@ export function NetworkPolicyDiagram({ spec }: NetworkPolicyDiagramProps) {
               ports={[]}
               direction="ingress"
               denied
+              staged={staged}
             />
           ) : (
             ingress?.map((rule, i) => (
@@ -52,6 +65,7 @@ export function NetworkPolicyDiagram({ spec }: NetworkPolicyDiagramProps) {
                 target={targetLabel}
                 ports={extractPorts(rule.ports)}
                 direction="ingress"
+                staged={staged}
               />
             ))
           )}
@@ -72,6 +86,7 @@ export function NetworkPolicyDiagram({ spec }: NetworkPolicyDiagramProps) {
               ports={[]}
               direction="egress"
               denied
+              staged={staged}
             />
           ) : (
             egress?.map((rule, i) => (
@@ -81,6 +96,7 @@ export function NetworkPolicyDiagram({ spec }: NetworkPolicyDiagramProps) {
                 target={targetLabel}
                 ports={extractPorts(rule.ports)}
                 direction="egress"
+                staged={staged}
               />
             ))
           )}
@@ -97,7 +113,7 @@ export function NetworkPolicyDiagram({ spec }: NetworkPolicyDiagramProps) {
 interface PeerInfo {
   label: string
   sublabel?: string
-  type: 'pod' | 'namespace' | 'cidr' | 'all' | 'deny' | 'combined'
+  type: NetworkPolicyPeerType
 }
 
 function extractPeers(peers: any[] | undefined): PeerInfo[] {
@@ -141,38 +157,14 @@ function extractPeers(peers: any[] | undefined): PeerInfo[] {
 
 function extractPorts(ports: any[] | undefined): string[] {
   if (!ports || ports.length === 0) return []
-  return ports.map((p: any) => {
-    const proto = p.protocol || 'TCP'
-    const port = p.port || '*'
-    const endPort = p.endPort
-    return endPort ? `${proto}/${port}-${endPort}` : `${proto}/${port}`
-  })
+  return ports.map(formatNetworkPolicyPort)
 }
 
+// matchExpressions select too; a selector made only of them is not "all".
 function formatSelector(selector: any): string {
-  const labels = selector?.matchLabels || {}
-  if (Object.keys(labels).length === 0) return 'all'
-  return Object.entries(labels).map(([k, v]) => `${k}=${v}`).join(', ')
+  const text = formatKubernetesLabelSelector(selector)
+  return text === 'all workloads' ? 'all' : text
 }
-
-// Color coding for peer types
-const PEER_STYLES = {
-  pod: 'border-emerald-500/30 bg-emerald-500/8',
-  namespace: 'border-sky-500/30 bg-sky-500/8',
-  cidr: 'border-amber-500/30 bg-amber-500/8',
-  combined: 'border-emerald-500/30 bg-emerald-500/8',
-  all: 'border-theme-border bg-theme-elevated/50',
-  deny: 'border-red-500/30 bg-red-500/8',
-} as const
-
-const PEER_DOT = {
-  pod: 'bg-emerald-500',
-  namespace: 'bg-sky-500',
-  cidr: 'bg-amber-500',
-  combined: 'bg-emerald-500',
-  all: 'bg-theme-text-tertiary',
-  deny: 'bg-red-500',
-} as const
 
 function FlowRow({
   sources,
@@ -180,12 +172,14 @@ function FlowRow({
   ports,
   direction,
   denied = false,
+  staged = false,
 }: {
   sources: PeerInfo[]
   target: string
   ports: string[]
   direction: 'ingress' | 'egress'
   denied?: boolean
+  staged?: boolean
 }) {
   const isIngress = direction === 'ingress'
 
@@ -200,11 +194,11 @@ function FlowRow({
             <div
               className={clsx(
                 'rounded-md border px-2 py-1.5 min-w-0 overflow-hidden',
-                PEER_STYLES[peer.type],
+                NETWORK_POLICY_PEER_STYLES[peer.type],
               )}
             >
               <div className="flex items-center gap-1.5 min-w-0">
-                <span className={clsx('w-1.5 h-1.5 rounded-full shrink-0', PEER_DOT[peer.type])} />
+                <span className={clsx('w-1.5 h-1.5 rounded-full shrink-0', NETWORK_POLICY_PEER_DOTS[peer.type])} />
                 <span className={clsx('text-[11px] font-medium truncate min-w-0', denied && 'line-through text-red-400')}>
                   {peer.label}
                 </span>
@@ -245,14 +239,14 @@ function FlowRow({
           x1="2" y1="10" x2="32" y2="10"
           stroke={denied ? '#ef4444' : direction === 'ingress' ? '#3b82f6' : '#a855f7'}
           strokeWidth="1.5"
-          strokeDasharray={denied ? '3 2' : undefined}
+          strokeDasharray={staged ? '4 3' : denied ? '3 2' : undefined}
           markerEnd={`url(#arrow-${direction}-${denied ? 'denied' : 'ok'})`}
         />
       </svg>
       {ports.length > 0 && (
-        <div className="flex flex-wrap justify-center gap-0.5 mt-0.5">
+        <div className="flex flex-col items-center gap-0.5 mt-0.5">
           {ports.map((p, i) => (
-            <span key={i} className="text-[8px] text-theme-text-tertiary font-mono leading-none">{p}</span>
+            <span key={i} className="whitespace-nowrap text-[8px] text-theme-text-tertiary font-mono leading-none">{p}</span>
           ))}
         </div>
       )}

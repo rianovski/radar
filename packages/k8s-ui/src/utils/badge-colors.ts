@@ -38,6 +38,10 @@ export const HEALTH_BADGE_COLORS: Record<string, string> = {
   degraded: BADGE_SEVERITY_COLORS.warning,
   alert: BADGE_SEVERITY_COLORS.alert,
   unhealthy: BADGE_SEVERITY_COLORS.error,
+  // neutral = intentional/idle (suspended, scaled-to-0, completed) — sky, calm
+  // and distinct from `unknown` (gray, "can't determine"). Reuses the `info`
+  // sky palette; see `.status-neutral` in theme/components.css.
+  neutral: BADGE_SEVERITY_COLORS.info,
   unknown: BADGE_SEVERITY_COLORS.neutral,
 }
 
@@ -70,7 +74,7 @@ export const NODEPOOL_MODE_BADGE: Record<string, string> = {
 
 // Translucent gray badge for "inactive / unknown / pending / unset / disabled" states.
 // The de-facto fallback in renderers when no severity or category applies.
-export const BADGE_INACTIVE = 'bg-gray-500/20 text-gray-400'
+export const BADGE_INACTIVE = 'status-unknown'
 
 // Best practices category colors
 export const BP_CATEGORY_BADGE: Record<string, string> = {
@@ -225,6 +229,9 @@ export function healthToSeverity(health: string): Severity {
     case 'error':
     case 'failed':
       return 'error'
+    // health 'neutral' (intentional/idle) renders sky via the `info` palette —
+    // calm, and visually distinct from 'unknown' which falls through to gray.
+    case 'neutral':
     case 'info':
       return 'info'
     default:
@@ -284,6 +291,31 @@ export function getHealthBadgeColor(healthState: string): string {
 export function getHelmStatusColor(status: string): string {
   const statusLower = status.toLowerCase()
   return HELM_STATUS_COLORS[statusLower] || 'bg-theme-hover/50 text-theme-text-secondary'
+}
+
+/**
+ * Helm release statuses where the row UI should signpost the user
+ * toward the drawer (history / rollback / logs).
+ *
+ * Currently `failed` only. The `pending-*` statuses (install /
+ * upgrade / rollback) are excluded deliberately: they're Helm's
+ * normal in-flight states during every routine operation. Treating
+ * them as "actionable" would briefly attach an alarming chevron +
+ * tooltip to every install while it ran — indistinguishable from
+ * the genuinely-stuck case (controller crashed mid-flight). Until
+ * we have release age available client-side to disambiguate
+ * "in-flight" from "stuck > N min", we give up the stuck-detect
+ * signpost rather than wrongly alarm the common case.
+ *
+ * @see https://github.com/helm/helm/blob/dev-v3/pkg/release/status.go
+ */
+const ACTIONABLE_HELM_STATUSES: ReadonlySet<string> = new Set([
+  'failed',
+])
+
+export function isHelmReleaseActionable(status: string | null | undefined): boolean {
+  if (!status) return false
+  return ACTIONABLE_HELM_STATUSES.has(status.toLowerCase())
 }
 
 // =============================================================================

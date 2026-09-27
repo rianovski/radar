@@ -1,24 +1,30 @@
 package audit
 
 import (
-	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/skyhook-io/radar/pkg/resourceid"
 )
 
-// ResourceKey returns the index key for a resource: "Kind/namespace/name".
-func ResourceKey(kind, namespace, name string) string {
-	if namespace == "" {
-		return fmt.Sprintf("%s//%s", kind, name)
-	}
-	return fmt.Sprintf("%s/%s/%s", kind, namespace, name)
+// ResourceKey re-exports the neutral identity key from pkg/resourceid (the
+// canonical home) so existing audit callers keep working unchanged.
+func ResourceKey(group, kind, namespace, name string) string {
+	return resourceid.ResourceKey(group, kind, namespace, name)
+}
+
+// GroupForBuiltinKind re-exports the builtin Kind→group table from pkg/resourceid
+// so callers resolving a finding's key (which backfills group the same way) don't
+// need a second import.
+func GroupForBuiltinKind(kind string) string {
+	return resourceid.GroupForBuiltinKind(kind)
 }
 
 // IndexByResource builds a lookup map from ResourceKey → []Finding.
 func IndexByResource(findings []Finding) map[string][]Finding {
 	m := make(map[string][]Finding)
 	for _, f := range findings {
-		key := ResourceKey(f.Kind, f.Namespace, f.Name)
+		key := ResourceKey(f.Group, f.Kind, f.Namespace, f.Name)
 		m[key] = append(m[key], f)
 	}
 	return m
@@ -33,6 +39,7 @@ func GroupByResource(findings []Finding) []ResourceGroup {
 	for _, fs := range index {
 		g := ResourceGroup{
 			Kind:      fs[0].Kind,
+			Group:     fs[0].Group,
 			Namespace: fs[0].Namespace,
 			Name:      fs[0].Name,
 			Findings:  fs,
@@ -55,8 +62,8 @@ func GroupByResource(findings []Finding) []ResourceGroup {
 		if groups[i].Warning != groups[j].Warning {
 			return groups[i].Warning > groups[j].Warning
 		}
-		return ResourceKey(groups[i].Kind, groups[i].Namespace, groups[i].Name) <
-			ResourceKey(groups[j].Kind, groups[j].Namespace, groups[j].Name)
+		return ResourceKey(groups[i].Group, groups[i].Kind, groups[i].Namespace, groups[i].Name) <
+			ResourceKey(groups[j].Group, groups[j].Kind, groups[j].Namespace, groups[j].Name)
 	})
 
 	return groups
@@ -129,14 +136,42 @@ func ApplySettings(results *ScanResults, ignoredNamespaces, disabledChecks []str
 		totalDanger += cs.Danger
 	}
 
+	// Filter the evaluation denominators onto fresh maps — the input is the
+	// server's shared cached scan, so mutating its maps would corrupt every
+	// other consumer for the cache TTL.
+	var evalByNS map[string]map[string]int
+	if results.EvaluatedByNamespace != nil {
+		evalByNS = make(map[string]map[string]int, len(results.EvaluatedByNamespace))
+		for id, byNS := range results.EvaluatedByNamespace {
+			if disabled[id] {
+				continue
+			}
+			nsCopy := make(map[string]int, len(byNS))
+			for ns, n := range byNS {
+				if matchesIgnoredNS(ns) {
+					continue
+				}
+				nsCopy[ns] = n
+			}
+			if len(nsCopy) > 0 {
+				evalByNS[id] = nsCopy
+			}
+		}
+	}
+	checkCounts, totalPassing := deriveCheckCounts(evalByNS, filtered, categories)
+
 	return &ScanResults{
 		Summary: ScanSummary{
+			Passing:    totalPassing,
 			Warning:    totalWarning,
 			Danger:     totalDanger,
 			Categories: categories,
 		},
-		Findings: filtered,
-		Groups:   groups,
-		Checks:   results.Checks,
+		Findings:             filtered,
+		Groups:               groups,
+		Checks:               results.Checks,
+		CheckCounts:          checkCounts,
+		EvaluatedByNamespace: evalByNS,
+		MissingInputs:        results.MissingInputs,
 	}
 }

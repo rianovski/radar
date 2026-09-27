@@ -6,6 +6,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+
+	"github.com/skyhook-io/radar/pkg/prune"
 )
 
 // minifyDetail strips metadata noise and per-type status noise, but keeps full spec
@@ -33,69 +35,51 @@ func minifyDetail(obj runtime.Object) (map[string]any, error) {
 // minifyDetailUnstructured applies Detail-level pruning to an unstructured resource.
 func minifyDetailUnstructured(obj map[string]any) map[string]any {
 	pruneMapDetail(obj)
+	redactUnstructuredSecrets(obj)
 	return obj
 }
 
+// redactUnstructuredSecrets redacts inline secret-shaped values in a CRD's
+// spec/status. Core Secret bodies are handled structurally elsewhere; this is
+// the only value-level pass that reaches arbitrary CRD specs (e.g. a Traefik
+// Middleware basicAuth user) before they go to an LLM.
+func redactUnstructuredSecrets(obj map[string]any) {
+	if spec, ok := obj["spec"]; ok {
+		RedactInlineSecrets(spec)
+	}
+	if status, ok := obj["status"]; ok {
+		RedactInlineSecrets(status)
+	}
+}
+
 func pruneMapDetail(m map[string]any) {
-	// Prune metadata — strip noise keys but keep ALL annotations and labels
-	if meta, ok := m["metadata"].(map[string]any); ok {
-		pruneMetadataCommon(meta)
-		// At Detail level: annotations are NOT filtered (all kept)
-	}
+	// Metadata/spec/container key drops via the shared profiles (annotations
+	// NOT filtered at Detail level). Per-container conditional pruning
+	// (imagePullPolicy rule, env redaction) can't be a path drop — below.
+	prune.ApplyInPlace(m, detailBaseProfile)
+	pruneSpecElements(m)
 
-	// Prune spec — strip noisy pod spec fields
-	if spec, ok := m["spec"].(map[string]any); ok {
-		pruneSpecDetail(spec)
-	}
-
-	// Per-type status pruning
 	kind, _ := m["kind"].(string)
-	if status, ok := m["status"].(map[string]any); ok {
-		pruneStatusForKind(strings.ToLower(kind), status)
+	if p, ok := statusProfileByKind[strings.ToLower(kind)]; ok {
+		prune.ApplyInPlace(m, p)
 	}
 }
 
-func pruneSpecDetail(spec map[string]any) {
-	// Strip noisy pod spec fields
-	for key := range stripPodSpecFields {
-		delete(spec, key)
-	}
-
-	// Prune template.spec (for Deployments, StatefulSets, etc.)
-	if template, ok := spec["template"].(map[string]any); ok {
-		if tSpec, ok := template["spec"].(map[string]any); ok {
-			prunePodSpec(tSpec)
-		}
-	}
-
-	// Direct pod spec (for Pod resources)
-	pruneContainersInSpec(spec)
-}
-
-func pruneStatusForKind(kind string, status map[string]any) {
-	switch kind {
-	case "pod":
-		pruneStatusPod(status)
-	case "deployment", "statefulset", "daemonset", "replicaset":
-		pruneStatusWorkload(status)
-	}
+// pruneSpecElements handles what the shared profiles can't: conditional
+// per-element pruning inside container slices (unconditional key drops ride
+// detailBaseProfile's Drop + ElementDrops).
+func pruneSpecElements(m map[string]any) {
+	forEachContainer(m, pruneContainerConditional)
+	sanitizeSpecEnvLists(m, false)
 }
 
 func minifySecretDetail(secret *corev1.Secret) map[string]any {
-	keys := make([]string, 0, len(secret.Data)+len(secret.StringData))
-	for k := range secret.Data {
-		keys = append(keys, k)
-	}
-	for k := range secret.StringData {
-		keys = append(keys, k)
-	}
-
 	result := map[string]any{
 		"kind":      "Secret",
 		"name":      secret.Name,
 		"namespace": secret.Namespace,
 		"type":      string(secret.Type),
-		"keys":      keys,
+		"keys":      secretKeyNames(secret),
 	}
 
 	if len(secret.Labels) > 0 {

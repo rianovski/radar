@@ -7,15 +7,37 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 func ptr[T any](v T) *T { return &v }
+
+func findingNames(findings []Finding, checkID string) map[string]bool {
+	names := map[string]bool{}
+	for _, f := range findings {
+		if f.CheckID == checkID {
+			names[f.Name] = true
+		}
+	}
+	return names
+}
+
+func findingResourceKeys(findings []Finding, checkID string) map[string]bool {
+	keys := map[string]bool{}
+	for _, f := range findings {
+		if f.CheckID == checkID {
+			keys[f.Kind+"/"+f.Namespace+"/"+f.Name] = true
+		}
+	}
+	return keys
+}
 
 func TestRunChecks_Empty(t *testing.T) {
 	results := RunChecks(&CheckInput{})
@@ -33,6 +55,9 @@ func TestRunChecks_Nil(t *testing.T) {
 
 func TestSecurityChecks(t *testing.T) {
 	input := &CheckInput{
+		// non-nil = authoritative inventory (nil now means RBAC-denied and
+		// skips the SA-dependent automount check)
+		ServiceAccounts: []*corev1.ServiceAccount{},
 		Deployments: []*appsv1.Deployment{{
 			ObjectMeta: metav1.ObjectMeta{Name: "insecure-app", Namespace: "default"},
 			Spec: appsv1.DeploymentSpec{
@@ -503,6 +528,7 @@ func TestSecurityChecks_AutomountDefaultServiceAccount(t *testing.T) {
 
 func TestReliabilityChecks(t *testing.T) {
 	input := &CheckInput{
+		HorizontalPodAutoscalers: []*autoscalingv2.HorizontalPodAutoscaler{},
 		Deployments: []*appsv1.Deployment{{
 			ObjectMeta: metav1.ObjectMeta{Name: "single-replica", Namespace: "default"},
 			Spec: appsv1.DeploymentSpec{
@@ -573,8 +599,59 @@ func TestSingleReplica_SkippedWithHPA(t *testing.T) {
 	}
 }
 
+func TestRolloutAvailabilityRisk(t *testing.T) {
+	input := &CheckInput{Deployments: []*appsv1.Deployment{
+		rolloutAuditDeployment("risky", 3, appsv1.RollingUpdateDeploymentStrategyType, intstr.FromInt32(0), intstr.FromString("100%")),
+		rolloutAuditDeployment("safe-defaults", 3, "", intstr.IntOrString{}, intstr.IntOrString{}),
+		rolloutAuditDeployment("explicit-recreate", 3, appsv1.RecreateDeploymentStrategyType, intstr.FromInt32(0), intstr.FromString("100%")),
+		rolloutAuditDeployment("single-replica", 1, appsv1.RollingUpdateDeploymentStrategyType, intstr.FromInt32(0), intstr.FromString("100%")),
+	}}
+	input.Deployments[1].Spec.Strategy.RollingUpdate = nil
+
+	results := RunChecks(input)
+	var matching []Finding
+	for _, finding := range results.Findings {
+		if finding.CheckID == "rolloutAvailabilityRisk" {
+			matching = append(matching, finding)
+		}
+	}
+	if len(matching) != 1 {
+		t.Fatalf("rolloutAvailabilityRisk findings = %+v, want exactly one", matching)
+	}
+	finding := matching[0]
+	if finding.Name != "risky" || finding.Namespace != "prod" || finding.Group != "apps" || finding.Severity != SeverityWarning {
+		t.Errorf("finding identity = %+v", finding)
+	}
+	if !strings.Contains(finding.Message, "maxUnavailable=100%") || !strings.Contains(finding.Message, "can drop to zero available pods") {
+		t.Errorf("finding message = %q", finding.Message)
+	}
+	if got, want := results.CheckCounts["rolloutAvailabilityRisk"], (CheckCount{Evaluated: 2, Passed: 1}); got != want {
+		t.Errorf("CheckCounts[rolloutAvailabilityRisk] = %+v, want %+v", got, want)
+	}
+	if got := results.EvaluatedByNamespace["rolloutAvailabilityRisk"]["prod"]; got != 2 {
+		t.Errorf("namespace evaluation count = %d, want 2", got)
+	}
+}
+
+func rolloutAuditDeployment(name string, replicas int32, strategyType appsv1.DeploymentStrategyType, maxSurge, maxUnavailable intstr.IntOrString) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Strategy: appsv1.DeploymentStrategy{
+				Type: strategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxSurge:       &maxSurge,
+					MaxUnavailable: &maxUnavailable,
+				},
+			},
+		},
+	}
+}
+
 func TestEfficiencyChecks(t *testing.T) {
 	input := &CheckInput{
+		LimitRanges: []*corev1.LimitRange{},
 		Deployments: []*appsv1.Deployment{{
 			ObjectMeta: metav1.ObjectMeta{Name: "no-resources", Namespace: "default"},
 			Spec: appsv1.DeploymentSpec{
@@ -1146,65 +1223,9 @@ func TestMissingTopologySpread_SingleReplica(t *testing.T) {
 	}
 }
 
-func TestPodHARisk(t *testing.T) {
-	input := &CheckInput{
-		Deployments: []*appsv1.Deployment{{
-			ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
-			Spec: appsv1.DeploymentSpec{
-				Replicas: ptr(int32(3)),
-				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
-				Template: corev1.PodTemplateSpec{
-					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "app:v1"}}},
-				},
-			},
-		}},
-		Pods: []*corev1.Pod{
-			{ObjectMeta: metav1.ObjectMeta{Name: "web-1", Namespace: "default", Labels: map[string]string{"app": "web"}}, Spec: corev1.PodSpec{NodeName: "node-1"}},
-			{ObjectMeta: metav1.ObjectMeta{Name: "web-2", Namespace: "default", Labels: map[string]string{"app": "web"}}, Spec: corev1.PodSpec{NodeName: "node-1"}},
-			{ObjectMeta: metav1.ObjectMeta{Name: "web-3", Namespace: "default", Labels: map[string]string{"app": "web"}}, Spec: corev1.PodSpec{NodeName: "node-1"}},
-		},
-	}
-
-	results := RunChecks(input)
-	found := false
-	for _, f := range results.Findings {
-		if f.CheckID == "podHARisk" {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("expected podHARisk when all 3 pods are on the same node")
-	}
-}
-
-func TestPodHARisk_Distributed(t *testing.T) {
-	input := &CheckInput{
-		Deployments: []*appsv1.Deployment{{
-			ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
-			Spec: appsv1.DeploymentSpec{
-				Replicas: ptr(int32(2)),
-				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
-				Template: corev1.PodTemplateSpec{
-					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "app:v1"}}},
-				},
-			},
-		}},
-		Pods: []*corev1.Pod{
-			{ObjectMeta: metav1.ObjectMeta{Name: "web-1", Namespace: "default", Labels: map[string]string{"app": "web"}}, Spec: corev1.PodSpec{NodeName: "node-1"}},
-			{ObjectMeta: metav1.ObjectMeta{Name: "web-2", Namespace: "default", Labels: map[string]string{"app": "web"}}, Spec: corev1.PodSpec{NodeName: "node-2"}},
-		},
-	}
-
-	results := RunChecks(input)
-	for _, f := range results.Findings {
-		if f.CheckID == "podHARisk" {
-			t.Error("podHARisk should not fire when pods are on different nodes")
-		}
-	}
-}
-
 func TestOrphanConfigMapSecret(t *testing.T) {
 	input := &CheckInput{
+		Ingresses: []*networkingv1.Ingress{},
 		Pods: []*corev1.Pod{{
 			ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},
 			Spec: corev1.PodSpec{
@@ -1232,11 +1253,13 @@ func TestOrphanConfigMapSecret(t *testing.T) {
 		},
 	}
 
-	results := RunChecks(input)
+	results := RunChecks(completeOrphanEvidence(input))
 	orphans := map[string]bool{}
+	messages := map[string]string{}
 	for _, f := range results.Findings {
 		if f.CheckID == "orphanConfigMapSecret" {
 			orphans[f.Name] = true
+			messages[f.Name] = f.Message
 		}
 	}
 
@@ -1255,16 +1278,686 @@ func TestOrphanConfigMapSecret(t *testing.T) {
 	if orphans["sa-token"] {
 		t.Error("service account token secrets should be skipped")
 	}
+	if strings.Contains(messages["orphan-config"], "any pod") || strings.Contains(messages["orphan-secret"], "any pod") {
+		t.Errorf("orphan messages should mention broadened references, got %q / %q", messages["orphan-config"], messages["orphan-secret"])
+	}
+}
+
+func TestOrphanConfigMapSecretSkipsKnownPlatformArtifacts(t *testing.T) {
+	input := &CheckInput{
+		ConfigMaps: []*corev1.ConfigMap{
+			{ObjectMeta: metav1.ObjectMeta{Name: "aws-auth", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "amazon-vpc-cni", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "extension-apiserver-authentication", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "kube-apiserver-legacy-service-account-token-tracking", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "cluster-autoscaler-status", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "cluster-kubestore", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "clustermetrics", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "gke-common-webhook-heartbeat", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "gke-common-webhook-lock", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "ingress-uid", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "konnectivity-agent-autoscaler-config", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "kube-dns-autoscaler", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "kubedns-config-images", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "pdcsi-metrics-collector-config-map", Namespace: "kube-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "config-images", Namespace: "gmp-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "scheduled-jobs", Namespace: "gmp-system"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "cluster-autoscaler-status", Namespace: "cluster-autoscaler"}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "argocd-cm",
+				Namespace: "argocd",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "argocd"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "argocd-cmd-params-cm",
+				Namespace: "argocd",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "argocd"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "argocd-dex-cm", Namespace: "argocd"}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "argocd-gpg-keys-cm",
+				Namespace: "argocd",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "argocd"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "argocd-notifications-cm",
+				Namespace: "argocd",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "argocd"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "argocd-rbac-cm",
+				Namespace: "argocd",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "argocd"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "argocd-ssh-known-hosts-cm",
+				Namespace: "argocd",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "argocd"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "argocd-tls-certs-cm",
+				Namespace: "argocd",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "argocd"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "ingress-nginx-controller",
+				Namespace: "ingress-nginx",
+				Labels:    map[string]string{"app.kubernetes.io/name": "ingress-nginx"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "argo-rollouts-config", Namespace: "argo-rollouts"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "argo-rollouts-notification-configmap", Namespace: "argo-rollouts"}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "kyverno",
+				Namespace: "kyverno",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "kyverno"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "kyverno-metrics",
+				Namespace: "kyverno",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "kyverno"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "aws-auth", Namespace: "default"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "argocd-rbac-cm", Namespace: "default"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "ingress-nginx-controller", Namespace: "default"}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "ordinary-helm-config",
+				Namespace: "default",
+				Labels:    map[string]string{"app.kubernetes.io/managed-by": "Helm"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "kube-prometheus-stack-alertmanager-overview",
+				Namespace: "monitoring",
+				Labels:    map[string]string{"grafana_dashboard": "1"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "kube-prometheus-stack-grafana-datasource",
+				Namespace: "monitoring",
+				Labels:    map[string]string{"grafana_datasource": "true"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "kube-prometheus-stack-rules",
+				Namespace: "monitoring",
+				Labels:    map[string]string{"prometheus_rule": "yes"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "fluentd-extra-config",
+				Namespace: "logging",
+				Labels:    map[string]string{"fluentd_config": "enabled"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "k8sgpt-dynamic-config",
+				Namespace: "k8sgpt",
+				Labels:    map[string]string{"k8sgpt.ai/dynamically-loaded": "true"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:        "datadog-operator-lock",
+				Namespace:   "datadog",
+				Annotations: map[string]string{"control-plane.alpha.kubernetes.io/leader": `{"holderIdentity":"datadog-operator"}`},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "argo-workflows-workflow-controller-configmap",
+				Namespace: "argo-workflows",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "argo-workflows"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "cnpg-controller-manager-config",
+				Namespace: "cloud-native-pg",
+				Labels:    map[string]string{"app.kubernetes.io/name": "cloudnative-pg"},
+			}},
+		},
+		Secrets: []*corev1.Secret{
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "sealed-secrets-keyabc",
+				Namespace: "sealed-secrets",
+				Labels:    map[string]string{"sealedsecrets.bitnami.com/sealed-secrets-key": "active"},
+			}, Type: corev1.SecretTypeTLS},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "repo-creds",
+				Namespace: "argocd",
+				Labels:    map[string]string{"argocd.argoproj.io/secret-type": "repo-creds"},
+			}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "argocd-secret",
+				Namespace: "argocd",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "argocd"},
+			}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "argocd-notifications-secret",
+				Namespace: "argocd",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "argocd"},
+			}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "cert-manager-webhook-ca",
+				Namespace: "cert-manager",
+				Labels:    map[string]string{"app.kubernetes.io/managed-by": "cert-manager-webhook"},
+			}, Type: corev1.SecretTypeTLS},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:        "cert-manager-other-webhook-ca",
+				Namespace:   "cert-manager",
+				Annotations: map[string]string{"cert-manager.io/allow-direct-injection": "true"},
+			}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "letsencrypt-account-key",
+				Namespace: "cert-manager",
+				Labels:    map[string]string{"app.kubernetes.io/managed-by": "cert-manager"},
+			}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{Name: "alertmanager", Namespace: "gmp-public"}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "webhook-tls",
+				Namespace: "gmp-system",
+				Labels: map[string]string{
+					"addonmanager.kubernetes.io/mode":  "Reconcile",
+					"components.gke.io/component-name": "managed-prometheus",
+				},
+			}, Type: corev1.SecretTypeTLS},
+			{ObjectMeta: metav1.ObjectMeta{Name: "crossplane-root-ca", Namespace: "crossplane-system"}, Type: corev1.SecretTypeTLS},
+			{ObjectMeta: metav1.ObjectMeta{Name: "cert-manager-webhook-ca", Namespace: "default"}, Type: corev1.SecretTypeTLS},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "letsencrypt-account-key",
+				Namespace: "default",
+				Labels:    map[string]string{"app.kubernetes.io/managed-by": "Helm"},
+			}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "ordinary-helm-secret",
+				Namespace: "default",
+				Labels:    map[string]string{"app.kubernetes.io/managed-by": "Helm"},
+			}, Type: corev1.SecretTypeOpaque},
+		},
+	}
+
+	orphans := findingResourceKeys(RunChecks(completeOrphanEvidence(input)).Findings, "orphanConfigMapSecret")
+	for _, key := range []string{
+		"ConfigMap/kube-system/aws-auth",
+		"ConfigMap/kube-system/amazon-vpc-cni",
+		"ConfigMap/kube-system/extension-apiserver-authentication",
+		"ConfigMap/kube-system/kube-apiserver-legacy-service-account-token-tracking",
+		"ConfigMap/kube-system/cluster-autoscaler-status",
+		"ConfigMap/kube-system/cluster-kubestore",
+		"ConfigMap/kube-system/clustermetrics",
+		"ConfigMap/kube-system/gke-common-webhook-heartbeat",
+		"ConfigMap/kube-system/gke-common-webhook-lock",
+		"ConfigMap/kube-system/ingress-uid",
+		"ConfigMap/kube-system/konnectivity-agent-autoscaler-config",
+		"ConfigMap/kube-system/kube-dns-autoscaler",
+		"ConfigMap/kube-system/kubedns-config-images",
+		"ConfigMap/kube-system/pdcsi-metrics-collector-config-map",
+		"ConfigMap/gmp-system/config-images",
+		"ConfigMap/gmp-system/scheduled-jobs",
+		"ConfigMap/cluster-autoscaler/cluster-autoscaler-status",
+		"ConfigMap/argocd/argocd-cm",
+		"ConfigMap/argocd/argocd-cmd-params-cm",
+		"ConfigMap/argocd/argocd-dex-cm",
+		"ConfigMap/argocd/argocd-gpg-keys-cm",
+		"ConfigMap/argocd/argocd-notifications-cm",
+		"ConfigMap/argocd/argocd-rbac-cm",
+		"ConfigMap/argocd/argocd-ssh-known-hosts-cm",
+		"ConfigMap/argocd/argocd-tls-certs-cm",
+		"ConfigMap/ingress-nginx/ingress-nginx-controller",
+		"ConfigMap/argo-rollouts/argo-rollouts-config",
+		"ConfigMap/argo-rollouts/argo-rollouts-notification-configmap",
+		"ConfigMap/kyverno/kyverno",
+		"ConfigMap/kyverno/kyverno-metrics",
+		"ConfigMap/monitoring/kube-prometheus-stack-alertmanager-overview",
+		"ConfigMap/monitoring/kube-prometheus-stack-grafana-datasource",
+		"ConfigMap/monitoring/kube-prometheus-stack-rules",
+		"ConfigMap/logging/fluentd-extra-config",
+		"ConfigMap/k8sgpt/k8sgpt-dynamic-config",
+		"ConfigMap/datadog/datadog-operator-lock",
+		"ConfigMap/argo-workflows/argo-workflows-workflow-controller-configmap",
+		"ConfigMap/cloud-native-pg/cnpg-controller-manager-config",
+		"Secret/sealed-secrets/sealed-secrets-keyabc",
+		"Secret/argocd/repo-creds",
+		"Secret/argocd/argocd-secret",
+		"Secret/argocd/argocd-notifications-secret",
+		"Secret/cert-manager/cert-manager-webhook-ca",
+		"Secret/cert-manager/cert-manager-other-webhook-ca",
+		"Secret/cert-manager/letsencrypt-account-key",
+		"Secret/gmp-public/alertmanager",
+		"Secret/gmp-system/webhook-tls",
+		"Secret/crossplane-system/crossplane-root-ca",
+	} {
+		if orphans[key] {
+			t.Errorf("%s should not be flagged as orphan", key)
+		}
+	}
+	for _, key := range []string{
+		"ConfigMap/default/aws-auth",
+		"ConfigMap/default/argocd-rbac-cm",
+		"ConfigMap/default/ingress-nginx-controller",
+		"ConfigMap/default/ordinary-helm-config",
+		"Secret/default/cert-manager-webhook-ca",
+		"Secret/default/letsencrypt-account-key",
+		"Secret/default/ordinary-helm-secret",
+	} {
+		if !orphans[key] {
+			t.Errorf("%s should still be flagged as orphan", key)
+		}
+	}
+}
+
+func TestOrphanConfigMapSecretKnownPlatformArtifactNegativeCases(t *testing.T) {
+	input := &CheckInput{
+		ConfigMaps: []*corev1.ConfigMap{
+			{ObjectMeta: metav1.ObjectMeta{Name: "argocd-rbac-cm", Namespace: "custom-argocd"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "kyverno-metrics", Namespace: "kyverno"}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "ingress-nginx-controller",
+				Namespace: "ingress-nginx",
+				Labels:    map[string]string{"app.kubernetes.io/name": "not-ingress-nginx"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "koala-grafana-dashboards", Namespace: "default"}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "disabled-grafana-dashboard",
+				Namespace: "default",
+				Labels:    map[string]string{"grafana_dashboard": "false"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "disabled-k8sgpt-dynamic-config",
+				Namespace: "k8sgpt",
+				Labels:    map[string]string{"k8sgpt.ai/dynamically-loaded": "false"},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:        "empty-leader-lock",
+				Namespace:   "default",
+				Annotations: map[string]string{"control-plane.alpha.kubernetes.io/leader": ""},
+			}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "argo-workflows-workflow-controller-configmap", Namespace: "argo-workflows"}},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "cnpg-controller-manager-config",
+				Namespace: "cloud-native-pg",
+				Labels:    map[string]string{"app.kubernetes.io/name": "not-cloudnative-pg"},
+			}},
+		},
+		Secrets: []*corev1.Secret{
+			{ObjectMeta: metav1.ObjectMeta{Name: "argocd-secret", Namespace: "argocd"}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "cert-manager-webhook-ca",
+				Namespace: "cert-manager",
+				Labels:    map[string]string{"app.kubernetes.io/managed-by": "Helm"},
+			}, Type: corev1.SecretTypeTLS},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "letsencrypt-account-key",
+				Namespace: "cert-manager",
+				Labels:    map[string]string{"app.kubernetes.io/managed-by": "Helm"},
+			}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{Name: "webhook-tls", Namespace: "gmp-system"}, Type: corev1.SecretTypeTLS},
+			{ObjectMeta: metav1.ObjectMeta{
+				Name:      "webhook-tls",
+				Namespace: "default",
+				Labels: map[string]string{
+					"addonmanager.kubernetes.io/mode":  "Reconcile",
+					"components.gke.io/component-name": "managed-prometheus",
+				},
+			}, Type: corev1.SecretTypeTLS},
+		},
+	}
+
+	orphans := findingResourceKeys(RunChecks(completeOrphanEvidence(input)).Findings, "orphanConfigMapSecret")
+	for _, key := range []string{
+		"ConfigMap/custom-argocd/argocd-rbac-cm",
+		"ConfigMap/kyverno/kyverno-metrics",
+		"ConfigMap/ingress-nginx/ingress-nginx-controller",
+		"ConfigMap/default/koala-grafana-dashboards",
+		"ConfigMap/default/disabled-grafana-dashboard",
+		"ConfigMap/k8sgpt/disabled-k8sgpt-dynamic-config",
+		"ConfigMap/default/empty-leader-lock",
+		"ConfigMap/argo-workflows/argo-workflows-workflow-controller-configmap",
+		"ConfigMap/cloud-native-pg/cnpg-controller-manager-config",
+		"Secret/argocd/argocd-secret",
+		"Secret/cert-manager/cert-manager-webhook-ca",
+		"Secret/cert-manager/letsencrypt-account-key",
+		"Secret/gmp-system/webhook-tls",
+		"Secret/default/webhook-tls",
+	} {
+		if !orphans[key] {
+			t.Errorf("%s should still be flagged as orphan", key)
+		}
+	}
+}
+
+func TestOrphanConfigMapSecretPrecision(t *testing.T) {
+	controller := true
+	ownerRefs := []metav1.OwnerReference{{APIVersion: "example.io/v1", Kind: "Widget", Name: "owner", Controller: &controller}}
+	replicas := int32(0)
+
+	input := &CheckInput{
+		Deployments: []*appsv1.Deployment{{
+			ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &replicas,
+				Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:  "app",
+						Image: "app:v1",
+						EnvFrom: []corev1.EnvFromSource{{
+							ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "deploy-env"}},
+						}, {
+							SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "deploy-secret"}},
+						}},
+					}},
+				}},
+			},
+		}},
+		StatefulSets: []*appsv1.StatefulSet{{
+			ObjectMeta: metav1.ObjectMeta{Name: "stateful", Namespace: "default"},
+			Spec: appsv1.StatefulSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "app:v1"}},
+				Volumes: []corev1.Volume{{
+					Name:         "config",
+					VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "stateful-volume"}}},
+				}},
+			}}},
+		}},
+		DaemonSets: []*appsv1.DaemonSet{{
+			ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"},
+			Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "agent", Image: "agent:v1"}},
+				Volumes: []corev1.Volume{{
+					Name: "projected",
+					VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{
+						ConfigMap: &corev1.ConfigMapProjection{LocalObjectReference: corev1.LocalObjectReference{Name: "daemon-projected"}},
+					}, {
+						Secret: &corev1.SecretProjection{LocalObjectReference: corev1.LocalObjectReference{Name: "daemon-projected-secret"}},
+					}}}},
+				}},
+			}}},
+		}},
+		Jobs: []*batchv1.Job{{
+			ObjectMeta: metav1.ObjectMeta{Name: "batch", Namespace: "default"},
+			Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  "job",
+					Image: "job:v1",
+					Env: []corev1.EnvVar{{
+						Name: "JOB_CFG",
+						ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "job-config"},
+						}},
+					}},
+				}},
+			}}},
+		}},
+		CronJobs: []*batchv1.CronJob{{
+			ObjectMeta: metav1.ObjectMeta{Name: "cron", Namespace: "default"},
+			Spec: batchv1.CronJobSpec{JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "cron", Image: "cron:v1"}},
+				Volumes: []corev1.Volume{{
+					Name: "csi",
+					VolumeSource: corev1.VolumeSource{CSI: &corev1.CSIVolumeSource{
+						Driver:               "secrets-store.csi.k8s.io",
+						NodePublishSecretRef: &corev1.LocalObjectReference{Name: "csi-secret"},
+					}},
+				}},
+			}}}}},
+		}},
+		ConfigMaps: []*corev1.ConfigMap{
+			{ObjectMeta: metav1.ObjectMeta{Name: "deploy-env", Namespace: "default"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "stateful-volume", Namespace: "default"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "daemon-projected", Namespace: "default"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "job-config", Namespace: "default"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "owned-config", Namespace: "default", OwnerReferences: ownerRefs}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "actual-orphan-config", Namespace: "default"}},
+		},
+		Secrets: []*corev1.Secret{
+			{ObjectMeta: metav1.ObjectMeta{Name: "deploy-secret", Namespace: "default"}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{Name: "daemon-projected-secret", Namespace: "default"}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{Name: "csi-secret", Namespace: "default"}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{Name: "owned-secret", Namespace: "default", OwnerReferences: ownerRefs}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{Name: "actual-orphan-secret", Namespace: "default"}, Type: corev1.SecretTypeOpaque},
+		},
+	}
+
+	orphans := findingNames(RunChecks(completeOrphanEvidence(input)).Findings, "orphanConfigMapSecret")
+	if !orphans["actual-orphan-config"] || !orphans["actual-orphan-secret"] {
+		t.Fatalf("expected only explicit orphans, got %+v", orphans)
+	}
+	for _, name := range []string{
+		"deploy-env", "deploy-secret", "stateful-volume", "daemon-projected",
+		"daemon-projected-secret", "job-config", "csi-secret", "owned-config", "owned-secret",
+	} {
+		if orphans[name] {
+			t.Errorf("%s should not be flagged as orphan", name)
+		}
+	}
+}
+
+func TestOrphanConfigMapSecretTerminalJobsDoNotSuppressFindings(t *testing.T) {
+	input := &CheckInput{
+		Jobs: []*batchv1.Job{{
+			ObjectMeta: metav1.ObjectMeta{Name: "finished", Namespace: "default"},
+			Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  "job",
+					Image: "job:v1",
+					Env: []corev1.EnvVar{{
+						Name: "JOB_CFG",
+						ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "finished-job-config"},
+						}},
+					}, {
+						Name: "JOB_SECRET",
+						ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "finished-job-secret"},
+						}},
+					}},
+				}},
+			}}},
+			Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+				Type:   batchv1.JobComplete,
+				Status: corev1.ConditionTrue,
+			}}},
+		}},
+		Pods: []*corev1.Pod{{
+			ObjectMeta: metav1.ObjectMeta{Name: "finished-pod", Namespace: "default"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  "job",
+					Image: "job:v1",
+					Env: []corev1.EnvVar{{
+						Name: "JOB_CFG",
+						ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "finished-job-config"},
+						}},
+					}, {
+						Name: "JOB_SECRET",
+						ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "finished-job-secret"},
+						}},
+					}},
+				}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+		}},
+		ConfigMaps: []*corev1.ConfigMap{
+			{ObjectMeta: metav1.ObjectMeta{Name: "finished-job-config", Namespace: "default"}},
+		},
+		Secrets: []*corev1.Secret{
+			{ObjectMeta: metav1.ObjectMeta{Name: "finished-job-secret", Namespace: "default"}, Type: corev1.SecretTypeOpaque},
+		},
+	}
+
+	orphans := findingNames(RunChecks(completeOrphanEvidence(input)).Findings, "orphanConfigMapSecret")
+	if !orphans["finished-job-config"] || !orphans["finished-job-secret"] {
+		t.Fatalf("terminal Job references should not suppress orphan findings, got %+v", orphans)
+	}
+}
+
+func TestOrphanConfigMapSecretServiceAccountImagePullSecrets(t *testing.T) {
+	input := &CheckInput{
+		Pods: []*corev1.Pod{{
+			ObjectMeta: metav1.ObjectMeta{Name: "implicit-default", Namespace: "default"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "app:v1"}},
+			},
+		}, {
+			ObjectMeta: metav1.ObjectMeta{Name: "explicit-builder", Namespace: "default"},
+			Spec: corev1.PodSpec{
+				ServiceAccountName: "builder",
+				Containers:         []corev1.Container{{Name: "app", Image: "app:v1"}},
+			},
+		}, {
+			ObjectMeta: metav1.ObjectMeta{Name: "direct-override", Namespace: "default"},
+			Spec: corev1.PodSpec{
+				ServiceAccountName: "override",
+				ImagePullSecrets:   []corev1.LocalObjectReference{{Name: "direct-pull-secret"}},
+				Containers:         []corev1.Container{{Name: "app", Image: "app:v1"}},
+			},
+		}},
+		ServiceAccounts: []*corev1.ServiceAccount{{
+			ObjectMeta:       metav1.ObjectMeta{Name: "default", Namespace: "default"},
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: "default-pull-secret"}},
+		}, {
+			ObjectMeta:       metav1.ObjectMeta{Name: "builder", Namespace: "default"},
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: "builder-pull-secret"}},
+		}, {
+			ObjectMeta:       metav1.ObjectMeta{Name: "override", Namespace: "default"},
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: "overridden-sa-pull-secret"}},
+		}},
+		Secrets: []*corev1.Secret{
+			{ObjectMeta: metav1.ObjectMeta{Name: "default-pull-secret", Namespace: "default"}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{Name: "builder-pull-secret", Namespace: "default"}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{Name: "direct-pull-secret", Namespace: "default"}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{Name: "overridden-sa-pull-secret", Namespace: "default"}, Type: corev1.SecretTypeOpaque},
+		},
+	}
+
+	orphans := findingNames(RunChecks(completeOrphanEvidence(input)).Findings, "orphanConfigMapSecret")
+	for _, name := range []string{"default-pull-secret", "builder-pull-secret", "direct-pull-secret"} {
+		if orphans[name] {
+			t.Errorf("%s should be counted as used", name)
+		}
+	}
+	if !orphans["overridden-sa-pull-secret"] {
+		t.Fatalf("SA imagePullSecret should not count as used when the pod specifies direct imagePullSecrets, got %+v", orphans)
+	}
+}
+
+func TestOrphanConfigMapSecretEphemeralContainerRefs(t *testing.T) {
+	input := &CheckInput{
+		Pods: []*corev1.Pod{{
+			ObjectMeta: metav1.ObjectMeta{Name: "debugged", Namespace: "default"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "app:v1"}},
+				EphemeralContainers: []corev1.EphemeralContainer{{
+					EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+						Name:  "debugger",
+						Image: "debug:v1",
+						Env: []corev1.EnvVar{{
+							Name: "DEBUG_CONFIG",
+							ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{Name: "debug-config"},
+							}},
+						}},
+						EnvFrom: []corev1.EnvFromSource{{
+							SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "debug-secret"}},
+						}},
+					},
+				}},
+			},
+		}},
+		ConfigMaps: []*corev1.ConfigMap{
+			{ObjectMeta: metav1.ObjectMeta{Name: "debug-config", Namespace: "default"}},
+		},
+		Secrets: []*corev1.Secret{
+			{ObjectMeta: metav1.ObjectMeta{Name: "debug-secret", Namespace: "default"}, Type: corev1.SecretTypeOpaque},
+		},
+	}
+
+	orphans := findingNames(RunChecks(completeOrphanEvidence(input)).Findings, "orphanConfigMapSecret")
+	if orphans["debug-config"] || orphans["debug-secret"] {
+		t.Fatalf("ephemeral container refs should be counted as used, got %+v", orphans)
+	}
+}
+
+func TestOrphanConfigMapSecretAdditionalRefs(t *testing.T) {
+	input := &CheckInput{
+		ConfigObjectRefs: []ConfigObjectRef{
+			{Kind: "ConfigMap", Namespace: "default", Name: "crd-config"},
+			{Kind: "Secret", Namespace: "default", Name: "crd-secret"},
+			{Kind: "Service", Namespace: "default", Name: "ignored"},
+			{Kind: "Secret", Namespace: "", Name: "ignored-no-namespace"},
+		},
+		ConfigMaps: []*corev1.ConfigMap{
+			{ObjectMeta: metav1.ObjectMeta{Name: "crd-config", Namespace: "default"}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "actual-orphan-config", Namespace: "default"}},
+		},
+		Secrets: []*corev1.Secret{
+			{ObjectMeta: metav1.ObjectMeta{Name: "crd-secret", Namespace: "default"}, Type: corev1.SecretTypeOpaque},
+			{ObjectMeta: metav1.ObjectMeta{Name: "actual-orphan-secret", Namespace: "default"}, Type: corev1.SecretTypeOpaque},
+		},
+	}
+
+	orphans := findingNames(RunChecks(completeOrphanEvidence(input)).Findings, "orphanConfigMapSecret")
+	if orphans["crd-config"] || orphans["crd-secret"] {
+		t.Fatalf("additional refs should suppress orphan findings, got %+v", orphans)
+	}
+	if !orphans["actual-orphan-config"] || !orphans["actual-orphan-secret"] {
+		t.Fatalf("unreferenced resources should still be flagged, got %+v", orphans)
+	}
+}
+
+func TestOrphanConfigMapSecretCertManagerCertificateMetadata(t *testing.T) {
+	input := &CheckInput{
+		Secrets: []*corev1.Secret{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "api-tls-from-annotation",
+					Namespace: "app",
+					Annotations: map[string]string{
+						"cert-manager.io/certificate-name": "api-tls",
+						"cert-manager.io/issuer-name":      "letsencrypt",
+					},
+					Labels: map[string]string{
+						"controller.cert-manager.io/fao": "true",
+					},
+				},
+				Type: corev1.SecretTypeTLS,
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "api-tls-from-label",
+					Namespace: "app",
+					Labels: map[string]string{
+						"cert-manager.io/certificate-name": "api-tls-label",
+					},
+				},
+				Type: corev1.SecretTypeTLS,
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "unrelated-tls",
+					Namespace: "app",
+					Annotations: map[string]string{
+						"cert-manager.io/issuer-name": "letsencrypt",
+					},
+				},
+				Type: corev1.SecretTypeTLS,
+			},
+		},
+	}
+
+	orphans := findingResourceKeys(RunChecks(completeOrphanEvidence(input)).Findings, "orphanConfigMapSecret")
+	for _, key := range []string{
+		"Secret/app/api-tls-from-annotation",
+		"Secret/app/api-tls-from-label",
+	} {
+		if orphans[key] {
+			t.Errorf("%s should not be flagged as orphan", key)
+		}
+	}
+	if !orphans["Secret/app/unrelated-tls"] {
+		t.Errorf("Secret/app/unrelated-tls should still be flagged as orphan")
+	}
 }
 
 func TestDeprecatedAPIVersion(t *testing.T) {
 	input := &CheckInput{
 		ClusterVersion: "1.30",
 		ServedAPIs: []string{
-			"apps/v1",                    // stable — should not flag
-			"batch/v1beta1",              // deprecated, removed in 1.25 — should flag
-			"policy/v1beta1",             // deprecated, removed in 1.25 — should flag
-			"networking.k8s.io/v1",       // stable — should not flag
+			"apps/v1",              // stable — should not flag
+			"batch/v1beta1",        // deprecated, removed in 1.25 — should flag
+			"policy/v1beta1",       // deprecated, removed in 1.25 — should flag
+			"networking.k8s.io/v1", // stable — should not flag
 		},
 	}
 
@@ -1275,9 +1968,18 @@ func TestDeprecatedAPIVersion(t *testing.T) {
 			deprecated++
 		}
 	}
-	// batch/v1beta1 has CronJob, policy/v1beta1 has PDB + PSP = at least 3 entries
-	if deprecated < 3 {
-		t.Errorf("expected at least 3 deprecatedAPIVersion findings, got %d", deprecated)
+	// Findings merge per served group/version now (evaluated unit == failure
+	// unit): batch/v1beta1 + policy/v1beta1 = 2 merged findings; policy's
+	// message carries both PDB and PSP deprecations.
+	if deprecated != 2 {
+		t.Errorf("expected 2 merged deprecatedAPIVersion findings, got %d", deprecated)
+	}
+	for _, f := range results.Findings {
+		if f.CheckID == "deprecatedAPIVersion" && f.Name == "policy/v1beta1" {
+			if !strings.Contains(f.Message, "PodDisruptionBudget") || !strings.Contains(f.Message, "PodSecurityPolicy") {
+				t.Errorf("policy/v1beta1 merged message missing a kind: %q", f.Message)
+			}
+		}
 	}
 }
 
@@ -1294,45 +1996,16 @@ func TestDeprecatedAPIVersion_NoServedAPIs(t *testing.T) {
 	}
 }
 
-func TestResourceUtilization(t *testing.T) {
-	input := &CheckInput{
-		PodMetrics: []PodMetricsInput{
-			{Namespace: "default", Name: "waste-pod", CPUUsage: 5, CPURequest: 1000, MemoryUsage: 10 * 1024 * 1024, MemoryRequest: 512 * 1024 * 1024},       // 0.5% CPU, 2% memory — waste
-			{Namespace: "default", Name: "hot-pod", CPUUsage: 950, CPURequest: 1000, MemoryUsage: 480 * 1024 * 1024, MemoryRequest: 512 * 1024 * 1024},        // 95% CPU, 94% memory — risk
-			{Namespace: "default", Name: "normal-pod", CPUUsage: 500, CPURequest: 1000, MemoryUsage: 256 * 1024 * 1024, MemoryRequest: 512 * 1024 * 1024},     // 50% — fine
-			{Namespace: "default", Name: "no-request-pod", CPUUsage: 100, CPURequest: 0, MemoryUsage: 128 * 1024 * 1024, MemoryRequest: 0},                     // no requests — skip
-		},
-	}
-
-	results := RunChecks(input)
-	pods := map[string]int{} // pod name → finding count
-	for _, f := range results.Findings {
-		if f.CheckID == "resourceUtilization" {
-			pods[f.Name]++
+func TestDeprecatedAPIVersionReportsSchedulingV1Alpha2BeforeRemoval(t *testing.T) {
+	input := &CheckInput{ClusterVersion: "v1.36.4", ServedAPIs: []string{"scheduling.k8s.io/v1alpha2"}}
+	found := false
+	for _, finding := range RunChecks(input).Findings {
+		if finding.CheckID == "deprecatedAPIVersion" {
+			found = true
 		}
 	}
-
-	if pods["waste-pod"] < 1 {
-		t.Error("expected utilization finding for waste-pod (under-utilized)")
-	}
-	if pods["hot-pod"] < 1 {
-		t.Error("expected utilization finding for hot-pod (over-utilized)")
-	}
-	if pods["normal-pod"] > 0 {
-		t.Error("normal-pod at 50% utilization should not be flagged")
-	}
-	if pods["no-request-pod"] > 0 {
-		t.Error("pod with no requests should not be flagged")
-	}
-}
-
-func TestResourceUtilization_Empty(t *testing.T) {
-	input := &CheckInput{}
-	results := RunChecks(input)
-	for _, f := range results.Findings {
-		if f.CheckID == "resourceUtilization" {
-			t.Error("resourceUtilization should not fire when no metrics provided")
-		}
+	if !found {
+		t.Fatal("Kubernetes 1.36 did not report scheduling.k8s.io/v1alpha2 before its 1.37 removal")
 	}
 }
 
@@ -1437,6 +2110,55 @@ func TestSecretInConfigMap(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "db-config", Namespace: "default"},
 				Data:       map[string]string{"db_host": "postgres", "db_password": "hunter2"},
 			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "short-client-secret", Namespace: "default"},
+				Data:       map[string]string{"oauth_client_secret": "hunter2"},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "literal-secret", Namespace: "default"},
+				Data:       map[string]string{"secret": "hunter2"},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "auth-config", Namespace: "default"},
+				Data: map[string]string{
+					"auth_mode":                      "oidc",
+					"google_application_credentials": "/var/run/secrets/google/key.json",
+					"credential_url":                 "https://metadata.google.internal/token",
+					"token_file":                     "/var/run/secrets/token",
+					"token_ttl":                      "3600",
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "secret-reference-config", Namespace: "default"},
+				Data: map[string]string{
+					"client_secret_name": "oauth-client-credentials",
+					"secret_name":        "db-secret",
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "embedded-url-credentials", Namespace: "default"},
+				Data:       map[string]string{"credentials": `{"token_uri":"https://oauth2.googleapis.com/token","private_key_id":"abc123DEF456ghi789JKL"}`},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "connection-url-credentials", Namespace: "default"},
+				Data:       map[string]string{"db_credentials": "postgres://app:s3cretpass@db:5432/app"},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "password-only-url-credentials", Namespace: "default"},
+				Data:       map[string]string{"cache_credentials": "redis://:s3cretpass@redis:6379/0"},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "token-config", Namespace: "default"},
+				Data:       map[string]string{"api_token": "qH7mN2pR9sT4uV6wX8yZ0aB1cD3eF5gH"},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "bearer-config", Namespace: "default"},
+				Data:       map[string]string{"authorization_header": "Bearer qH7mN2pR9sT4uV6wX8yZ0aB1cD3eF5gH"},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "basic-config", Namespace: "default"},
+				Data:       map[string]string{"authorization_header": "Basic c3VwZXJzZWNyZXQ6cGFzc3dvcmQxMjM="},
+			},
 		},
 	}
 
@@ -1451,8 +2173,38 @@ func TestSecretInConfigMap(t *testing.T) {
 	if !found["db-config"] {
 		t.Error("expected secretInConfigMap finding for db-config (has db_password key)")
 	}
+	if !found["short-client-secret"] {
+		t.Error("expected secretInConfigMap finding for short client secret key")
+	}
+	if !found["literal-secret"] {
+		t.Error("expected secretInConfigMap finding for literal secret key")
+	}
 	if found["app-config"] {
 		t.Error("app-config should not be flagged (no sensitive keys)")
+	}
+	if found["auth-config"] {
+		t.Error("auth-config should not be flagged for low-information auth/token settings")
+	}
+	if found["secret-reference-config"] {
+		t.Error("secret-reference-config should not be flagged for Secret name references")
+	}
+	if !found["embedded-url-credentials"] {
+		t.Error("expected secretInConfigMap finding for credential-looking value that embeds a URL")
+	}
+	if !found["connection-url-credentials"] {
+		t.Error("expected secretInConfigMap finding for credential URL with embedded userinfo")
+	}
+	if !found["password-only-url-credentials"] {
+		t.Error("expected secretInConfigMap finding for credential URL with password-only userinfo")
+	}
+	if !found["token-config"] {
+		t.Error("expected secretInConfigMap finding for token-config (token-looking value)")
+	}
+	if !found["bearer-config"] {
+		t.Error("expected secretInConfigMap finding for bearer-config (bearer token-looking value)")
+	}
+	if !found["basic-config"] {
+		t.Error("expected secretInConfigMap finding for basic-config (basic auth value)")
 	}
 }
 
@@ -1566,7 +2318,7 @@ func TestCheckStuckTerminating_AllKinds(t *testing.T) {
 	// (Selector, container specs) than this test cares about. The audit
 	// dispatch is itself covered by RunChecks tests; this one targets
 	// only the stuckTerminating loop completeness.
-	findings := checkStuckTerminating(input)
+	findings := checkStuckTerminating(newEvalTracker(), input)
 	byKindAndName := map[string]string{} // "Kind/name" → severity
 	for _, f := range findings {
 		if f.CheckID != "stuckTerminating" {
@@ -1576,17 +2328,17 @@ func TestCheckStuckTerminating_AllKinds(t *testing.T) {
 	}
 
 	wantPairs := map[string]string{
-		"Pod/pod-x":                         SeverityDanger,
-		"Deployment/deploy-x":               SeverityDanger,
-		"StatefulSet/sts-x":                 SeverityDanger,
-		"DaemonSet/ds-x":                    SeverityDanger,
-		"Service/svc-x":                     SeverityDanger,
-		"Ingress/ing-x":                     SeverityDanger,
-		"HorizontalPodAutoscaler/hpa-x":     SeverityDanger,
-		"PodDisruptionBudget/pdb-x":         SeverityDanger,
-		"ConfigMap/cm-x":                    SeverityDanger,
-		"Secret/secret-x":                   SeverityDanger,
-		"ServiceAccount/sa-x":               SeverityDanger,
+		"Pod/pod-x":                     SeverityDanger,
+		"Deployment/deploy-x":           SeverityDanger,
+		"StatefulSet/sts-x":             SeverityDanger,
+		"DaemonSet/ds-x":                SeverityDanger,
+		"Service/svc-x":                 SeverityDanger,
+		"Ingress/ing-x":                 SeverityDanger,
+		"HorizontalPodAutoscaler/hpa-x": SeverityDanger,
+		"PodDisruptionBudget/pdb-x":     SeverityDanger,
+		"ConfigMap/cm-x":                SeverityDanger,
+		"Secret/secret-x":               SeverityDanger,
+		"ServiceAccount/sa-x":           SeverityDanger,
 	}
 	for k, want := range wantPairs {
 		got, ok := byKindAndName[k]
@@ -1597,5 +2349,195 @@ func TestCheckStuckTerminating_AllKinds(t *testing.T) {
 		if got != want {
 			t.Errorf("%s: severity = %q, want %q", k, got, want)
 		}
+	}
+}
+
+// TestCheckCrossplaneStuck pins the severity ramp and condition-priority
+// rules for stuck MR/XR/Claim resources. The 5min/30min thresholds are
+// shared with stuckTerminating; if either is retuned, retune both so the
+// audit page reports consistent severity across stuck-resource categories.
+func TestCheckCrossplaneStuck(t *testing.T) {
+	now := time.Now()
+	mr := func(name string, ttype, treason, tmessage string, transitionAgo time.Duration, paused bool) *unstructured.Unstructured {
+		annotations := map[string]interface{}{}
+		if paused {
+			annotations["crossplane.io/paused"] = "true"
+		}
+		u := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "kubernetes.crossplane.io/v1alpha1",
+			"kind":       "Object",
+			"metadata": map[string]interface{}{
+				"name":        name,
+				"annotations": annotations,
+			},
+			"spec": map[string]interface{}{
+				"providerConfigRef": map[string]interface{}{"name": "default"},
+			},
+			"status": map[string]interface{}{
+				"conditions": []interface{}{
+					map[string]interface{}{
+						"type":               ttype,
+						"status":             "False",
+						"reason":             treason,
+						"message":            tmessage,
+						"lastTransitionTime": now.Add(-transitionAgo).Format(time.RFC3339),
+					},
+				},
+			},
+		}}
+		return u
+	}
+
+	healthy := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "kubernetes.crossplane.io/v1alpha1",
+		"kind":       "Object",
+		"metadata":   map[string]interface{}{"name": "healthy"},
+		"spec":       map[string]interface{}{"providerConfigRef": map[string]interface{}{"name": "default"}},
+		"status": map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{"type": "Ready", "status": "True", "lastTransitionTime": now.Format(time.RFC3339)},
+				map[string]interface{}{"type": "Synced", "status": "True", "lastTransitionTime": now.Format(time.RFC3339)},
+			},
+		},
+	}}
+
+	input := &CheckInput{
+		ManagedResources: []*unstructured.Unstructured{
+			healthy,
+			mr("under-threshold", "Ready", "Pending", "still converging", 4*time.Minute+59*time.Second, false),
+			mr("warn-ready", "Ready", "ProviderConfigNotReady", "auth error from cloud", 6*time.Minute, false),
+			mr("warn-synced", "Synced", "ReconcileError", "schema rejected by provider", 6*time.Minute, false),
+			mr("danger", "Ready", "BackendError", "quota exceeded", 45*time.Minute, false),
+			mr("paused-ignored", "Ready", "ProviderConfigNotReady", "auth error", 45*time.Minute, true),
+		},
+	}
+
+	results := RunChecks(input)
+	bySeverity := map[string]map[string]Finding{}
+	for _, f := range results.Findings {
+		if f.CheckID != "crossplaneStuck" {
+			continue
+		}
+		if bySeverity[f.Severity] == nil {
+			bySeverity[f.Severity] = map[string]Finding{}
+		}
+		if f.Group != "kubernetes.crossplane.io" {
+			t.Errorf("Crossplane finding lost its group: %+v", f)
+		}
+		bySeverity[f.Severity][f.Name] = f
+	}
+
+	if _, found := bySeverity["warning"]["healthy"]; found {
+		t.Error("healthy MR should not be flagged")
+	}
+	if _, found := bySeverity["warning"]["under-threshold"]; found {
+		t.Error("MR within 5min window should not be flagged")
+	}
+	if _, found := bySeverity["warning"]["paused-ignored"]; found {
+		t.Error("paused MR should not be flagged regardless of age — operator intent")
+	}
+	if _, found := bySeverity["danger"]["paused-ignored"]; found {
+		t.Error("paused MR should not be flagged regardless of age — operator intent")
+	}
+
+	warnReady, ok := bySeverity["warning"]["warn-ready"]
+	if !ok {
+		t.Fatal("expected warning-tier finding for 6min-old Ready=False MR")
+	}
+	if !strings.Contains(warnReady.Message, "Ready=False") {
+		t.Errorf("expected message to name Ready=False; got %q", warnReady.Message)
+	}
+	if !strings.Contains(warnReady.Message, "auth error from cloud") {
+		t.Errorf("expected message to include the upstream cloud error; got %q", warnReady.Message)
+	}
+
+	warnSynced, ok := bySeverity["warning"]["warn-synced"]
+	if !ok {
+		t.Fatal("expected warning-tier finding for 6min-old Synced=False MR")
+	}
+	if !strings.Contains(warnSynced.Message, "Synced=False") {
+		t.Errorf("expected message to name Synced=False; got %q", warnSynced.Message)
+	}
+
+	danger, ok := bySeverity["danger"]["danger"]
+	if !ok {
+		t.Fatal("expected danger-tier finding for 45min-old MR")
+	}
+	if !strings.Contains(danger.Message, "quota exceeded") {
+		t.Errorf("expected danger message to include cloud error; got %q", danger.Message)
+	}
+}
+
+// TestCheckCrossplaneStuck_SyncedPriority verifies Synced=False takes
+// precedence over Ready=False when both are present. Synced=False usually
+// indicates a configuration error (the actionable thing); Ready=False is
+// often a downstream consequence. Operators fixing Synced first resolves
+// both — surfacing Synced=False in the finding tells them where to look.
+func TestCheckCrossplaneStuck_SyncedPriority(t *testing.T) {
+	now := time.Now()
+	bothFalse := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "kubernetes.crossplane.io/v1alpha1",
+		"kind":       "Object",
+		"metadata":   map[string]interface{}{"name": "both"},
+		"spec":       map[string]interface{}{"providerConfigRef": map[string]interface{}{"name": "default"}},
+		"status": map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{"type": "Ready", "status": "False", "reason": "ProviderConfigNotReady", "message": "ready msg", "lastTransitionTime": now.Add(-10 * time.Minute).Format(time.RFC3339)},
+				map[string]interface{}{"type": "Synced", "status": "False", "reason": "ReconcileError", "message": "synced msg", "lastTransitionTime": now.Add(-10 * time.Minute).Format(time.RFC3339)},
+			},
+		},
+	}}
+	input := &CheckInput{ManagedResources: []*unstructured.Unstructured{bothFalse}}
+	results := RunChecks(input)
+	var found *Finding
+	for i := range results.Findings {
+		if results.Findings[i].CheckID == "crossplaneStuck" && results.Findings[i].Name == "both" {
+			found = &results.Findings[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("expected a crossplaneStuck finding")
+	}
+	if !strings.Contains(found.Message, "Synced=False") {
+		t.Errorf("expected Synced=False to win over Ready=False; got message %q", found.Message)
+	}
+	if !strings.Contains(found.Message, "synced msg") {
+		t.Errorf("expected Synced message body in finding; got %q", found.Message)
+	}
+}
+
+// TestCheckCrossplaneStuck_Composites checks that XRs/Claims are scanned too.
+func TestCheckCrossplaneStuck_Composites(t *testing.T) {
+	now := time.Now()
+	xr := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "demo.example.io/v1alpha1",
+		"kind":       "AppBundle",
+		"metadata":   map[string]interface{}{"name": "broken-xr"},
+		"spec": map[string]interface{}{
+			"crossplane": map[string]interface{}{
+				"resourceRefs": []interface{}{},
+			},
+		},
+		"status": map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{"type": "Synced", "status": "False", "reason": "ComposeResources", "message": "composition error", "lastTransitionTime": now.Add(-10 * time.Minute).Format(time.RFC3339)},
+			},
+		},
+	}}
+	input := &CheckInput{CompositeResources: []*unstructured.Unstructured{xr}}
+	results := RunChecks(input)
+	var found *Finding
+	for i := range results.Findings {
+		if results.Findings[i].CheckID == "crossplaneStuck" && results.Findings[i].Name == "broken-xr" {
+			found = &results.Findings[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("expected crossplaneStuck finding for composite resource")
+	}
+	if found.Kind != "AppBundle" {
+		t.Errorf("expected Kind=AppBundle, got %q", found.Kind)
 	}
 }

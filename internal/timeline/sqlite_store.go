@@ -4,18 +4,30 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite" // Pure Go SQLite driver
 
 	pkgtimeline "github.com/skyhook-io/radar/pkg/timeline"
 )
+
+// sqliteTimeLayout is the storage format for timestamp columns compared
+// lexically by ORDER BY and range filters. RFC3339Nano is unsuitable: it
+// strips trailing fraction zeros, and '.' sorts before 'Z', so a
+// second-aligned stamp ("...T00:00:00Z") sorts lexically AFTER a sub-second
+// one in the same second ("...T00:00:00.5Z"). A fixed-width 9-digit fraction
+// on UTC ('Z') makes lexical order match chronological order. Reads still
+// parse with RFC3339Nano, which accepts any fraction width — required for
+// rows written before normalizeTimestamps ran.
+const sqliteTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
 // SQLiteStore is a persistent implementation of EventStore using SQLite.
 // Suitable for local development with persistence and in-cluster use with PVC.
@@ -32,9 +44,24 @@ type SQLiteStore struct {
 
 	cleanupMu     sync.RWMutex
 	retentionAge  time.Duration
+	maxStorage    int64
 	lastCleanupAt time.Time
 	lastCleanupN  int64
 	lastCleanupEr string
+	// evictedRows is process-lifetime: whether any retention/size pruning has
+	// deleted rows since this store opened. Cursor-eviction detection needs a
+	// sticky flag, not just the last sweep's count — an "older" cursor issued
+	// before a prune must read as a gap, not a clean end of history. Restart
+	// amnesia is fine: the activity epoch changes with the process, so stale
+	// cursors already get an epoch-changed gap.
+	evictedRows bool
+
+	// nextSeq is a process-lifetime monotonic arrival counter, seeded from
+	// MAX(seq) at open. It survives retention emptying the table, so a new
+	// insert's seq always exceeds any previously issued seq while the store
+	// lives — an in-flight delta cursor can't be silently overtaken by a
+	// rewound seq.
+	nextSeq atomic.Int64
 }
 
 // NewSQLiteStore creates a new SQLite-backed event store.
@@ -90,7 +117,28 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	// behave like a fresh store, not a fatal error.
 	store.hydrateSeenResources()
 
+	// Seed the monotonic seq counter from the persisted high-water mark so
+	// arrival numbers continue above the last issued value across restarts.
+	if err := store.seedSeq(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to seed seq counter: %w", err)
+	}
+
 	return store, nil
+}
+
+// seedSeq initializes nextSeq to the current MAX(seq). A failure must fail the
+// open: seeding at 0 would issue seqs below rows already in the table, and a
+// delta client's cursor (the old high-water mark) would then read every new
+// event as already-seen — a live-looking timeline that only refreshes on the
+// periodic full resync.
+func (s *SQLiteStore) seedSeq() error {
+	var maxSeq int64
+	if err := s.db.QueryRow("SELECT COALESCE(MAX(seq), 0) FROM events").Scan(&maxSeq); err != nil {
+		return err
+	}
+	s.nextSeq.Store(maxSeq)
+	return nil
 }
 
 // initSchema creates the database tables if they don't exist
@@ -111,10 +159,16 @@ func (s *SQLiteStore) initSchema() error {
 		health_state TEXT,
 		owner_kind TEXT,
 		owner_name TEXT,
+		owner_api_version TEXT,
+		owner_uid TEXT,
+		owner_evidence TEXT,
 		labels_json TEXT,
 		count INTEGER DEFAULT 0,
 		correlation_id TEXT,
-		created_at TEXT DEFAULT (datetime('now'))
+		created_at TEXT DEFAULT (datetime('now')),
+		cluster_context TEXT NOT NULL DEFAULT '',
+		resource_created_at TEXT,
+		seq INTEGER NOT NULL DEFAULT 0
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp DESC);
@@ -143,6 +197,10 @@ func (s *SQLiteStore) initSchema() error {
 	}
 	defer rows.Close()
 	hasAPIVersion := false
+	hasClusterContext := false
+	hasResourceCreatedAt := false
+	hasSeq := false
+	hasOwnerColumn := map[string]bool{}
 	for rows.Next() {
 		var cid int
 		var name, ctype string
@@ -151,17 +209,128 @@ func (s *SQLiteStore) initSchema() error {
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
 			return err
 		}
-		if name == "api_version" {
+		switch name {
+		case "api_version":
 			hasAPIVersion = true
-			break
+		case "cluster_context":
+			hasClusterContext = true
+		case "resource_created_at":
+			hasResourceCreatedAt = true
+		case "seq":
+			hasSeq = true
+		case "owner_api_version", "owner_uid", "owner_evidence":
+			hasOwnerColumn[name] = true
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
 	}
 	if !hasAPIVersion {
 		if _, err := s.db.Exec("ALTER TABLE events ADD COLUMN api_version TEXT"); err != nil {
 			return err
 		}
 	}
+	if !hasClusterContext {
+		// Pre-existing rows keep '' — their cluster is unknowable (recorded
+		// before provenance was tracked), and context-scoped queries
+		// deliberately exclude them rather than guess.
+		if _, err := s.db.Exec("ALTER TABLE events ADD COLUMN cluster_context TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+	// NULL in these columns means unknown owner reference fields and evidence.
+	for _, column := range []string{"owner_api_version", "owner_uid", "owner_evidence"} {
+		if !hasOwnerColumn[column] {
+			if _, err := s.db.Exec("ALTER TABLE events ADD COLUMN " + column + " TEXT"); err != nil {
+				return err
+			}
+		}
+	}
+	if !hasResourceCreatedAt {
+		if _, err := s.db.Exec("ALTER TABLE events ADD COLUMN resource_created_at TEXT"); err != nil {
+			return err
+		}
+	}
+	if !hasSeq {
+		if _, err := s.db.Exec("ALTER TABLE events ADD COLUMN seq INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		// Backfill arrival numbers from rowid — insertion order, which is what
+		// seq means. New appends continue above MAX(seq).
+		if _, err := s.db.Exec("UPDATE events SET seq = rowid WHERE seq = 0"); err != nil {
+			return err
+		}
+	}
+	if err := s.normalizeTimestamps(); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_events_cluster_ts ON events(cluster_context, timestamp DESC)"); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq)"); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+// normalizeTimestamps rewrites rows whose timestamp doesn't match
+// sqliteTimeLayout. Older builds stored RFC3339Nano in the host's local zone;
+// both the zone offset and the variable fraction width break the
+// lexical-order-is-chronological invariant the layout exists for. One pass per
+// legacy row: rewritten rows match the GLOB and are skipped on later opens.
+func (s *SQLiteStore) normalizeTimestamps() error {
+	rows, err := s.db.Query(`SELECT id, timestamp FROM events WHERE timestamp NOT GLOB '????-??-??T??:??:??.?????????Z'`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type fixup struct{ id, ts string }
+	var fixups []fixup
+	unparseable := 0
+	for rows.Next() {
+		var id, ts string
+		if err := rows.Scan(&id, &ts); err != nil {
+			return err
+		}
+		t, err := time.Parse(time.RFC3339Nano, ts)
+		if err != nil {
+			unparseable++
+			continue
+		}
+		fixups = append(fixups, fixup{id: id, ts: t.UTC().Format(sqliteTimeLayout)})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if unparseable > 0 {
+		log.Printf("[timeline] %d timeline rows have unparseable timestamps; left as-is", unparseable)
+	}
+	if len(fixups) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare("UPDATE events SET timestamp = ? WHERE id = ?")
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+	for _, f := range fixups {
+		if _, err := stmt.Exec(f.ts, f.id); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	log.Printf("[timeline] normalized %d legacy timeline timestamps to fixed-width UTC", len(fixups))
 	return nil
 }
 
@@ -182,12 +351,51 @@ func (s *SQLiteStore) AppendBatch(ctx context.Context, events []TimelineEvent) e
 	}
 	defer tx.Rollback()
 
+	// A K8s Event mutates count/message/lastTimestamp in place on the same uid;
+	// the id is the uid, so a bump re-arrives as a conflict. Upsert those mutable
+	// fields for k8s_event rows — mirroring MemoryStore.appendLocked — so the row
+	// reflects the latest revision instead of dropping the bump. The WHERE gates
+	// the update to k8s_event conflicts whose incoming revision is not older, so
+	// an out-of-order relay can't clobber a newer row. For informer/historical
+	// ids the WHERE is false, leaving the original row untouched — the same
+	// no-op an INSERT OR IGNORE gives for a relist dupe.
+	//
+	// Enrichment (owner/labels/createdAt) upserts asymmetrically: a bump that
+	// carries it wins (fresher truth), a bump that lost it (tombstone expired,
+	// object gone from the live cache) keeps what the row already knows.
+	// seq is the arrival number, taken from the process-lifetime nextSeq counter
+	// rather than MAX(seq)+1 per insert: retention emptying the table can't then
+	// rewind seq and strand a live client's delta cursor. The upsert takes
+	// excluded.seq — the freshly issued value — so a count bump re-arrives at the
+	// cursor frontier instead of staying buried at its original arrival position,
+	// mirroring MemoryStore's vacate-and-re-append-at-head.
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT OR IGNORE INTO events (
+		INSERT INTO events (
 			id, timestamp, source, kind, api_version, namespace, name, uid, event_type,
-			reason, message, diff_json, health_state, owner_kind, owner_name,
-			labels_json, count, correlation_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			reason, message, diff_json, health_state, owner_kind, owner_name, owner_api_version, owner_uid, owner_evidence,
+			labels_json, count, correlation_id, cluster_context, resource_created_at, seq
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			timestamp = excluded.timestamp,
+			event_type = excluded.event_type,
+			reason = excluded.reason,
+			message = excluded.message,
+			health_state = excluded.health_state,
+			count = excluded.count,
+			seq = excluded.seq,
+			namespace = excluded.namespace,
+			uid = excluded.uid,
+			resource_created_at = COALESCE(excluded.resource_created_at, events.resource_created_at),
+			-- The owner tuple moves as one; OwnerReplacesOnUpsert states the rule.
+			owner_kind = CASE WHEN (excluded.owner_evidence IN ('enriched', 'unidentified') OR (COALESCE(excluded.owner_evidence, '') = '' AND COALESCE(excluded.owner_kind, '') != '')) THEN excluded.owner_kind ELSE events.owner_kind END,
+			owner_name = CASE WHEN (excluded.owner_evidence IN ('enriched', 'unidentified') OR (COALESCE(excluded.owner_evidence, '') = '' AND COALESCE(excluded.owner_kind, '') != '')) THEN excluded.owner_name ELSE events.owner_name END,
+			owner_api_version = CASE WHEN (excluded.owner_evidence IN ('enriched', 'unidentified') OR (COALESCE(excluded.owner_evidence, '') = '' AND COALESCE(excluded.owner_kind, '') != '')) THEN excluded.owner_api_version ELSE events.owner_api_version END,
+			owner_uid = CASE WHEN (excluded.owner_evidence IN ('enriched', 'unidentified') OR (COALESCE(excluded.owner_evidence, '') = '' AND COALESCE(excluded.owner_kind, '') != '')) THEN excluded.owner_uid ELSE events.owner_uid END,
+			owner_evidence = CASE WHEN (excluded.owner_evidence IN ('enriched', 'unidentified') OR (COALESCE(excluded.owner_evidence, '') = '' AND COALESCE(excluded.owner_kind, '') != '')) THEN excluded.owner_evidence ELSE events.owner_evidence END,
+			labels_json = CASE WHEN excluded.labels_json != '' THEN excluded.labels_json ELSE events.labels_json END
+		WHERE events.source = 'k8s_event'
+			AND excluded.source = 'k8s_event'
+			AND excluded.timestamp >= events.timestamp
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to prepare statement: %w", err)
@@ -196,7 +404,7 @@ func (s *SQLiteStore) AppendBatch(ctx context.Context, events []TimelineEvent) e
 
 	for _, event := range events {
 		var diffJSON, labelsJSON []byte
-		var ownerKind, ownerName string
+		var ownerKind, ownerName, ownerAPIVersion, ownerUID string
 		var err error
 
 		if event.Diff != nil {
@@ -218,11 +426,20 @@ func (s *SQLiteStore) AppendBatch(ctx context.Context, events []TimelineEvent) e
 		if event.Owner != nil {
 			ownerKind = event.Owner.Kind
 			ownerName = event.Owner.Name
+			ownerAPIVersion = event.Owner.APIVersion
+			ownerUID = event.Owner.UID
+		}
+		var resourceCreatedAt any
+		if event.CreatedAt != nil {
+			resourceCreatedAt = event.CreatedAt.UTC().Format(sqliteTimeLayout)
 		}
 
+		// Timestamps hit a TEXT column compared lexically by ORDER BY / range
+		// filters; sqliteTimeLayout (fixed-width UTC) keeps lexical order
+		// chronological.
 		_, err = stmt.ExecContext(ctx,
 			event.ID,
-			event.Timestamp.Format(time.RFC3339Nano),
+			event.Timestamp.UTC().Format(sqliteTimeLayout),
 			string(event.Source),
 			event.Kind,
 			event.APIVersion,
@@ -236,9 +453,15 @@ func (s *SQLiteStore) AppendBatch(ctx context.Context, events []TimelineEvent) e
 			string(event.HealthState),
 			ownerKind,
 			ownerName,
+			ownerAPIVersion,
+			ownerUID,
+			string(event.OwnerEvidence),
 			string(labelsJSON),
 			event.Count,
 			event.CorrelationID,
+			event.ClusterContext,
+			resourceCreatedAt,
+			s.nextSeq.Add(1),
 		)
 		if err != nil {
 			return fmt.Errorf("failed to insert event: %w", err)
@@ -253,8 +476,8 @@ func (s *SQLiteStore) Query(ctx context.Context, opts QueryOptions) ([]TimelineE
 	// Build query
 	query := strings.Builder{}
 	query.WriteString("SELECT id, timestamp, source, kind, api_version, namespace, name, uid, event_type, ")
-	query.WriteString("reason, message, diff_json, health_state, owner_kind, owner_name, ")
-	query.WriteString("labels_json, count, correlation_id FROM events WHERE 1=1")
+	query.WriteString("reason, message, diff_json, health_state, owner_kind, owner_name, owner_api_version, owner_uid, owner_evidence, ")
+	query.WriteString("labels_json, count, correlation_id, cluster_context, resource_created_at, seq FROM events WHERE 1=1")
 
 	var args []any
 
@@ -283,14 +506,44 @@ func (s *SQLiteStore) Query(ctx context.Context, opts QueryOptions) ([]TimelineE
 		query.WriteString(")")
 	}
 
+	if opts.RequireAPIVersion {
+		query.WriteString(" AND COALESCE(api_version, '') <> ''")
+	}
+	if len(opts.APIGroups) > 0 {
+		// Keep rows whose emitter did not record apiVersion: they are unknown,
+		// not evidence of a group mismatch. For known versions, extract the
+		// group in SQL so collisions cannot consume the bounded result window.
+		query.WriteString(" AND (COALESCE(api_version, '') = '' OR CASE WHEN instr(api_version, '/') > 0 THEN substr(api_version, 1, instr(api_version, '/') - 1) ELSE '' END IN (")
+		for i, group := range opts.APIGroups {
+			if i > 0 {
+				query.WriteString(",")
+			}
+			query.WriteString("?")
+			args = append(args, group)
+		}
+		query.WriteString("))")
+	}
+
+	if len(opts.Names) > 0 {
+		query.WriteString(" AND name IN (")
+		for i, name := range opts.Names {
+			if i > 0 {
+				query.WriteString(",")
+			}
+			query.WriteString("?")
+			args = append(args, name)
+		}
+		query.WriteString(")")
+	}
+
 	if !opts.Since.IsZero() {
 		query.WriteString(" AND timestamp >= ?")
-		args = append(args, opts.Since.Format(time.RFC3339Nano))
+		args = append(args, opts.Since.UTC().Format(sqliteTimeLayout))
 	}
 
 	if !opts.Until.IsZero() {
 		query.WriteString(" AND timestamp <= ?")
-		args = append(args, opts.Until.Format(time.RFC3339Nano))
+		args = append(args, opts.Until.UTC().Format(sqliteTimeLayout))
 	}
 
 	if len(opts.Sources) > 0 {
@@ -305,8 +558,53 @@ func (s *SQLiteStore) Query(ctx context.Context, opts QueryOptions) ([]TimelineE
 		query.WriteString(")")
 	}
 
-	// Order by timestamp descending
-	query.WriteString(" ORDER BY timestamp DESC")
+	if len(opts.EventTypes) > 0 {
+		query.WriteString(" AND event_type IN (")
+		for i, et := range opts.EventTypes {
+			if i > 0 {
+				query.WriteString(",")
+			}
+			query.WriteString("?")
+			args = append(args, string(et))
+		}
+		query.WriteString(")")
+	}
+
+	// Filter deletes in SQL (before ORDER/LIMIT) so hiding them can't under-fill
+	// the page when the newest rows happen to be deletes.
+	if opts.ExcludeDeleted {
+		query.WriteString(" AND event_type != ?")
+		args = append(args, string(EventTypeDelete))
+	}
+
+	if opts.ClusterContext != "" {
+		query.WriteString(" AND cluster_context = ?")
+		args = append(args, opts.ClusterContext)
+	}
+
+	seqPaging := opts.SeqPaging || opts.SinceSeq > 0
+	if seqPaging {
+		query.WriteString(" AND seq > ?")
+		args = append(args, opts.SinceSeq)
+	}
+	if opts.UntilSeq > 0 {
+		query.WriteString(" AND seq < ?")
+		args = append(args, opts.UntilSeq)
+	}
+
+	// Delta reads (seq paging) page by ascending arrival order: the server
+	// advances the client cursor by the max seq in the page, so a burst larger
+	// than the limit must resume from the lowest unseen seq — timestamp DESC
+	// would return the newest matches and silently drop the mid-seq ones. The
+	// client merges by id, so ascending is fine. Sequence snapshots and backwards
+	// pages are newest-arrival-first; ordinary timeline reads remain newest-time-first.
+	if seqPaging || opts.SequenceOrder == pkgtimeline.SequenceOrderAscending {
+		query.WriteString(" ORDER BY seq ASC")
+	} else if opts.UntilSeq > 0 || opts.SequenceOrder == pkgtimeline.SequenceOrderDescending {
+		query.WriteString(" ORDER BY seq DESC")
+	} else {
+		query.WriteString(" ORDER BY timestamp DESC")
+	}
 
 	// Apply limit
 	limit := opts.Limit
@@ -369,61 +667,11 @@ func (s *SQLiteStore) Query(ctx context.Context, opts QueryOptions) ([]TimelineE
 	return events, rows.Err()
 }
 
-// QueryGrouped retrieves events grouped according to the specified mode
-func (s *SQLiteStore) QueryGrouped(ctx context.Context, opts QueryOptions) (*TimelineResponse, error) {
-	startTime := time.Now()
-
-	// Get events (with higher limit for grouping)
-	queryOpts := opts
-	queryOpts.Limit = min(opts.Limit*10, 5000)
-
-	events, err := s.Query(ctx, queryOpts)
-	if err != nil {
-		return nil, err
-	}
-
-	if opts.GroupBy == GroupByNone {
-		if len(events) > opts.Limit {
-			events = events[:opts.Limit]
-		}
-		return &TimelineResponse{
-			Ungrouped: events,
-			Meta: TimelineMeta{
-				TotalEvents: len(events),
-				QueryTimeMs: time.Since(startTime).Milliseconds(),
-				HasMore:     len(events) == opts.Limit,
-			},
-		}, nil
-	}
-
-	// Group events using shared implementation from pkg/timeline
-	groups := pkgtimeline.GroupEvents(events, opts.GroupBy)
-
-	limit := opts.Limit
-	if limit <= 0 {
-		limit = 200
-	}
-	hasMore := len(groups) > limit
-	if hasMore {
-		groups = groups[:limit]
-	}
-
-	return &TimelineResponse{
-		Groups: groups,
-		Meta: TimelineMeta{
-			TotalEvents: len(events),
-			GroupCount:  len(groups),
-			QueryTimeMs: time.Since(startTime).Milliseconds(),
-			HasMore:     hasMore,
-		},
-	}, nil
-}
-
 // GetEvent retrieves a single event by ID
 func (s *SQLiteStore) GetEvent(ctx context.Context, id string) (*TimelineEvent, error) {
 	query := `SELECT id, timestamp, source, kind, api_version, namespace, name, uid, event_type,
-		reason, message, diff_json, health_state, owner_kind, owner_name,
-		labels_json, count, correlation_id FROM events WHERE id = ?`
+		reason, message, diff_json, health_state, owner_kind, owner_name, owner_api_version, owner_uid, owner_evidence,
+		labels_json, count, correlation_id, cluster_context, resource_created_at, seq FROM events WHERE id = ?`
 
 	row := s.db.QueryRowContext(ctx, query, id)
 	event, err := s.scanEventRow(row)
@@ -436,47 +684,11 @@ func (s *SQLiteStore) GetEvent(ctx context.Context, id string) (*TimelineEvent, 
 	return &event, nil
 }
 
-// GetChangesForOwner retrieves changes for resources owned by the given owner
-func (s *SQLiteStore) GetChangesForOwner(ctx context.Context, ownerKind, ownerNamespace, ownerName string, since time.Time, limit int) ([]TimelineEvent, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-
-	query := `SELECT id, timestamp, source, kind, api_version, namespace, name, uid, event_type,
-		reason, message, diff_json, health_state, owner_kind, owner_name,
-		labels_json, count, correlation_id FROM events
-		WHERE owner_kind = ? AND owner_name = ? AND namespace = ?`
-
-	args := []any{ownerKind, ownerName, ownerNamespace}
-
-	if !since.IsZero() {
-		query += " AND timestamp >= ?"
-		args = append(args, since.Format(time.RFC3339Nano))
-	}
-
-	query += fmt.Sprintf(" ORDER BY timestamp DESC LIMIT %d", limit)
-
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	events := make([]TimelineEvent, 0)
-	for rows.Next() {
-		event, err := s.scanEvent(rows)
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, event)
-	}
-
-	return events, rows.Err()
-}
-
-// MarkResourceSeen records that a resource has been seen
-func (s *SQLiteStore) MarkResourceSeen(kind, namespace, name string) {
-	key := ResourceKey(kind, namespace, name)
+// MarkResourceSeen records that a resource has been seen. The key is
+// cluster- and API-group-qualified: this store outlives kubeconfig context
+// switches and distinct groups can define the same kind/namespace/name.
+func (s *SQLiteStore) MarkResourceSeen(clusterContext, group, kind, namespace, name string) {
+	key := SeenResourceKey(clusterContext, group, kind, namespace, name)
 
 	s.seenMu.Lock()
 	s.seenResources[key] = true
@@ -486,16 +698,17 @@ func (s *SQLiteStore) MarkResourceSeen(kind, namespace, name string) {
 	_, _ = s.db.Exec("INSERT OR REPLACE INTO seen_resources (resource_key) VALUES (?)", key)
 }
 
-// IsResourceSeen checks if a resource has been seen before
-func (s *SQLiteStore) IsResourceSeen(kind, namespace, name string) bool {
+// IsResourceSeen checks if a resource has been seen before in the given cluster
+// context and API group.
+func (s *SQLiteStore) IsResourceSeen(clusterContext, group, kind, namespace, name string) bool {
 	s.seenMu.RLock()
 	defer s.seenMu.RUnlock()
-	return s.seenResources[ResourceKey(kind, namespace, name)]
+	return s.seenResources[SeenResourceKey(clusterContext, group, kind, namespace, name)]
 }
 
 // ClearResourceSeen removes a resource from the seen set
-func (s *SQLiteStore) ClearResourceSeen(kind, namespace, name string) {
-	key := ResourceKey(kind, namespace, name)
+func (s *SQLiteStore) ClearResourceSeen(clusterContext, group, kind, namespace, name string) {
+	key := SeenResourceKey(clusterContext, group, kind, namespace, name)
 
 	s.seenMu.Lock()
 	delete(s.seenResources, key)
@@ -523,11 +736,11 @@ func (s *SQLiteStore) Stats() StoreStats {
 	if newest.Valid {
 		stats.NewestEvent, _ = time.Parse(time.RFC3339Nano, newest.String)
 	}
+	row = s.db.QueryRow("SELECT COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0) FROM events")
+	_ = row.Scan(&stats.OldestSeq, &stats.NewestSeq)
 
 	// Get database file size
-	if info, err := os.Stat(s.path); err == nil {
-		stats.StorageBytes = info.Size()
-	}
+	stats.StorageBytes = s.storageBytes()
 
 	s.seenMu.RLock()
 	stats.SeenResources = len(s.seenResources)
@@ -535,9 +748,11 @@ func (s *SQLiteStore) Stats() StoreStats {
 
 	s.cleanupMu.RLock()
 	stats.RetentionAge = s.retentionAge
+	stats.MaxStorageBytes = s.maxStorage
 	stats.LastCleanupAt = s.lastCleanupAt
 	stats.LastCleanupDeletedRows = s.lastCleanupN
 	stats.LastCleanupError = s.lastCleanupEr
+	stats.EventsEvicted = s.evictedRows
 	s.cleanupMu.RUnlock()
 
 	return stats
@@ -554,36 +769,133 @@ func (s *SQLiteStore) Close() error {
 
 // Cleanup removes events older than the given duration
 func (s *SQLiteStore) Cleanup(ctx context.Context, maxAge time.Duration) (int64, error) {
-	cutoff := time.Now().Add(-maxAge).Format(time.RFC3339Nano)
+	cutoff := time.Now().Add(-maxAge).UTC().Format(sqliteTimeLayout)
 	result, err := s.db.ExecContext(ctx, "DELETE FROM events WHERE timestamp < ?", cutoff)
 	if err != nil {
 		return 0, err
 	}
-	return result.RowsAffected()
+	n, err := result.RowsAffected()
+	s.recordEviction(n)
+	return n, err
+}
+
+// recordEviction stickies the fact that rows were pruned — cursor-eviction
+// detection must survive later sweeps that delete nothing.
+func (s *SQLiteStore) recordEviction(rows int64) {
+	if rows <= 0 {
+		return
+	}
+	s.cleanupMu.Lock()
+	s.evictedRows = true
+	s.cleanupMu.Unlock()
+}
+
+func (s *SQLiteStore) PruneToMaxSize(ctx context.Context, maxBytes int64) (totalDeletedOut int64, errOut error) {
+	if maxBytes <= 0 {
+		return 0, nil
+	}
+	defer func() { s.recordEviction(totalDeletedOut) }()
+	if current := s.storageBytes(); current <= maxBytes {
+		return 0, nil
+	}
+	if err := s.checkpointWAL(ctx); err != nil {
+		return 0, err
+	}
+	if current := s.storageBytes(); current <= maxBytes {
+		return 0, nil
+	}
+
+	target := maxBytes * 85 / 100
+	if target <= 0 {
+		target = maxBytes
+	}
+
+	var totalDeleted int64
+	for attempts := 0; attempts < 5; attempts++ {
+		current := s.storageBytes()
+		if current <= maxBytes {
+			return totalDeleted, nil
+		}
+
+		count, err := s.countEvents(ctx)
+		if err != nil {
+			return totalDeleted, err
+		}
+		if count == 0 {
+			if err := s.reclaimStorage(ctx); err != nil {
+				return totalDeleted, err
+			}
+			break
+		}
+		if count == 1 {
+			deleted, err := s.deleteOldestEvents(ctx, 1)
+			totalDeleted += deleted
+			if err != nil {
+				return totalDeleted, err
+			}
+			if err := s.reclaimStorage(ctx); err != nil {
+				return totalDeleted, err
+			}
+			continue
+		}
+
+		avgBytes := current / count
+		if avgBytes < 1 {
+			avgBytes = 1
+		}
+		toDelete := ((current - target) / avgBytes) + 1
+		if toDelete < 1000 && count > 1000 {
+			toDelete = 1000
+		}
+		if toDelete < 1 {
+			toDelete = 1
+		}
+		if toDelete >= count {
+			toDelete = count - 1
+		}
+
+		deleted, err := s.deleteOldestEvents(ctx, toDelete)
+		totalDeleted += deleted
+		if err != nil {
+			return totalDeleted, err
+		}
+		if deleted == 0 {
+			break
+		}
+		if err := s.reclaimStorage(ctx); err != nil {
+			return totalDeleted, err
+		}
+	}
+
+	if current := s.storageBytes(); current > maxBytes {
+		return totalDeleted, fmt.Errorf("timeline storage still above max size after pruning (%d > %d bytes)", current, maxBytes)
+	}
+	return totalDeleted, nil
 }
 
 // StartCleanupLoop spawns a goroutine that periodically deletes events older
-// than retention. Without this, the events table grows unbounded. Runs once
-// immediately so post-upgrade users with bloated DBs don't wait an hour for
-// the first cleanup. The loop exits when Close is called. retention <= 0
-// (or interval <= 0) disables cleanup entirely.
-func (s *SQLiteStore) StartCleanupLoop(retention, interval time.Duration) {
-	if retention <= 0 || interval <= 0 {
+// than retention and prunes oldest events when the DB exceeds maxStorageBytes.
+// Runs once immediately so post-upgrade users with bloated DBs don't wait an
+// hour for the first cleanup. The loop exits when Close is called. Both
+// retention <= 0 and maxStorageBytes <= 0 together disable cleanup entirely.
+func (s *SQLiteStore) StartCleanupLoop(retention, interval time.Duration, maxStorageBytes int64) {
+	if interval <= 0 || (retention <= 0 && maxStorageBytes <= 0) {
 		return
 	}
 	s.cleanupMu.Lock()
 	s.retentionAge = retention
+	s.maxStorage = maxStorageBytes
 	s.cleanupMu.Unlock()
 	s.wg.Go(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		s.runCleanup(retention)
+		s.runCleanup(retention, maxStorageBytes)
 		for {
 			select {
 			case <-s.quit:
 				return
 			case <-ticker.C:
-				s.runCleanup(retention)
+				s.runCleanup(retention, maxStorageBytes)
 			}
 		}
 	})
@@ -601,11 +913,15 @@ func (s *SQLiteStore) hydrateSeenResources() {
 	}
 	defer rows.Close()
 
-	var loaded, skipped int
+	var loaded, skipped, obsolete int
 	for rows.Next() {
 		var key string
 		if err := rows.Scan(&key); err != nil {
 			skipped++
+			continue
+		}
+		if !isGroupAwareSeenResourceKey(key) {
+			obsolete++
 			continue
 		}
 		s.seenResources[key] = true
@@ -617,9 +933,17 @@ func (s *SQLiteStore) hydrateSeenResources() {
 	if skipped > 0 {
 		log.Printf("[timeline] skipped %d unreadable seen_resources rows in %s (loaded %d)", skipped, s.path, loaded)
 	}
+	if obsolete > 0 {
+		log.Printf("[timeline] ignored %d obsolete seen_resources rows in %s", obsolete, s.path)
+	}
 	if loaded > 0 {
 		log.Printf("[timeline] loaded %d seen resources from %s", loaded, s.path)
 	}
+}
+
+func isGroupAwareSeenResourceKey(key string) bool {
+	_, resourceKey, ok := strings.Cut(key, "\x00")
+	return ok && strings.Count(resourceKey, "|") == 3
 }
 
 // runCleanup deletes events older than retention and truncates the WAL so the
@@ -627,16 +951,32 @@ func (s *SQLiteStore) hydrateSeenResources() {
 // (timestamp, deleted count, last error) so it's surfaceable via Stats() and
 // /api/diagnostics — operators shouldn't need to tail logs to know retention
 // is working.
-func (s *SQLiteStore) runCleanup(retention time.Duration) {
-	n, err := s.Cleanup(context.Background(), retention)
+func (s *SQLiteStore) runCleanup(retention time.Duration, maxStorageBytes int64) {
+	var n int64
+	var cleanupErr error
+	var checkpointErr error
+	var pruneErr error
+	ctx := context.Background()
+	if retention > 0 {
+		n, cleanupErr = s.Cleanup(ctx, retention)
+		if cleanupErr == nil {
+			checkpointErr = s.checkpointWAL(ctx)
+		}
+	}
+	if maxStorageBytes > 0 {
+		var pruned int64
+		pruned, pruneErr = s.PruneToMaxSize(ctx, maxStorageBytes)
+		n += pruned
+	}
+	err := errors.Join(cleanupErr, checkpointErr, pruneErr)
 	now := time.Now()
 	s.cleanupMu.Lock()
 	s.lastCleanupAt = now
+	s.lastCleanupN = n
 	if err != nil {
 		s.lastCleanupEr = err.Error()
 	} else {
 		s.lastCleanupEr = ""
-		s.lastCleanupN = n
 	}
 	s.cleanupMu.Unlock()
 
@@ -645,11 +985,58 @@ func (s *SQLiteStore) runCleanup(retention time.Duration) {
 		return
 	}
 	if n > 0 {
-		log.Printf("[timeline] cleanup: deleted %d events older than %s from %s", n, retention, s.path)
+		log.Printf("[timeline] cleanup: deleted %d events from %s", n, s.path)
 	}
-	if _, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		log.Printf("[timeline] wal_checkpoint failed for %s: %v", s.path, err)
+}
+
+func (s *SQLiteStore) storageBytes() int64 {
+	var total int64
+	for _, path := range []string{s.path, s.path + "-wal"} {
+		if info, err := os.Stat(path); err == nil {
+			total += info.Size()
+		}
 	}
+	return total
+}
+
+func (s *SQLiteStore) countEvents(ctx context.Context) (int64, error) {
+	var count int64
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM events").Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *SQLiteStore) deleteOldestEvents(ctx context.Context, limit int64) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM events
+		WHERE id IN (
+			SELECT id FROM events
+			ORDER BY timestamp ASC, created_at ASC
+			LIMIT ?
+		)
+	`, limit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (s *SQLiteStore) reclaimStorage(ctx context.Context) error {
+	if err := s.checkpointWAL(ctx); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, "VACUUM"); err != nil {
+		return fmt.Errorf("vacuum failed: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) checkpointWAL(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		return fmt.Errorf("wal checkpoint failed: %w", err)
+	}
+	return nil
 }
 
 // scanEvent scans a row into a TimelineEvent
@@ -658,7 +1045,8 @@ func (s *SQLiteStore) scanEvent(rows *sql.Rows) (TimelineEvent, error) {
 	var timestamp string
 	var source, eventType, healthState string
 	var apiVersion, uid, reason, message, diffJSON, labelsJSON sql.NullString
-	var ownerKind, ownerName, correlationID sql.NullString
+	var ownerKind, ownerName, ownerAPIVersion, ownerUID, ownerEvidence sql.NullString
+	var correlationID, clusterContext, resourceCreatedAt sql.NullString
 
 	err := rows.Scan(
 		&event.ID,
@@ -676,12 +1064,24 @@ func (s *SQLiteStore) scanEvent(rows *sql.Rows) (TimelineEvent, error) {
 		&healthState,
 		&ownerKind,
 		&ownerName,
+		&ownerAPIVersion,
+		&ownerUID,
+		&ownerEvidence,
 		&labelsJSON,
 		&event.Count,
 		&correlationID,
+		&clusterContext,
+		&resourceCreatedAt,
+		&event.Seq,
 	)
 	if err != nil {
 		return event, err
+	}
+	event.ClusterContext = clusterContext.String
+	if resourceCreatedAt.Valid && resourceCreatedAt.String != "" {
+		if t, err := time.Parse(time.RFC3339Nano, resourceCreatedAt.String); err == nil {
+			event.CreatedAt = &t
+		}
 	}
 
 	event.Timestamp, _ = time.Parse(time.RFC3339Nano, timestamp)
@@ -714,10 +1114,13 @@ func (s *SQLiteStore) scanEvent(rows *sql.Rows) (TimelineEvent, error) {
 
 	if ownerKind.Valid && ownerKind.String != "" {
 		event.Owner = &OwnerInfo{
-			Kind: ownerKind.String,
-			Name: ownerName.String,
+			Kind:       ownerKind.String,
+			Name:       ownerName.String,
+			APIVersion: ownerAPIVersion.String,
+			UID:        ownerUID.String,
 		}
 	}
+	event.OwnerEvidence = OwnerEvidence(ownerEvidence.String)
 
 	if labelsJSON.Valid && labelsJSON.String != "" {
 		json.Unmarshal([]byte(labelsJSON.String), &event.Labels)
@@ -732,7 +1135,8 @@ func (s *SQLiteStore) scanEventRow(row *sql.Row) (TimelineEvent, error) {
 	var timestamp string
 	var source, eventType, healthState string
 	var apiVersion, uid, reason, message, diffJSON, labelsJSON sql.NullString
-	var ownerKind, ownerName, correlationID sql.NullString
+	var ownerKind, ownerName, ownerAPIVersion, ownerUID, ownerEvidence sql.NullString
+	var correlationID, clusterContext, resourceCreatedAt sql.NullString
 
 	err := row.Scan(
 		&event.ID,
@@ -750,12 +1154,24 @@ func (s *SQLiteStore) scanEventRow(row *sql.Row) (TimelineEvent, error) {
 		&healthState,
 		&ownerKind,
 		&ownerName,
+		&ownerAPIVersion,
+		&ownerUID,
+		&ownerEvidence,
 		&labelsJSON,
 		&event.Count,
 		&correlationID,
+		&clusterContext,
+		&resourceCreatedAt,
+		&event.Seq,
 	)
 	if err != nil {
 		return event, err
+	}
+	event.ClusterContext = clusterContext.String
+	if resourceCreatedAt.Valid && resourceCreatedAt.String != "" {
+		if t, err := time.Parse(time.RFC3339Nano, resourceCreatedAt.String); err == nil {
+			event.CreatedAt = &t
+		}
 	}
 
 	event.Timestamp, _ = time.Parse(time.RFC3339Nano, timestamp)
@@ -788,10 +1204,13 @@ func (s *SQLiteStore) scanEventRow(row *sql.Row) (TimelineEvent, error) {
 
 	if ownerKind.Valid && ownerKind.String != "" {
 		event.Owner = &OwnerInfo{
-			Kind: ownerKind.String,
-			Name: ownerName.String,
+			Kind:       ownerKind.String,
+			Name:       ownerName.String,
+			APIVersion: ownerAPIVersion.String,
+			UID:        ownerUID.String,
 		}
 	}
+	event.OwnerEvidence = OwnerEvidence(ownerEvidence.String)
 
 	if labelsJSON.Valid && labelsJSON.String != "" {
 		json.Unmarshal([]byte(labelsJSON.String), &event.Labels)

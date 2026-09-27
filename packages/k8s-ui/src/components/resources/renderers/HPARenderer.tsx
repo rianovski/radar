@@ -1,111 +1,49 @@
-import { Cpu, AlertTriangle } from 'lucide-react'
+import type { ReactNode } from 'react'
+import { Activity, Cpu } from 'lucide-react'
 import { clsx } from 'clsx'
-import { Section, PropertyList, Property, ConditionsSection, ResourceLink } from '../../ui/drawer-components'
+import { Section, PropertyList, Property, ConditionsSection, ResourceLink, type ConditionTone } from '../../ui/drawer-components'
+import { Badge } from '../../ui/Badge'
 import { kindToPlural } from '../../../utils/navigation'
 import { formatAge } from '../resource-utils'
+import { HPADiagnosisSummary } from '../HPADiagnosisSummary'
+import type { HPADiagnosis } from '../../../types'
 
 interface HPARendererProps {
   data: any
   onNavigate?: (ref: { kind: string; namespace: string; name: string }) => void
+  hpaDiagnosis?: HPADiagnosis
+  /** Optional host-provided section rendered after Conditions — used to inject Prometheus-backed charts. */
+  extraSections?: ReactNode
 }
 
-// Extract problems from HPA conditions
-function getHPAProblems(data: any): string[] {
-  const problems: string[] = []
-  const conditions = data.status?.conditions || []
-  const status = data.status || {}
-  const spec = data.spec || {}
-
-  // Check conditions for issues
-  for (const cond of conditions) {
-    // AbleToScale = False means target not found or can't scale
-    if (cond.type === 'AbleToScale' && cond.status === 'False') {
-      problems.push(`Cannot scale: ${cond.reason}${cond.message ? ' - ' + cond.message : ''}`)
-    }
-
-    // ScalingActive = False means metrics unavailable
-    if (cond.type === 'ScalingActive' && cond.status === 'False') {
-      if (cond.reason === 'FailedGetResourceMetric') {
-        problems.push('Metrics unavailable — is metrics-server running?')
-      } else {
-        problems.push(`Scaling inactive: ${cond.reason}${cond.message ? ' - ' + cond.message : ''}`)
-      }
-    }
-
-    // ScalingLimited = True means at min/max bound
-    if (cond.type === 'ScalingLimited' && cond.status === 'True') {
-      if (cond.reason === 'TooFewReplicas') {
-        problems.push(`At minimum replicas (${spec.minReplicas || 1}) — cannot scale down further`)
-      } else if (cond.reason === 'TooManyReplicas') {
-        problems.push(`At maximum replicas (${spec.maxReplicas}) — cannot scale up further`)
-      }
-    }
+function hpaConditionTone(condition: any): ConditionTone | undefined {
+  if (condition?.type === 'ScaledToZero') {
+    if (condition.status === 'False') return 'ok'
+    if (condition.status === 'True') return 'unknown'
+    return 'unknown'
   }
+  if (condition?.type !== 'ScalingLimited') return undefined
+  if (condition.status === 'False') return 'ok'
+  if (condition.status !== 'True') return 'unknown'
 
-  // Check for desired != current (scaling in progress or stuck)
-  if (status.currentReplicas !== undefined && status.desiredReplicas !== undefined) {
-    if (status.currentReplicas !== status.desiredReplicas) {
-      const direction = status.desiredReplicas > status.currentReplicas ? 'up' : 'down'
-      problems.push(`Scaling ${direction}: ${status.currentReplicas} → ${status.desiredReplicas} replicas`)
-    }
-  }
-
-  return problems
+  const reason = String(condition.reason ?? '').toLowerCase()
+  const message = String(condition.message ?? '').toLowerCase()
+  if (reason.includes('toomany') || message.includes('maximum')) return 'warning'
+  if (reason.includes('toofew') || message.includes('minimum')) return 'ok'
+  return 'warning'
 }
 
-export function HPARenderer({ data, onNavigate }: HPARendererProps) {
+export function HPARenderer({ data, onNavigate, hpaDiagnosis, extraSections }: HPARendererProps) {
   const status = data.status || {}
   const spec = data.spec || {}
   const metrics = status.currentMetrics || []
 
-  // Check for problems
-  const problems = getHPAProblems(data)
-  const hasProblems = problems.length > 0
-
-  // Determine if these are errors (red) or warnings (yellow)
-  const hasErrors = problems.some(p =>
-    p.includes('Cannot scale') || p.includes('unavailable') || p.includes('inactive')
-  )
-
   return (
     <>
-      {/* Problems/warnings alert */}
-      {hasProblems && (
-        <div className={clsx(
-          'mb-4 p-3 rounded-lg border',
-          hasErrors
-            ? 'bg-red-500/10 border-red-500/30'
-            : 'bg-yellow-500/10 border-yellow-500/30'
-        )}>
-          <div className="flex items-start gap-2">
-            <AlertTriangle className={clsx(
-              'w-4 h-4 mt-0.5 shrink-0',
-              hasErrors ? 'text-red-400' : 'text-yellow-400'
-            )} />
-            <div className="flex-1 min-w-0">
-              <div className={clsx(
-                'text-sm font-medium mb-1',
-                hasErrors ? 'text-red-400' : 'text-yellow-400'
-              )}>
-                {hasErrors ? 'Scaling Issues' : 'Scaling Status'}
-              </div>
-              <ul className={clsx(
-                'text-xs space-y-1',
-                hasErrors ? 'text-red-300' : 'text-yellow-300'
-              )}>
-                {problems.map((problem, i) => (
-                  <li key={i} className="flex items-start gap-1.5">
-                    <span className={clsx(
-                      'mt-0.5',
-                      hasErrors ? 'text-red-400/60' : 'text-yellow-400/60'
-                    )}>•</span>
-                    <span>{problem}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </div>
-        </div>
+      {hpaDiagnosis && (
+        <Section title="Diagnosis" icon={Activity}>
+          <HPADiagnosisSummary diagnosis={hpaDiagnosis} variant="detail" />
+        </Section>
       )}
 
       <Section title="Scaling" icon={Cpu}>
@@ -123,13 +61,37 @@ export function HPARenderer({ data, onNavigate }: HPARendererProps) {
           } />
           <Property label="Current" value={status.currentReplicas} />
           <Property label="Desired" value={status.desiredReplicas} />
-          <Property label="Min" value={spec.minReplicas || 1} />
+          <Property label="Min" value={spec.minReplicas ?? 1} />
           <Property label="Max" value={spec.maxReplicas} />
           {status.lastScaleTime && <Property label="Last Scale" value={formatAge(status.lastScaleTime)} />}
         </PropertyList>
       </Section>
 
-      {metrics.length > 0 && (
+      {hpaDiagnosis?.metrics && hpaDiagnosis.metrics.length > 0 && (
+        <Section title="Metrics" defaultExpanded>
+          <div className="space-y-2">
+            {hpaDiagnosis.metrics.map((metric) => (
+              <div key={`${metric.type}-${metric.name}`} className="card-inner">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                  <div>
+                    <div className="font-medium text-theme-text-primary">{metric.name}</div>
+                    <div className="text-xs text-theme-text-tertiary">{metric.type}</div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-theme-text-secondary">
+                    {metric.current && <span>Current {metric.current}</span>}
+                    {metric.target && <span>Target {metric.target}</span>}
+                    <Badge severity={metric.status === 'ok' ? 'success' : metric.status === 'missing' ? 'warning' : 'neutral'} size="sm">
+                      {metric.status.replace(/_/g, ' ')}
+                    </Badge>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
+
+      {!hpaDiagnosis?.metrics?.length && metrics.length > 0 && (
         <Section title="Metrics" defaultExpanded>
           <div className="space-y-3">
             {metrics.map((metric: any, i: number) => {
@@ -159,7 +121,9 @@ export function HPARenderer({ data, onNavigate }: HPARendererProps) {
         </Section>
       )}
 
-      <ConditionsSection conditions={status.conditions} />
+      <ConditionsSection conditions={status.conditions} getConditionTone={hpaConditionTone} />
+
+      {extraSections}
     </>
   )
 }

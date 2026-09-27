@@ -4,6 +4,15 @@ import (
 	"context"
 	"regexp"
 	"time"
+
+	"github.com/skyhook-io/radar/pkg/resourceid"
+)
+
+type SequenceOrder string
+
+const (
+	SequenceOrderAscending  SequenceOrder = "ascending"
+	SequenceOrderDescending SequenceOrder = "descending"
 )
 
 // EventStore is the interface for timeline event storage backends.
@@ -18,23 +27,21 @@ type EventStore interface {
 	// Query retrieves events matching the given options
 	Query(ctx context.Context, opts QueryOptions) ([]TimelineEvent, error)
 
-	// QueryGrouped retrieves events grouped according to the specified mode
-	QueryGrouped(ctx context.Context, opts QueryOptions) (*TimelineResponse, error)
-
 	// GetEvent retrieves a single event by ID
 	GetEvent(ctx context.Context, id string) (*TimelineEvent, error)
 
-	// GetChangesForOwner retrieves changes for resources owned by the given owner
-	GetChangesForOwner(ctx context.Context, ownerKind, ownerNamespace, ownerName string, since time.Time, limit int) ([]TimelineEvent, error)
+	// MarkResourceSeen records that a resource has been seen (for dedup on
+	// restart). clusterContext scopes the key — the store outlives kubeconfig
+	// context switches, so a same-named resource in another cluster must not
+	// read as already-seen. group distinguishes colliding Kubernetes kinds.
+	MarkResourceSeen(clusterContext, group, kind, namespace, name string)
 
-	// MarkResourceSeen records that a resource has been seen (for dedup on restart)
-	MarkResourceSeen(kind, namespace, name string)
-
-	// IsResourceSeen checks if a resource has been seen before
-	IsResourceSeen(kind, namespace, name string) bool
+	// IsResourceSeen checks if a resource has been seen before in the given
+	// cluster context and API group.
+	IsResourceSeen(clusterContext, group, kind, namespace, name string) bool
 
 	// ClearResourceSeen removes a resource from the seen set (on delete)
-	ClearResourceSeen(kind, namespace, name string)
+	ClearResourceSeen(clusterContext, group, kind, namespace, name string)
 
 	// Stats returns storage statistics
 	Stats() StoreStats
@@ -46,11 +53,56 @@ type EventStore interface {
 // QueryOptions configures event queries
 type QueryOptions struct {
 	// Filters
-	Namespaces []string      // Filter by namespaces (empty = all)
-	Kinds      []string      // Filter by resource kinds (empty = all)
-	Since      time.Time     // Filter events after this time
-	Until      time.Time     // Filter events before this time
-	Sources    []EventSource // Filter by event source (empty = all)
+	Namespaces []string // Filter by namespaces (empty = all)
+	Kinds      []string // Filter by resource kinds (empty = all)
+	Names      []string // Filter by resource names (empty = all)
+	// APIGroups filters by the group parsed from APIVersion before pagination
+	// limits are applied. Use "" for the core group. Events whose APIVersion
+	// was not recorded are retained as unknown rather than treated as a known
+	// mismatch (empty slice = all groups).
+	APIGroups []string
+	// RequireAPIVersion excludes unknown identities for exact resource drill-downs.
+	RequireAPIVersion bool
+	Since             time.Time     // Filter events after this time
+	Until             time.Time     // Filter events before this time
+	Sources           []EventSource // Filter by event source (empty = all)
+	EventTypes        []EventType   // Filter by event type, e.g. add/delete (empty = all)
+	// ClusterContext scopes results to one cluster's events (empty = all).
+	// Anything answering "what happened on THIS cluster" must set it: the
+	// SQLite store outlives context switches, and rows written before the
+	// column existed carry "" (unknowable provenance), which a non-empty
+	// filter deliberately excludes.
+	ClusterContext string
+
+	// SinceSeq returns only events whose arrival number (Seq) is greater
+	// than this; 0 means no cursor. This is the delta-read cursor: arrival
+	// order, not event time, so late-arriving events can't be skipped.
+	// Delta reads page oldest-first (ascending seq) so a burst larger than
+	// Limit resumes from the lowest unseen seq. Do not combine with Offset —
+	// it is defined for the newest-first shape only and its delta-mode
+	// behavior is unspecified.
+	SinceSeq int64
+	// UntilSeq returns only events whose arrival number (Seq) is less than
+	// this value. It provides stable backwards pagination without relying on
+	// event timestamps, which may arrive out of order. Do not combine it with
+	// SinceSeq.
+	UntilSeq int64
+	// SequenceOrder explicitly orders a bounded snapshot by arrival number.
+	// Use it when the result becomes the baseline for sequence cursors: timestamp
+	// ordering can omit a late arrival with an older event time and then advance
+	// the cursor past it. SinceSeq and UntilSeq still apply their filters.
+	SequenceOrder SequenceOrder
+
+	// SeqPaging forces the delta-read shape (seq > SinceSeq, ascending seq)
+	// even when SinceSeq is 0 — i.e. "every row the query's OTHER filters
+	// admit, in arrival order" (content filters like FilterPreset and
+	// IncludeManaged still apply; a full backfill pairs this with the
+	// everything-visible options). A plain
+	// SinceSeq of 0 keeps its historical meaning (no cursor, newest-first),
+	// which existing full-fetch callers rely on; this flag is how a consumer
+	// that needs a FULL backfill in resumable pages asks for page one. Same
+	// combination caveats as SinceSeq.
+	SeqPaging bool
 
 	// Filter preset (overrides individual filters if set)
 	FilterPreset string
@@ -59,11 +111,9 @@ type QueryOptions struct {
 	Limit  int // Max results (default 200, max 1000)
 	Offset int // Skip first N results
 
-	// Grouping
-	GroupBy GroupingMode // How to group results
-
 	// Include/exclude options
 	IncludeManaged   bool // Include ReplicaSets, Pods, Events (default false)
+	ExcludeDeleted   bool // Exclude delete events
 	IncludeK8sEvents bool // Include K8s Event resources (default true)
 }
 
@@ -71,8 +121,8 @@ type QueryOptions struct {
 func DefaultQueryOptions() QueryOptions {
 	return QueryOptions{
 		Limit:            200,
-		GroupBy:          GroupByNone,
 		IncludeManaged:   false,
+		ExcludeDeleted:   false,
 		IncludeK8sEvents: true,
 	}
 }
@@ -82,11 +132,23 @@ type StoreStats struct {
 	TotalEvents   int64     `json:"totalEvents"`
 	OldestEvent   time.Time `json:"oldestEvent"`
 	NewestEvent   time.Time `json:"newestEvent"`
+	OldestSeq     int64     `json:"oldestSeq,omitempty"`
+	NewestSeq     int64     `json:"newestSeq,omitempty"`
+	MaxEvents     int       `json:"maxEvents,omitempty"`
+	EventsEvicted bool      `json:"eventsEvicted,omitempty"`
 	StorageBytes  int64     `json:"storageBytes,omitempty"`
 	SeenResources int       `json:"seenResources"`
 
+	// Degraded is set when the configured persistent backend could not be
+	// opened and the store fell back to in-memory for this session — surfaced
+	// so diagnostics show why persistence is missing instead of the timeline
+	// looking healthy. DegradedReason carries the original open error.
+	Degraded       bool   `json:"degraded,omitempty"`
+	DegradedReason string `json:"degradedReason,omitempty"`
+
 	// SQLite-only retention/cleanup state. Zero values for memory store.
 	RetentionAge           time.Duration `json:"retentionAge,omitempty"`
+	MaxStorageBytes        int64         `json:"maxStorageBytes,omitempty"`
 	LastCleanupAt          time.Time     `json:"lastCleanupAt,omitempty"`
 	LastCleanupDeletedRows int64         `json:"lastCleanupDeletedRows,omitempty"`
 	LastCleanupError       string        `json:"lastCleanupError,omitempty"`
@@ -183,7 +245,11 @@ func (cf *CompiledFilter) Matches(event *TimelineEvent) bool {
 	return true
 }
 
-// ResourceKey generates a unique key for a resource
-func ResourceKey(kind, namespace, name string) string {
-	return kind + "/" + namespace + "/" + name
+// SeenResourceKey qualifies the canonical resource identity with the cluster
+// context. The NUL separator can't appear in a kubeconfig context name or the
+// resource key. Older opaque keys without group identity deliberately don't
+// match: their API group is unknowable, so the resource is re-extracted once
+// rather than a same-named resource in another group being suppressed.
+func SeenResourceKey(clusterContext, group, kind, namespace, name string) string {
+	return clusterContext + "\x00" + resourceid.ResourceKey(group, kind, namespace, name)
 }

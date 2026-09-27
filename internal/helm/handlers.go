@@ -2,16 +2,20 @@ package helm
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"k8s.io/client-go/rest"
+
 	"github.com/skyhook-io/radar/internal/auth"
 	"github.com/skyhook-io/radar/internal/errorlog"
 	"github.com/skyhook-io/radar/internal/k8s"
-	"k8s.io/client-go/rest"
 )
 
 // IsForbiddenError checks if an error is a Kubernetes RBAC forbidden error
@@ -33,220 +37,75 @@ func userCreds(r *http.Request) (string, []string) {
 	return "", nil
 }
 
-// Handlers provides HTTP handlers for Helm endpoints.
-//
-// ContextResolver is called per-request to determine which cluster the
-// Helm action should target. Returning a non-nil rest.Config + a context
-// name routes the action through that cluster (used when the caller is on
-// a non-default pool context). Returning (nil, "") falls back to the
-// process-global Helm Client, which reads k8s.GetConfig() / GetContextName().
-// Wiring it from server.New keeps this package free of a pool dependency.
+// decodeApplyValuesRequest parses an apply-values body. Apply always targets
+// the release's current chart; changing the chart version goes through the
+// upgrade endpoints. Preview shares the request type and accepts
+// Version/Repository, so a chart-change request here fails loudly instead of
+// applying against the current chart while the caller believes the version
+// changed.
+func decodeApplyValuesRequest(body io.Reader) (ApplyValuesRequest, error) {
+	var req ApplyValuesRequest
+	if err := json.NewDecoder(body).Decode(&req); err != nil {
+		return req, fmt.Errorf("invalid request body: %s", err.Error())
+	}
+	if req.Version != "" || req.Repository != "" {
+		return req, errors.New("version and repository are not supported when applying values; use the upgrade endpoint to change the chart version")
+	}
+	return req, nil
+}
+
+func decodeOptionalApplyValuesRequest(body io.Reader) (map[string]any, error) {
+	if body == nil {
+		return nil, nil
+	}
+	var req ApplyValuesRequest
+	if err := json.NewDecoder(body).Decode(&req); err != nil {
+		if err == io.EOF {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return req.Values, nil
+}
+
+// Handlers provides HTTP handlers for Helm endpoints
 type Handlers struct {
-	ContextResolver func(r *http.Request) (*rest.Config, string)
+	ConfigWriteAllowed func(http.ResponseWriter, *http.Request) bool
+	// resolveNamespaces maps a request to the namespaces a Helm list should
+	// query. It returns (nil, true) for cluster-wide access, (namespaces, true)
+	// to list those namespaces and merge, and (_, false) when the identity has
+	// no namespace access. Injected by the server so the helm package doesn't
+	// depend on its per-user RBAC plumbing. May be nil in tests that don't
+	// exercise the list endpoints.
+	resolveNamespaces func(r *http.Request) ([]string, bool)
+	// ContextResolver returns the per-user pool context a request targets, or
+	// a nil rest.Config for the process-global default context. May be nil.
+	ContextResolver func(r *http.Request) (*rest.Config, string, *k8s.ResourceCache)
 }
 
-// NewHandlers creates a new Handlers instance. resolver may be nil (the
-// default-context path is used unconditionally in that case).
-func NewHandlers(resolver func(r *http.Request) (*rest.Config, string)) *Handlers {
-	return &Handlers{ContextResolver: resolver}
+// client returns the Helm client for the request's kubeconfig context.
+func (h *Handlers) client(r *http.Request) *Client {
+	c := GetClient()
+	if c == nil || h.ContextResolver == nil {
+		return c
+	}
+	return c.ForContext(h.ContextResolver(r))
 }
 
-// resolveContext returns the per-request (restConfig, contextName) pair, or
-// (nil, "") when no resolver is wired or the resolver maps the request to
-// the default context.
-func (h *Handlers) resolveContext(r *http.Request) (*rest.Config, string) {
-	if h.ContextResolver == nil {
-		return nil, ""
-	}
-	return h.ContextResolver(r)
+// NewHandlers creates a new Handlers instance. resolveNamespaces lets the list
+// endpoints degrade gracefully for namespace-restricted identities (see
+// handleListReleases); pass nil only in tests that don't hit those routes.
+func NewHandlers(resolveNamespaces func(r *http.Request) ([]string, bool)) *Handlers {
+	return &Handlers{resolveNamespaces: resolveNamespaces}
 }
 
-// listReleases / getRelease / getManifest / getValues / getManifestDiff
-// are thin per-context dispatchers used by the read handlers. They
-// either delegate to the global Client (default context) or build an
-// action.Configuration against the per-request rest.Config so reads hit
-// the user's switched-to cluster.
-func (h *Handlers) listReleases(r *http.Request, client *Client, namespace, username string, groups []string) ([]HelmRelease, error) {
-	if h.ContextResolver == nil {
-		return client.ListReleasesAsUser(namespace, username, groups)
+// listNamespaces resolves which namespaces a Helm list should query. Falls back
+// to cluster-wide (nil, true) when no resolver is wired.
+func (h *Handlers) listNamespaces(r *http.Request) ([]string, bool) {
+	if h.resolveNamespaces == nil {
+		return nil, true
 	}
-	restCfg, ctxName := h.ContextResolver(r)
-	if restCfg == nil {
-		return client.ListReleasesAsUser(namespace, username, groups)
-	}
-	actionConfig, err := client.GetActionConfigForUserWith(restCfg, ctxName, namespace, username, groups)
-	if err != nil {
-		return nil, err
-	}
-	return ListReleasesWith(actionConfig, namespace, username, groups)
-}
-
-func (h *Handlers) getRelease(r *http.Request, client *Client, namespace, name, username string, groups []string) (*HelmReleaseDetail, error) {
-	if h.ContextResolver == nil {
-		return client.GetReleaseAsUser(namespace, name, username, groups)
-	}
-	restCfg, ctxName := h.ContextResolver(r)
-	if restCfg == nil {
-		return client.GetReleaseAsUser(namespace, name, username, groups)
-	}
-	actionConfig, err := client.GetActionConfigForUserWith(restCfg, ctxName, namespace, username, groups)
-	if err != nil {
-		return nil, err
-	}
-	return GetReleaseWith(actionConfig, namespace, name)
-}
-
-func (h *Handlers) getManifest(r *http.Request, client *Client, namespace, name string, revision int, username string, groups []string) (string, error) {
-	if h.ContextResolver == nil {
-		return client.GetManifestAsUser(namespace, name, revision, username, groups)
-	}
-	restCfg, ctxName := h.ContextResolver(r)
-	if restCfg == nil {
-		return client.GetManifestAsUser(namespace, name, revision, username, groups)
-	}
-	actionConfig, err := client.GetActionConfigForUserWith(restCfg, ctxName, namespace, username, groups)
-	if err != nil {
-		return "", err
-	}
-	return GetManifestWith(actionConfig, name, revision)
-}
-
-func (h *Handlers) getValues(r *http.Request, client *Client, namespace, name string, allValues bool, username string, groups []string) (*HelmValues, error) {
-	if h.ContextResolver == nil {
-		return client.GetValuesAsUser(namespace, name, allValues, username, groups)
-	}
-	restCfg, ctxName := h.ContextResolver(r)
-	if restCfg == nil {
-		return client.GetValuesAsUser(namespace, name, allValues, username, groups)
-	}
-	actionConfig, err := client.GetActionConfigForUserWith(restCfg, ctxName, namespace, username, groups)
-	if err != nil {
-		return nil, err
-	}
-	return GetValuesWith(actionConfig, name, allValues)
-}
-
-// Write dispatchers. Each one routes a mutating Helm action through the
-// per-user pool context when one is resolved, falling back to the global
-// Client methods (default context) otherwise. Without these, destructive
-// operations like Uninstall would always target the default cluster even
-// when the user is on a different one — silently destroying releases on
-// the wrong cluster.
-
-func (h *Handlers) uninstall(r *http.Request, client *Client, namespace, name string) error {
-	username, groups := userCreds(r)
-	restCfg, ctxName := h.resolveContext(r)
-	if restCfg == nil {
-		if username != "" {
-			return client.UninstallAsUser(namespace, name, username, groups)
-		}
-		return client.Uninstall(namespace, name)
-	}
-	actionConfig, err := client.GetActionConfigForUserWith(restCfg, ctxName, namespace, username, groups)
-	if err != nil {
-		return err
-	}
-	return client.UninstallWith(actionConfig, name)
-}
-
-func (h *Handlers) rollback(r *http.Request, client *Client, namespace, name string, revision int) error {
-	return h.rollbackWithProgress(r, client, namespace, name, revision, nil)
-}
-
-func (h *Handlers) rollbackWithProgress(r *http.Request, client *Client, namespace, name string, revision int, progressCh chan<- InstallProgress) error {
-	username, groups := userCreds(r)
-	restCfg, ctxName := h.resolveContext(r)
-	if restCfg == nil {
-		if progressCh != nil {
-			return client.RollbackWithProgress(namespace, name, revision, progressCh)
-		}
-		if username != "" {
-			return client.RollbackAsUser(namespace, name, revision, username, groups)
-		}
-		return client.Rollback(namespace, name, revision)
-	}
-	actionConfig, err := client.GetActionConfigForUserWith(restCfg, ctxName, namespace, username, groups)
-	if err != nil {
-		return err
-	}
-	// Direct rollbackWith ignores progress; per-user streaming progress is best-effort.
-	return client.RollbackWith(actionConfig, name, revision)
-}
-
-func (h *Handlers) upgrade(r *http.Request, client *Client, namespace, name, targetVersion, repositoryName string, progressCh chan<- InstallProgress) error {
-	username, groups := userCreds(r)
-	restCfg, ctxName := h.resolveContext(r)
-	if restCfg == nil {
-		if progressCh != nil {
-			if username != "" {
-				return client.UpgradeWithProgressAsUser(namespace, name, targetVersion, repositoryName, username, groups, progressCh)
-			}
-			return client.UpgradeWithProgress(namespace, name, targetVersion, repositoryName, progressCh)
-		}
-		if username != "" {
-			return client.UpgradeAsUser(namespace, name, targetVersion, repositoryName, username, groups)
-		}
-		return client.Upgrade(namespace, name, targetVersion, repositoryName)
-	}
-	actionConfig, err := client.GetActionConfigForUserWith(restCfg, ctxName, namespace, username, groups)
-	if err != nil {
-		return err
-	}
-	return client.UpgradeWith(actionConfig, name, targetVersion, repositoryName, progressCh)
-}
-
-func (h *Handlers) applyValues(r *http.Request, client *Client, namespace, name string, newValues map[string]any) error {
-	username, groups := userCreds(r)
-	restCfg, ctxName := h.resolveContext(r)
-	if restCfg == nil {
-		if username != "" {
-			return client.ApplyValuesAsUser(namespace, name, newValues, username, groups)
-		}
-		return client.ApplyValues(namespace, name, newValues)
-	}
-	actionConfig, err := client.GetActionConfigForUserWith(restCfg, ctxName, namespace, username, groups)
-	if err != nil {
-		return err
-	}
-	return client.ApplyValuesWith(actionConfig, name, newValues)
-}
-
-func (h *Handlers) install(r *http.Request, client *Client, req *InstallRequest, progressCh chan<- InstallProgress) (*HelmRelease, error) {
-	username, groups := userCreds(r)
-	restCfg, ctxName := h.resolveContext(r)
-	if restCfg == nil {
-		if progressCh != nil {
-			if username != "" {
-				return client.InstallWithProgressAsUser(req, progressCh, username, groups)
-			}
-			return client.InstallWithProgress(req, progressCh)
-		}
-		if username != "" {
-			return client.InstallAsUser(req, username, groups)
-		}
-		return client.Install(req)
-	}
-	actionConfig, err := client.GetActionConfigForUserWith(restCfg, ctxName, req.Namespace, username, groups)
-	if err != nil {
-		return nil, err
-	}
-	return client.InstallWith(actionConfig, req, progressCh)
-}
-
-func (h *Handlers) getManifestDiff(r *http.Request, client *Client, namespace, name string, rev1, rev2 int, username string, groups []string) (*ManifestDiff, error) {
-	m1, err := h.getManifest(r, client, namespace, name, rev1, username, groups)
-	if err != nil {
-		return nil, err
-	}
-	m2, err := h.getManifest(r, client, namespace, name, rev2, username, groups)
-	if err != nil {
-		return nil, err
-	}
-	return &ManifestDiff{
-		Revision1: rev1,
-		Revision2: rev2,
-		Diff:      computeDiff(m1, m2, rev1, rev2),
-	}, nil
+	return h.resolveNamespaces(r)
 }
 
 // RegisterRoutes registers Helm routes on the given router
@@ -258,9 +117,14 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 		r.Post("/releases/install-stream", h.handleInstallStream)
 		r.Get("/releases/{namespace}/{name}", h.handleGetRelease)
 		r.Get("/releases/{namespace}/{name}/manifest", h.handleGetManifest)
+		r.Get("/releases/{namespace}/{name}/values/diff", h.handleGetValuesDiff)
 		r.Get("/releases/{namespace}/{name}/values", h.handleGetValues)
 		r.Get("/releases/{namespace}/{name}/diff", h.handleGetDiff)
+		r.Get("/releases/{namespace}/{name}/notes/diff", h.handleGetNotesDiff)
+		r.Get("/releases/{namespace}/{name}/hooks/diff", h.handleGetHooksDiff)
+		r.Get("/releases/{namespace}/{name}/resources/diff", h.handleGetResourceDiff)
 		r.Get("/releases/{namespace}/{name}/upgrade-info", h.handleCheckUpgrade)
+		r.Get("/releases/{namespace}/{name}/versions", h.handleAvailableVersions)
 		r.Get("/upgrade-check", h.handleBatchUpgradeCheck)
 		// Actions (write operations)
 		r.Post("/releases/{namespace}/{name}/rollback", h.handleRollback)
@@ -274,6 +138,12 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 		// Chart browser (local repositories)
 		r.Get("/repositories", h.handleListRepositories)
 		r.Post("/repositories/{name}/update", h.handleUpdateRepository)
+
+		// Registered OCI chart sources (the OCI analog of `helm repo add`) — let
+		// Radar track upgrades for the user's own OCI-published charts.
+		r.Get("/oci-sources", h.handleListOCISources)
+		r.Post("/oci-sources", h.handleAddOCISource)
+		r.Delete("/oci-sources", h.handleRemoveOCISource)
 		r.Get("/charts", h.handleSearchCharts)
 		r.Get("/charts/{repo}/{chart}", h.handleGetChartDetail)
 		r.Get("/charts/{repo}/{chart}/{version}", h.handleGetChartDetailVersion)
@@ -287,16 +157,24 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 
 // handleListReleases returns all Helm releases
 func (h *Handlers) handleListReleases(w http.ResponseWriter, r *http.Request) {
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
 	}
 
-	namespace := r.URL.Query().Get("namespace")
+	// Resolve which namespaces to list. An explicit ?namespace= is honored by
+	// the resolver (via the request query); when none is given, a
+	// namespace-restricted identity resolves to its accessible namespaces
+	// instead of a cluster-wide `list secrets` that would 403.
+	namespaces, ok := h.listNamespaces(r)
+	if !ok {
+		writeJSON(w, []HelmRelease{})
+		return
+	}
 
 	username, groups := userCreds(r)
-	releases, err := h.listReleases(r, client, namespace, username, groups)
+	releases, err := client.ListReleasesAcrossNamespaces(namespaces, username, groups)
 	if err != nil {
 		if IsForbiddenError(err) {
 			writeError(w, http.StatusForbidden, "insufficient permissions to list Helm releases")
@@ -311,7 +189,7 @@ func (h *Handlers) handleListReleases(w http.ResponseWriter, r *http.Request) {
 
 // handleGetRelease returns details for a specific release
 func (h *Handlers) handleGetRelease(w http.ResponseWriter, r *http.Request) {
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -321,7 +199,7 @@ func (h *Handlers) handleGetRelease(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
 	username, groups := userCreds(r)
-	release, err := h.getRelease(r, client, namespace, name, username, groups)
+	release, err := client.GetReleaseAsUser(namespace, name, username, groups)
 	if err != nil {
 		if IsForbiddenError(err) {
 			writeError(w, http.StatusForbidden, "insufficient permissions to get Helm release")
@@ -330,19 +208,20 @@ func (h *Handlers) handleGetRelease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	EnrichHookDiagnosticsWithClusterEvidence(r.Context(), release, k8s.ClientFromContext(r.Context()))
 
 	writeJSON(w, release)
 }
 
 // handleGetManifest returns the rendered manifest for a release.
 // Member+ only — manifests can inline literal Secret resources with
-// base64-encoded data, which K8s 'view' (the default cloud:viewer
+// base64-encoded data, which K8s 'view' (the default radar:viewer
 // binding) excludes.
 func (h *Handlers) handleGetManifest(w http.ResponseWriter, r *http.Request) {
 	if !requireCloudRole(w, r, auth.RoleMember, "view Helm release manifests") {
 		return
 	}
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -360,7 +239,7 @@ func (h *Handlers) handleGetManifest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	username, groups := userCreds(r)
-	manifest, err := h.getManifest(r, client, namespace, name, revision, username, groups)
+	manifest, err := client.GetManifestAsUser(namespace, name, revision, username, groups)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -377,7 +256,7 @@ func (h *Handlers) handleGetValues(w http.ResponseWriter, r *http.Request) {
 	if !requireCloudRole(w, r, auth.RoleMember, "view Helm release values") {
 		return
 	}
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -386,9 +265,18 @@ func (h *Handlers) handleGetValues(w http.ResponseWriter, r *http.Request) {
 	namespace := chi.URLParam(r, "namespace")
 	name := chi.URLParam(r, "name")
 	allValues := r.URL.Query().Get("all") == "true"
+	revision := 0
+	if revStr := r.URL.Query().Get("revision"); revStr != "" {
+		rev, err := strconv.Atoi(revStr)
+		if err != nil || rev <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid revision parameter")
+			return
+		}
+		revision = rev
+	}
 
 	username, groups := userCreds(r)
-	values, err := h.getValues(r, client, namespace, name, allValues, username, groups)
+	values, err := client.GetValuesRevisionAsUser(namespace, name, allValues, revision, username, groups)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -397,13 +285,42 @@ func (h *Handlers) handleGetValues(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, values)
 }
 
+// handleGetValuesDiff returns a values diff between two release revisions.
+// Member+ only — values often contain credentials.
+func (h *Handlers) handleGetValuesDiff(w http.ResponseWriter, r *http.Request) {
+	if !requireCloudRole(w, r, auth.RoleMember, "diff Helm release values") {
+		return
+	}
+	client := h.client(r)
+	if client == nil {
+		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
+		return
+	}
+
+	rev1, rev2, ok := parseRevisionPair(w, r)
+	if !ok {
+		return
+	}
+
+	namespace := chi.URLParam(r, "namespace")
+	name := chi.URLParam(r, "name")
+	allValues := r.URL.Query().Get("all") == "true"
+	username, groups := userCreds(r)
+	diff, err := client.GetValuesDiffAsUser(namespace, name, rev1, rev2, allValues, username, groups)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, diff)
+}
+
 // handleGetDiff returns the diff between two revisions. Member+ only
 // — same surface as GetManifest (renders both revisions).
 func (h *Handlers) handleGetDiff(w http.ResponseWriter, r *http.Request) {
 	if !requireCloudRole(w, r, auth.RoleMember, "diff Helm release manifests") {
 		return
 	}
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -412,28 +329,13 @@ func (h *Handlers) handleGetDiff(w http.ResponseWriter, r *http.Request) {
 	namespace := chi.URLParam(r, "namespace")
 	name := chi.URLParam(r, "name")
 
-	rev1Str := r.URL.Query().Get("revision1")
-	rev2Str := r.URL.Query().Get("revision2")
-
-	if rev1Str == "" || rev2Str == "" {
-		writeError(w, http.StatusBadRequest, "revision1 and revision2 parameters are required")
-		return
-	}
-
-	rev1, err := strconv.Atoi(rev1Str)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid revision1 parameter")
-		return
-	}
-
-	rev2, err := strconv.Atoi(rev2Str)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid revision2 parameter")
+	rev1, rev2, ok := parseRevisionPair(w, r)
+	if !ok {
 		return
 	}
 
 	username, groups := userCreds(r)
-	diff, err := h.getManifestDiff(r, client, namespace, name, rev1, rev2, username, groups)
+	diff, err := client.GetManifestDiffAsUser(namespace, name, rev1, rev2, username, groups)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -442,9 +344,108 @@ func (h *Handlers) handleGetDiff(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, diff)
 }
 
+// handleGetNotesDiff returns a release notes diff between two revisions.
+func (h *Handlers) handleGetNotesDiff(w http.ResponseWriter, r *http.Request) {
+	if !requireCloudRole(w, r, auth.RoleMember, "diff Helm release notes") {
+		return
+	}
+	client := h.client(r)
+	if client == nil {
+		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
+		return
+	}
+	rev1, rev2, ok := parseRevisionPair(w, r)
+	if !ok {
+		return
+	}
+	namespace := chi.URLParam(r, "namespace")
+	name := chi.URLParam(r, "name")
+	username, groups := userCreds(r)
+	diff, err := client.GetNotesDiffAsUser(namespace, name, rev1, rev2, username, groups)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, diff)
+}
+
+// handleGetHooksDiff returns a release hook metadata diff between two revisions.
+func (h *Handlers) handleGetHooksDiff(w http.ResponseWriter, r *http.Request) {
+	if !requireCloudRole(w, r, auth.RoleMember, "diff Helm release hooks") {
+		return
+	}
+	client := h.client(r)
+	if client == nil {
+		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
+		return
+	}
+	rev1, rev2, ok := parseRevisionPair(w, r)
+	if !ok {
+		return
+	}
+	namespace := chi.URLParam(r, "namespace")
+	name := chi.URLParam(r, "name")
+	username, groups := userCreds(r)
+	diff, err := client.GetHooksDiffAsUser(namespace, name, rev1, rev2, username, groups)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, diff)
+}
+
+// handleGetResourceDiff returns added/removed rendered resources between revisions.
+func (h *Handlers) handleGetResourceDiff(w http.ResponseWriter, r *http.Request) {
+	if !requireCloudRole(w, r, auth.RoleMember, "diff Helm release resources") {
+		return
+	}
+	client := h.client(r)
+	if client == nil {
+		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
+		return
+	}
+	rev1, rev2, ok := parseRevisionPair(w, r)
+	if !ok {
+		return
+	}
+	namespace := chi.URLParam(r, "namespace")
+	name := chi.URLParam(r, "name")
+	username, groups := userCreds(r)
+	diff, err := client.GetResourceDiffAsUser(namespace, name, rev1, rev2, username, groups)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, diff)
+}
+
+func parseRevisionPair(w http.ResponseWriter, r *http.Request) (int, int, bool) {
+	rev1Str := r.URL.Query().Get("revision1")
+	rev2Str := r.URL.Query().Get("revision2")
+	if rev1Str == "" || rev2Str == "" {
+		writeError(w, http.StatusBadRequest, "revision1 and revision2 parameters are required")
+		return 0, 0, false
+	}
+	rev1, err := strconv.Atoi(rev1Str)
+	if err != nil || rev1 <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid revision1 parameter")
+		return 0, 0, false
+	}
+	rev2, err := strconv.Atoi(rev2Str)
+	if err != nil || rev2 <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid revision2 parameter")
+		return 0, 0, false
+	}
+	if rev1 == rev2 {
+		writeError(w, http.StatusBadRequest, "revision1 and revision2 must differ")
+		return 0, 0, false
+	}
+	return rev1, rev2, true
+}
+
 // handleCheckUpgrade checks if a newer version is available
 func (h *Handlers) handleCheckUpgrade(w http.ResponseWriter, r *http.Request) {
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -463,18 +464,52 @@ func (h *Handlers) handleCheckUpgrade(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, info)
 }
 
-// handleBatchUpgradeCheck checks all releases for upgrades at once
-func (h *Handlers) handleBatchUpgradeCheck(w http.ResponseWriter, r *http.Request) {
-	client := GetClient()
+// handleAvailableVersions returns the newest-first list of chart versions this
+// release could be upgraded/downgraded to, so the upgrade dialog can offer a
+// specific target version. Returns [] when the source can't be resolved.
+func (h *Handlers) handleAvailableVersions(w http.ResponseWriter, r *http.Request) {
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
 	}
 
-	namespace := r.URL.Query().Get("namespace")
+	namespace := chi.URLParam(r, "namespace")
+	name := chi.URLParam(r, "name")
 
 	username, groups := userCreds(r)
-	info, err := client.BatchCheckUpgradesAsUser(namespace, username, groups)
+	versions, err := client.AvailableVersionsAsUser(namespace, name, username, groups)
+	if err != nil {
+		if IsForbiddenError(err) {
+			writeError(w, http.StatusForbidden, "insufficient permissions to read Helm release")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if versions == nil {
+		versions = []string{}
+	}
+	writeJSON(w, versions)
+}
+
+// handleBatchUpgradeCheck checks all releases for upgrades at once
+func (h *Handlers) handleBatchUpgradeCheck(w http.ResponseWriter, r *http.Request) {
+	client := h.client(r)
+	if client == nil {
+		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
+		return
+	}
+
+	namespaces, ok := h.listNamespaces(r)
+	if !ok {
+		writeJSON(w, &BatchUpgradeInfo{Releases: map[string]*UpgradeInfo{}})
+		return
+	}
+
+	username, groups := userCreds(r)
+	info, err := client.BatchCheckUpgradesAcrossNamespaces(namespaces, username, groups)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -492,7 +527,7 @@ func (h *Handlers) handleRollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -514,7 +549,13 @@ func (h *Handlers) handleRollback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auth.AuditLog(r, namespace, name)
-	if err := h.rollback(r, client, namespace, name, revision); err != nil {
+	var rollbackErr error
+	if user := auth.UserFromContext(r.Context()); user != nil {
+		rollbackErr = client.RollbackAsUser(namespace, name, revision, user.Username, user.Groups)
+	} else {
+		rollbackErr = client.Rollback(namespace, name, revision)
+	}
+	if err := rollbackErr; err != nil {
 		if IsForbiddenError(err) {
 			writeError(w, http.StatusForbidden, "insufficient permissions to rollback Helm release")
 			return
@@ -535,7 +576,7 @@ func (h *Handlers) handleRollbackStream(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -573,7 +614,7 @@ func (h *Handlers) handleRollbackStream(w http.ResponseWriter, r *http.Request) 
 
 	resultCh := make(chan error, 1)
 	go func() {
-		resultCh <- h.rollbackWithProgress(r, client, namespace, name, revision, progressCh)
+		resultCh <- client.RollbackWithProgress(namespace, name, revision, progressCh)
 	}()
 
 	for {
@@ -628,7 +669,7 @@ func (h *Handlers) handleUninstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -638,7 +679,13 @@ func (h *Handlers) handleUninstall(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
 	auth.AuditLog(r, namespace, name)
-	if err := h.uninstall(r, client, namespace, name); err != nil {
+	var uninstallErr error
+	if user := auth.UserFromContext(r.Context()); user != nil {
+		uninstallErr = client.UninstallAsUser(namespace, name, user.Username, user.Groups)
+	} else {
+		uninstallErr = client.Uninstall(namespace, name)
+	}
+	if err := uninstallErr; err != nil {
 		if IsForbiddenError(err) {
 			writeError(w, http.StatusForbidden, "insufficient permissions to uninstall Helm release")
 			return
@@ -659,7 +706,7 @@ func (h *Handlers) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -676,7 +723,13 @@ func (h *Handlers) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	repositoryName := r.URL.Query().Get("repository")
 
 	auth.AuditLog(r, namespace, name)
-	if err := h.upgrade(r, client, namespace, name, version, repositoryName, nil); err != nil {
+	var upgradeErr error
+	if user := auth.UserFromContext(r.Context()); user != nil {
+		upgradeErr = client.UpgradeAsUser(namespace, name, version, repositoryName, user.Username, user.Groups)
+	} else {
+		upgradeErr = client.Upgrade(namespace, name, version, repositoryName)
+	}
+	if err := upgradeErr; err != nil {
 		if IsForbiddenError(err) {
 			writeError(w, http.StatusForbidden, "insufficient permissions to upgrade Helm release")
 			return
@@ -697,7 +750,7 @@ func (h *Handlers) handleUpgradeStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -712,6 +765,12 @@ func (h *Handlers) handleUpgradeStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repositoryName := r.URL.Query().Get("repository")
+
+	editedValues, err := decodeOptionalApplyValuesRequest(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
 
 	// Set up SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -728,9 +787,25 @@ func (h *Handlers) handleUpgradeStream(w http.ResponseWriter, r *http.Request) {
 	progressCh := make(chan InstallProgress, 10)
 	defer close(progressCh)
 
+	auth.AuditLog(r, namespace, name)
 	resultCh := make(chan error, 1)
 	go func() {
-		resultCh <- h.upgrade(r, client, namespace, name, version, repositoryName, progressCh)
+		user := auth.UserFromContext(r.Context())
+		// Use != nil, not len > 0: an explicit empty map ({}) means
+		// "clear all my overrides" and must NOT fall back to carry-over.
+		if editedValues != nil {
+			if user != nil {
+				resultCh <- client.UpgradeWithValuesProgressAsUser(namespace, name, version, repositoryName, editedValues, user.Username, user.Groups, progressCh)
+				return
+			}
+			resultCh <- client.UpgradeWithValuesProgress(namespace, name, version, repositoryName, editedValues, progressCh)
+			return
+		}
+		if user != nil {
+			resultCh <- client.UpgradeWithProgressAsUser(namespace, name, version, repositoryName, user.Username, user.Groups, progressCh)
+			return
+		}
+		resultCh <- client.UpgradeWithProgress(namespace, name, version, repositoryName, progressCh)
 	}()
 
 	for {
@@ -783,7 +858,7 @@ func (h *Handlers) handlePreviewValues(w http.ResponseWriter, r *http.Request) {
 	if !requireCloudRole(w, r, auth.RoleMember, "preview Helm release values") {
 		return
 	}
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -798,7 +873,8 @@ func (h *Handlers) handlePreviewValues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	preview, err := client.PreviewValuesChange(namespace, name, req.Values)
+	username, groups := userCreds(r)
+	preview, err := client.PreviewValuesChangeAsUser(namespace, name, req.Values, req.Version, req.Repository, username, groups)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -816,7 +892,7 @@ func (h *Handlers) handleApplyValues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -825,14 +901,20 @@ func (h *Handlers) handleApplyValues(w http.ResponseWriter, r *http.Request) {
 	namespace := chi.URLParam(r, "namespace")
 	name := chi.URLParam(r, "name")
 
-	var req ApplyValuesRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, err := decodeApplyValuesRequest(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	auth.AuditLog(r, namespace, name)
-	if err := h.applyValues(r, client, namespace, name, req.Values); err != nil {
+	var applyErr error
+	if user := auth.UserFromContext(r.Context()); user != nil {
+		applyErr = client.ApplyValuesAsUser(namespace, name, req.Values, user.Username, user.Groups)
+	} else {
+		applyErr = client.ApplyValues(namespace, name, req.Values)
+	}
+	if err := applyErr; err != nil {
 		if IsForbiddenError(err) {
 			writeError(w, http.StatusForbidden, "insufficient permissions to apply Helm values")
 			return
@@ -850,7 +932,7 @@ func (h *Handlers) handleApplyValues(w http.ResponseWriter, r *http.Request) {
 
 // handleListRepositories returns all configured Helm repositories
 func (h *Handlers) handleListRepositories(w http.ResponseWriter, r *http.Request) {
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -880,7 +962,7 @@ func (h *Handlers) handleUpdateRepository(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -900,9 +982,63 @@ func (h *Handlers) handleUpdateRepository(w http.ResponseWriter, r *http.Request
 	writeJSON(w, map[string]string{"status": "success", "message": "Repository updated"})
 }
 
+// ociSourceRequest is the body for registering/unregistering an OCI chart source.
+type ociSourceRequest struct {
+	Source string `json:"source"`
+}
+
+// handleListOCISources returns the registered OCI chart-source prefixes.
+func (h *Handlers) handleListOCISources(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, ListOCISources())
+}
+
+// handleAddOCISource registers an OCI chart-source prefix. Gated by
+// requireHelmWrite (same as repo refresh): it mutates pod-local config and
+// underpins later upgrades, but is not a cluster mutation.
+func (h *Handlers) handleAddOCISource(w http.ResponseWriter, r *http.Request) {
+	if h.ConfigWriteAllowed != nil && !h.ConfigWriteAllowed(w, r) {
+		return
+	}
+	if !requireHelmWrite(w, r) {
+		return
+	}
+	var req ociSourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	sources, err := AddOCISource(req.Source)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, sources)
+}
+
+// handleRemoveOCISource unregisters an OCI chart-source prefix.
+func (h *Handlers) handleRemoveOCISource(w http.ResponseWriter, r *http.Request) {
+	if h.ConfigWriteAllowed != nil && !h.ConfigWriteAllowed(w, r) {
+		return
+	}
+	if !requireHelmWrite(w, r) {
+		return
+	}
+	var req ociSourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	sources, err := RemoveOCISource(req.Source)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, sources)
+}
+
 // handleSearchCharts searches for charts across all repositories
 func (h *Handlers) handleSearchCharts(w http.ResponseWriter, r *http.Request) {
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -922,7 +1058,7 @@ func (h *Handlers) handleSearchCharts(w http.ResponseWriter, r *http.Request) {
 
 // handleGetChartDetail returns detailed info about a chart (latest version)
 func (h *Handlers) handleGetChartDetail(w http.ResponseWriter, r *http.Request) {
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -942,7 +1078,7 @@ func (h *Handlers) handleGetChartDetail(w http.ResponseWriter, r *http.Request) 
 
 // handleGetChartDetailVersion returns detailed info about a specific chart version
 func (h *Handlers) handleGetChartDetailVersion(w http.ResponseWriter, r *http.Request) {
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -970,7 +1106,7 @@ func (h *Handlers) handleInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -1001,7 +1137,13 @@ func (h *Handlers) handleInstall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auth.AuditLog(r, req.Namespace, req.ReleaseName)
-	release, installErr := h.install(r, client, &req, nil)
+	var release *HelmRelease
+	var installErr error
+	if user := auth.UserFromContext(r.Context()); user != nil {
+		release, installErr = client.InstallAsUser(&req, user.Username, user.Groups)
+	} else {
+		release, installErr = client.Install(&req)
+	}
 	if err := installErr; err != nil {
 		log.Printf("[helm] install %q/%q (chart=%q repo=%q) failed: %v", req.Namespace, req.ReleaseName, req.ChartName, req.Repository, err)
 		writeInstallError(w, err)
@@ -1020,7 +1162,7 @@ func (h *Handlers) handleInstallStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := GetClient()
+	client := h.client(r)
 	if client == nil {
 		writeError(w, http.StatusServiceUnavailable, "Helm client not initialized")
 		return
@@ -1068,9 +1210,16 @@ func (h *Handlers) handleInstallStream(w http.ResponseWriter, r *http.Request) {
 
 	// Start install in goroutine
 	auth.AuditLog(r, req.Namespace, req.ReleaseName)
+	user := auth.UserFromContext(r.Context())
 	resultCh := make(chan installResult, 1)
 	go func() {
-		release, err := h.install(r, client, &req, progressCh)
+		var release *HelmRelease
+		var err error
+		if user != nil {
+			release, err = client.InstallWithProgressAsUser(&req, progressCh, user.Username, user.Groups)
+		} else {
+			release, err = client.InstallWithProgress(&req, progressCh)
+		}
 		resultCh <- installResult{release: release, err: err}
 	}()
 
@@ -1145,6 +1294,9 @@ func writeJSON(w http.ResponseWriter, data any) {
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
+	if status >= 500 && k8s.MarkDisconnectedIfClusterUnreachable(message) {
+		status = http.StatusServiceUnavailable
+	}
 	if status >= 500 {
 		errorlog.Record("helm", "error", "%s", message)
 	}
@@ -1154,7 +1306,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 }
 
 // writeErrorCode is writeError with a stable machine-readable error_code
-// in the response body so the SPA + MCP clients can branch on the error
+// in the response body so the frontend + MCP clients can branch on the error
 // type without parsing the human message. Used for role-gated 403s and
 // any other case where the consumer wants to react differently per code.
 func writeErrorCode(w http.ResponseWriter, status int, code, message string) {
@@ -1179,7 +1331,7 @@ func writeErrorCode(w http.ResponseWriter, status int, code, message string) {
 // strictly additive for Cloud-attributed callers.
 //
 // When the caller IS Cloud-attributed and their tier is below `min`,
-// returns 403 with error_code=cloud_role_insufficient so the SPA can
+// returns 403 with error_code=cloud_role_insufficient so the frontend can
 // render a friendly "your role doesn't allow this" message instead of
 // a generic auth failure.
 func requireCloudRole(w http.ResponseWriter, r *http.Request, min auth.CloudRole, opName string) bool {

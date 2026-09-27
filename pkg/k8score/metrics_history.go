@@ -2,12 +2,16 @@ package k8score
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 )
 
@@ -33,17 +37,35 @@ type ContainerMetricsHistory struct {
 
 // PodMetricsHistory holds historical metrics for a pod.
 type PodMetricsHistory struct {
-	Namespace       string                    `json:"namespace"`
-	Name            string                    `json:"name"`
-	Containers      []ContainerMetricsHistory `json:"containers"`
-	CollectionError string                    `json:"collectionError,omitempty"`
+	Namespace                   string                    `json:"namespace"`
+	Name                        string                    `json:"name"`
+	Containers                  []ContainerMetricsHistory `json:"containers"`
+	CollectionError             string                    `json:"collectionError,omitempty"`
+	RawCollectionError          string                    `json:"rawCollectionError,omitempty"`
+	MetricsUnavailableDiagnosis string                    `json:"metricsUnavailableDiagnosis,omitempty"`
+	MetricsUnavailable          bool                      `json:"metricsUnavailable,omitempty"`
 }
 
 // NodeMetricsHistory holds historical metrics for a node.
 type NodeMetricsHistory struct {
-	Name            string             `json:"name"`
-	DataPoints      []MetricsDataPoint `json:"dataPoints"`
-	CollectionError string             `json:"collectionError,omitempty"`
+	Name                        string             `json:"name"`
+	DataPoints                  []MetricsDataPoint `json:"dataPoints"`
+	CollectionError             string             `json:"collectionError,omitempty"`
+	RawCollectionError          string             `json:"rawCollectionError,omitempty"`
+	MetricsUnavailableDiagnosis string             `json:"metricsUnavailableDiagnosis,omitempty"`
+	MetricsUnavailable          bool               `json:"metricsUnavailable,omitempty"`
+}
+
+// ContainerResourceMetrics holds latest usage plus request/limit for a single
+// container. Usage comes from the metrics API; request/limit from the pod spec.
+type ContainerResourceMetrics struct {
+	Name          string `json:"name"`
+	CPU           int64  `json:"cpu"`
+	CPURequest    int64  `json:"cpuRequest"`
+	CPULimit      int64  `json:"cpuLimit"`
+	Memory        int64  `json:"memory"`
+	MemoryRequest int64  `json:"memoryRequest"`
+	MemoryLimit   int64  `json:"memoryLimit"`
 }
 
 // TopPodMetrics holds the latest metrics snapshot for a single pod.
@@ -56,16 +78,21 @@ type TopPodMetrics struct {
 	CPULimit      int64  `json:"cpuLimit"`
 	MemoryRequest int64  `json:"memoryRequest"`
 	MemoryLimit   int64  `json:"memoryLimit"`
+	// Containers carries per-container usage and request/limit for pods with
+	// more than one running container (regular + native sidecars). Omitted for
+	// single-container pods, where the pod-level fields above already suffice.
+	Containers []ContainerResourceMetrics `json:"containers,omitempty"`
 }
 
 // TopNodeMetrics holds the latest metrics snapshot for a single node.
 type TopNodeMetrics struct {
-	Name              string `json:"name"`
-	CPU               int64  `json:"cpu"`
-	Memory            int64  `json:"memory"`
-	PodCount          int    `json:"podCount"`
-	CPUAllocatable    int64  `json:"cpuAllocatable"`
-	MemoryAllocatable int64  `json:"memoryAllocatable"`
+	Name              string    `json:"name"`
+	CPU               int64     `json:"cpu"`
+	Memory            int64     `json:"memory"`
+	ObservedAt        time.Time `json:"observedAt,omitzero"`
+	PodCount          int       `json:"podCount"`
+	CPUAllocatable    int64     `json:"cpuAllocatable"`
+	MemoryAllocatable int64     `json:"memoryAllocatable"`
 }
 
 // MetricsCollectionHealth reports the health of the metrics collection loop.
@@ -90,8 +117,9 @@ type MetricsSourceHealth struct {
 
 // MetricsHistoryStore stores historical metrics data polled from the metrics.k8s.io API.
 type MetricsHistoryStore struct {
-	mu        sync.RWMutex
-	dynClient dynamic.Interface
+	mu         sync.RWMutex
+	dynClient  dynamic.Interface
+	resolveGVR MetricsGVRResolver
 
 	podMetrics  map[string]*podMetricsBuffer
 	nodeMetrics map[string]*nodeMetricsBuffer
@@ -163,10 +191,59 @@ func (rb *ringBuffer) GetAll() []MetricsDataPoint {
 	return result
 }
 
+func metricsCollectionErrorLevel(err error) string {
+	if MetricsAPIUnavailable(err) {
+		return "warning"
+	}
+	return "error"
+}
+
+func MetricsAPIUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrMetricsAPINotDiscovered) {
+		return true
+	}
+	if apierrors.IsNotFound(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "metrics") {
+		return false
+	}
+	if apierrors.IsServiceUnavailable(err) {
+		return true
+	}
+	return strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "could not find the requested resource") ||
+		strings.Contains(msg, "no matches for kind") ||
+		strings.Contains(msg, "no resource matches") ||
+		strings.Contains(msg, "no metrics known") ||
+		strings.Contains(msg, "not available") ||
+		strings.Contains(msg, "unable to fetch metrics") ||
+		strings.Contains(msg, "currently unable to handle the request")
+}
+
 // NewMetricsHistoryStore creates a MetricsHistoryStore. Call Start() to begin polling.
 func NewMetricsHistoryStore(client dynamic.Interface) *MetricsHistoryStore {
+	return NewMetricsHistoryStoreWithResolver(client, func(resource string) (schema.GroupVersionResource, bool) {
+		switch resource {
+		case "pods":
+			return PodMetricsGVR, true
+		case "nodes":
+			return NodeMetricsGVR, true
+		default:
+			return schema.GroupVersionResource{}, false
+		}
+	})
+}
+
+// NewMetricsHistoryStoreWithResolver creates a store that follows discovered metrics API versions.
+func NewMetricsHistoryStoreWithResolver(client dynamic.Interface, resolveGVR MetricsGVRResolver) *MetricsHistoryStore {
 	return &MetricsHistoryStore{
 		dynClient:   client,
+		resolveGVR:  resolveGVR,
 		podMetrics:  make(map[string]*podMetricsBuffer),
 		nodeMetrics: make(map[string]*nodeMetricsBuffer),
 		stopCh:      make(chan struct{}),
@@ -216,6 +293,49 @@ func (s *MetricsHistoryStore) collectMetrics() {
 	s.collectNodeMetrics(ctx, now)
 }
 
+func (s *MetricsHistoryStore) metricsGVR(resource string) (schema.GroupVersionResource, bool) {
+	if s.resolveGVR == nil {
+		return schema.GroupVersionResource{}, false
+	}
+	gvr, ok := s.resolveGVR(resource)
+	if !ok || gvr.Group != MetricsAPIGroup || gvr.Version == "" || gvr.Resource != resource {
+		return schema.GroupVersionResource{}, false
+	}
+	return gvr, true
+}
+
+func (s *MetricsHistoryStore) recordPodCollectionError(err error) {
+	errMsg := err.Error()
+	s.mu.Lock()
+	s.consecutivePodErrors++
+	s.lastPodError = errMsg
+	shouldReport := s.consecutivePodErrors == 1 || s.consecutivePodErrors%20 == 0
+	count := s.consecutivePodErrors
+	s.mu.Unlock()
+	if shouldReport {
+		log.Printf("[metrics] Pod metrics collection failed (count=%d): %v", count, err)
+		if s.OnError != nil {
+			s.OnError("metrics", metricsCollectionErrorLevel(err), "pod metrics collection failed (count=%d): %v", count, err)
+		}
+	}
+}
+
+func (s *MetricsHistoryStore) recordNodeCollectionError(err error) {
+	errMsg := err.Error()
+	s.mu.Lock()
+	s.consecutiveNodeErrors++
+	s.lastNodeError = errMsg
+	shouldReport := s.consecutiveNodeErrors == 1 || s.consecutiveNodeErrors%20 == 0
+	count := s.consecutiveNodeErrors
+	s.mu.Unlock()
+	if shouldReport {
+		log.Printf("[metrics] Node metrics collection failed (count=%d): %v", count, err)
+		if s.OnError != nil {
+			s.OnError("metrics", metricsCollectionErrorLevel(err), "node metrics collection failed (count=%d): %v", count, err)
+		}
+	}
+}
+
 func (s *MetricsHistoryStore) collectPodMetrics(ctx context.Context, now time.Time) {
 	if s.dynClient == nil {
 		var shouldReport bool
@@ -234,24 +354,15 @@ func (s *MetricsHistoryStore) collectPodMetrics(ctx context.Context, now time.Ti
 		}
 		return
 	}
+	podMetricsGVR, ok := s.metricsGVR("pods")
+	if !ok {
+		s.recordPodCollectionError(ErrMetricsAPINotDiscovered)
+		return
+	}
 
-	result, err := s.dynClient.Resource(PodMetricsGVR).List(ctx, metav1.ListOptions{})
+	result, err := s.dynClient.Resource(podMetricsGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		var shouldReport bool
-		var count int
-		errMsg := err.Error()
-		s.mu.Lock()
-		s.consecutivePodErrors++
-		s.lastPodError = errMsg
-		shouldReport = s.consecutivePodErrors == 1 || s.consecutivePodErrors%20 == 0
-		count = s.consecutivePodErrors
-		s.mu.Unlock()
-		if shouldReport {
-			log.Printf("[metrics] Pod metrics collection failed (count=%d): %v", count, err)
-			if s.OnError != nil {
-				s.OnError("metrics", "error", "pod metrics collection failed (count=%d): %v", count, err)
-			}
-		}
+		s.recordPodCollectionError(err)
 		return
 	}
 
@@ -341,24 +452,15 @@ func (s *MetricsHistoryStore) collectNodeMetrics(ctx context.Context, now time.T
 		}
 		return
 	}
+	nodeMetricsGVR, ok := s.metricsGVR("nodes")
+	if !ok {
+		s.recordNodeCollectionError(ErrMetricsAPINotDiscovered)
+		return
+	}
 
-	result, err := s.dynClient.Resource(NodeMetricsGVR).List(ctx, metav1.ListOptions{})
+	result, err := s.dynClient.Resource(nodeMetricsGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		var shouldReport bool
-		var count int
-		errMsg := err.Error()
-		s.mu.Lock()
-		s.consecutiveNodeErrors++
-		s.lastNodeError = errMsg
-		shouldReport = s.consecutiveNodeErrors == 1 || s.consecutiveNodeErrors%20 == 0
-		count = s.consecutiveNodeErrors
-		s.mu.Unlock()
-		if shouldReport {
-			log.Printf("[metrics] Node metrics collection failed (count=%d): %v", count, err)
-			if s.OnError != nil {
-				s.OnError("metrics", "error", "node metrics collection failed (count=%d): %v", count, err)
-			}
-		}
+		s.recordNodeCollectionError(err)
 		return
 	}
 
@@ -472,6 +574,36 @@ func (s *MetricsHistoryStore) GetAllPodMetricsLatest() []TopPodMetrics {
 	return result
 }
 
+// GetAllPodContainerMetricsLatest returns the latest per-container usage for all
+// tracked pods, keyed by "namespace/name" then container name. Unlike
+// GetAllPodMetricsLatest it does not sum across containers. Only the usage
+// fields (CPU, Memory) are populated; request/limit are filled from the pod
+// spec by callers.
+func (s *MetricsHistoryStore) GetAllPodContainerMetricsLatest() map[string]map[string]ContainerResourceMetrics {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make(map[string]map[string]ContainerResourceMetrics, len(s.podMetrics))
+	for key, podBuf := range s.podMetrics {
+		containers := make(map[string]ContainerResourceMetrics, len(podBuf.containers))
+		for name, buf := range podBuf.containers {
+			if points := buf.GetAll(); len(points) > 0 {
+				last := points[len(points)-1]
+				containers[name] = ContainerResourceMetrics{
+					Name:   name,
+					CPU:    last.CPU,
+					Memory: last.Memory,
+				}
+			}
+		}
+		result[key] = containers
+	}
+	return result
+}
+
 // GetAllNodeMetricsLatest returns the latest metrics for all tracked nodes.
 func (s *MetricsHistoryStore) GetAllNodeMetricsLatest() []TopNodeMetrics {
 	if s == nil {
@@ -484,7 +616,7 @@ func (s *MetricsHistoryStore) GetAllNodeMetricsLatest() []TopNodeMetrics {
 	for _, nodeBuf := range s.nodeMetrics {
 		if points := nodeBuf.buffer.GetAll(); len(points) > 0 {
 			last := points[len(points)-1]
-			result = append(result, TopNodeMetrics{Name: nodeBuf.name, CPU: last.CPU, Memory: last.Memory})
+			result = append(result, TopNodeMetrics{Name: nodeBuf.name, CPU: last.CPU, Memory: last.Memory, ObservedAt: last.Timestamp})
 		}
 	}
 	return result
@@ -550,6 +682,13 @@ func parseCPU(s string) int64 {
 		var n int64
 		if _, err := fmt.Sscanf(s[:len(s)-1], "%d", &n); err == nil {
 			return n
+		}
+		return 0
+	}
+	if len(s) > 1 && s[len(s)-1] == 'u' {
+		var n int64
+		if _, err := fmt.Sscanf(s[:len(s)-1], "%d", &n); err == nil {
+			return n * 1000
 		}
 		return 0
 	}

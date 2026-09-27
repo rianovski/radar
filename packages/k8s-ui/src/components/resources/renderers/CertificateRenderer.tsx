@@ -1,6 +1,6 @@
 import { Shield, Clock, Globe, Key } from 'lucide-react'
 import { clsx } from 'clsx'
-import { Section, PropertyList, Property, ConditionsSection, AlertBanner } from '../../ui/drawer-components'
+import { Section, PropertyList, Property, ConditionsSection, AlertBanner, useOperationalIssuesShown} from '../../ui/drawer-components'
 import { pluralize } from '../../../utils/pluralize'
 
 interface CertificateRendererProps {
@@ -34,6 +34,7 @@ export function CertificateRenderer({ data }: CertificateRendererProps) {
   const readyCond = conditions.find((c: any) => c.type === 'Ready')
   const isReady = readyCond?.status === 'True'
   const isNotReady = readyCond?.status === 'False'
+  const operationalIssuesShown = useOperationalIssuesShown()
 
   const notAfter = status.notAfter
   const notBefore = status.notBefore
@@ -69,7 +70,7 @@ export function CertificateRenderer({ data }: CertificateRendererProps) {
   return (
     <>
       {/* Problem detection alerts */}
-      {isNotReady && (
+      {isNotReady && !operationalIssuesShown && (
         <AlertBanner
           variant="error"
           title="Certificate Not Ready"
@@ -119,13 +120,13 @@ export function CertificateRenderer({ data }: CertificateRendererProps) {
                 <span className={clsx(
                   'badge',
                   isReady
-                    ? 'bg-green-500/20 text-green-400'
-                    : 'bg-red-500/20 text-red-400'
+                    ? 'status-green'
+                    : 'status-red'
                 )}>
                   {isReady ? 'Ready' : 'Not Ready'}
                 </span>
                 {spec.isCA && (
-                  <span className="badge bg-purple-500/20 text-purple-400">
+                  <span className="badge status-purple">
                     CA Certificate
                   </span>
                 )}

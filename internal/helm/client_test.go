@@ -3,21 +3,39 @@ package helm
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/skyhook-io/radar/pkg/helmhistory"
+
+	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart"
+	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/cli"
+	"helm.sh/helm/v3/pkg/engine"
+	kubefake "helm.sh/helm/v3/pkg/kube/fake"
 	"helm.sh/helm/v3/pkg/release"
+	helmstorage "helm.sh/helm/v3/pkg/storage"
+	storagedriver "helm.sh/helm/v3/pkg/storage/driver"
 	helmtime "helm.sh/helm/v3/pkg/time"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func TestFindBestUpgradeVersion(t *testing.T) {
@@ -138,6 +156,93 @@ func TestFindBestUpgradeVersion(t *testing.T) {
 				t.Errorf("findBestUpgradeVersion() repo = %q, want %q", gotRepo, tt.wantRepo)
 			}
 		})
+	}
+}
+
+func TestApplyNoClassicCandidateUpgrade_SourceIssueMapping(t *testing.T) {
+	tests := []struct {
+		name                    string
+		noClassicRepos          bool
+		indexLoadFailed         bool
+		hasRegisteredOCISources bool
+		ociFallback             bool
+		wantIssue               UpgradeSourceIssue
+		wantUntracked           bool
+		wantSourceType          string
+		wantErrorContains       string
+	}{
+		{
+			name:                    "registered OCI source wins before repo index error",
+			indexLoadFailed:         true,
+			hasRegisteredOCISources: true,
+			ociFallback:             true,
+			wantSourceType:          "oci",
+		},
+		{
+			name:                    "repo index error when OCI does not resolve",
+			indexLoadFailed:         true,
+			hasRegisteredOCISources: true,
+			wantIssue:               UpgradeSourceIssueRepoIndexError,
+			wantErrorContains:       "failed to load one or more configured repository indexes",
+		},
+		{
+			name:              "no configured chart sources",
+			noClassicRepos:    true,
+			wantIssue:         UpgradeSourceIssueUntracked,
+			wantUntracked:     true,
+			wantErrorContains: "no chart sources configured",
+		},
+		{
+			name:                    "chart absent from configured sources",
+			hasRegisteredOCISources: true,
+			wantIssue:               UpgradeSourceIssueUntracked,
+			wantUntracked:           true,
+			wantErrorContains:       "chart not found in configured repositories or registered OCI sources",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := &UpgradeInfo{}
+			applyNoClassicCandidateUpgrade(info, tt.noClassicRepos, tt.indexLoadFailed, tt.hasRegisteredOCISources, func() bool {
+				if !tt.ociFallback {
+					return false
+				}
+				info.SourceType = "oci"
+				info.ChartRef = "oci://reg/charts/app"
+				info.LatestVersion = "1.2.0"
+				return true
+			})
+
+			if info.SourceIssue != tt.wantIssue {
+				t.Fatalf("SourceIssue = %q, want %q (info=%+v)", info.SourceIssue, tt.wantIssue, info)
+			}
+			if info.Untracked != tt.wantUntracked {
+				t.Fatalf("Untracked = %v, want %v (info=%+v)", info.Untracked, tt.wantUntracked, info)
+			}
+			if info.SourceType != tt.wantSourceType {
+				t.Fatalf("SourceType = %q, want %q (info=%+v)", info.SourceType, tt.wantSourceType, info)
+			}
+			if tt.wantErrorContains != "" && !strings.Contains(info.Error, tt.wantErrorContains) {
+				t.Fatalf("Error = %q, want to contain %q", info.Error, tt.wantErrorContains)
+			}
+			if tt.wantErrorContains == "" && info.Error != "" {
+				t.Fatalf("Error = %q, want empty", info.Error)
+			}
+		})
+	}
+}
+
+func TestMarkUpgradeSourceIssue_AmbiguousRepositoryIsNotUntracked(t *testing.T) {
+	info := &UpgradeInfo{}
+
+	markUpgradeSourceIssue(info, UpgradeSourceIssueAmbiguousRepository, "could not identify upstream chart repository")
+
+	if info.SourceIssue != UpgradeSourceIssueAmbiguousRepository {
+		t.Fatalf("SourceIssue = %q, want %q", info.SourceIssue, UpgradeSourceIssueAmbiguousRepository)
+	}
+	if info.Untracked {
+		t.Fatal("ambiguous classic repository should not be marked untracked")
 	}
 }
 
@@ -290,15 +395,1173 @@ func TestHelmReleaseStorageNamespacesWithClient_GzippedPayload(t *testing.T) {
 	assertStorageNamespaceFromSecret(t, true)
 }
 
+func TestHelmReleaseRowsFromStorageSnapshot_AttachesLastOperation(t *testing.T) {
+	revisions := []*release.Release{
+		helmTestRelease("atomic", "demo", 1, release.StatusSuperseded, "Install complete"),
+		helmTestRelease("atomic", "demo", 2, release.StatusFailed, `Upgrade "atomic" failed: timed out waiting for the condition`),
+		helmTestRelease("atomic", "demo", 3, release.StatusDeployed, "Rollback to 1"),
+	}
+	secrets := make([]*corev1.Secret, 0, len(revisions))
+	for _, rel := range revisions {
+		secrets = append(secrets, helmReleaseSecret(t, "flux-system", rel, false))
+	}
+
+	client := fake.NewSimpleClientset(secretsToObjects(secrets)...)
+	snapshot, err := helmReleaseStorageSnapshotWithClient(client, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := helmReleaseRowsFromStorageSnapshot(snapshot, nil)
+
+	if len(rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	if row.Revision != 3 {
+		t.Fatalf("revision = %d, want 3", row.Revision)
+	}
+	if row.StorageNamespace != "flux-system" {
+		t.Fatalf("storage namespace = %q, want flux-system", row.StorageNamespace)
+	}
+	if row.LastOperation == nil {
+		t.Fatal("LastOperation = nil")
+	}
+	if row.LastOperation.Kind != helmhistory.KindUpgradeRolledBack {
+		t.Fatalf("kind = %q, want %q", row.LastOperation.Kind, helmhistory.KindUpgradeRolledBack)
+	}
+	if row.LastOperation.FailedRevision != 2 || row.LastOperation.RollbackRevision != 3 || row.LastOperation.TargetRevision != 1 {
+		t.Fatalf("operation revisions = failed:%d rollback:%d target:%d", row.LastOperation.FailedRevision, row.LastOperation.RollbackRevision, row.LastOperation.TargetRevision)
+	}
+	if row.LastOperation.FailureDescription == "" {
+		t.Fatal("FailureDescription is empty")
+	}
+	if len(row.Operations) != 1 {
+		t.Fatalf("len(Operations) = %d, want 1", len(row.Operations))
+	}
+	if row.Operations[0].Kind != helmhistory.KindUpgradeRolledBack {
+		t.Fatalf("operations[0].kind = %q, want %q", row.Operations[0].Kind, helmhistory.KindUpgradeRolledBack)
+	}
+}
+
+func TestHelmReleaseRowsFromStorageSnapshot_KeepsHealthyRowsCompact(t *testing.T) {
+	rel := helmTestRelease("healthy", "demo", 1, release.StatusDeployed, "Install complete")
+	client := fake.NewSimpleClientset(helmReleaseSecret(t, "demo", rel, false))
+	snapshot, err := helmReleaseStorageSnapshotWithClient(client, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows := helmReleaseRowsFromStorageSnapshot(snapshot, nil)
+
+	if len(rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1", len(rows))
+	}
+	if rows[0].LastOperation != nil {
+		t.Fatalf("LastOperation = %#v, want nil", rows[0].LastOperation)
+	}
+	if len(rows[0].Operations) != 0 {
+		t.Fatalf("Operations = %#v, want none", rows[0].Operations)
+	}
+}
+
+func TestHelmReleaseRowsFromStorageSnapshot_SkipsMalformedReleaseSecret(t *testing.T) {
+	malformed := &release.Release{
+		Name:      "malformed",
+		Namespace: "demo",
+		Version:   1,
+		Info: &release.Info{
+			Status:       release.StatusDeployed,
+			LastDeployed: helmtime.Unix(1, 0),
+		},
+	}
+	client := fake.NewSimpleClientset(helmReleaseSecret(t, "demo", malformed, false))
+	snapshot, err := helmReleaseStorageSnapshotWithClient(client, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows := helmReleaseRowsFromStorageSnapshot(snapshot, nil)
+
+	if len(rows) != 0 {
+		t.Fatalf("len(rows) = %d, want 0 for malformed release secret", len(rows))
+	}
+}
+
+func TestHelmReleaseRowsFromStorageSnapshot_CapsOperations(t *testing.T) {
+	revisions := []*release.Release{
+		helmTestRelease("repeat", "demo", 1, release.StatusSuperseded, "Install complete"),
+		helmTestRelease("repeat", "demo", 2, release.StatusFailed, `Upgrade "repeat" failed: first`),
+		helmTestRelease("repeat", "demo", 3, release.StatusSuperseded, "Rollback to 1"),
+		helmTestRelease("repeat", "demo", 4, release.StatusFailed, `Upgrade "repeat" failed: second`),
+		helmTestRelease("repeat", "demo", 5, release.StatusSuperseded, "Rollback to 3"),
+		helmTestRelease("repeat", "demo", 6, release.StatusFailed, `Upgrade "repeat" failed: third`),
+		helmTestRelease("repeat", "demo", 7, release.StatusSuperseded, "Rollback to 5"),
+		helmTestRelease("repeat", "demo", 8, release.StatusFailed, `Upgrade "repeat" failed: fourth`),
+		helmTestRelease("repeat", "demo", 9, release.StatusDeployed, "Rollback to 7"),
+	}
+	secrets := make([]*corev1.Secret, 0, len(revisions))
+	for _, rel := range revisions {
+		secrets = append(secrets, helmReleaseSecret(t, "demo", rel, false))
+	}
+	client := fake.NewSimpleClientset(secretsToObjects(secrets)...)
+	snapshot, err := helmReleaseStorageSnapshotWithClient(client, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows := helmReleaseRowsFromStorageSnapshot(snapshot, nil)
+
+	if len(rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1", len(rows))
+	}
+	if len(rows[0].Operations) != 3 {
+		t.Fatalf("len(Operations) = %d, want 3: %#v", len(rows[0].Operations), rows[0].Operations)
+	}
+	wantRollbackRevisions := []int{9, 7, 5}
+	for i, want := range wantRollbackRevisions {
+		if rows[0].Operations[i].RollbackRevision != want {
+			t.Fatalf("Operations[%d].RollbackRevision = %d, want %d", i, rows[0].Operations[i].RollbackRevision, want)
+		}
+	}
+}
+
+func TestHelmReleaseRowsFromStorageSnapshot_UsesDetailHistoryWindow(t *testing.T) {
+	revisions := []*release.Release{
+		helmTestRelease("long-lived", "demo", 1, release.StatusSuperseded, "Install complete"),
+		helmTestRelease("long-lived", "demo", 2, release.StatusFailed, `Upgrade "long-lived" failed: early failure`),
+		helmTestRelease("long-lived", "demo", 3, release.StatusSuperseded, "Rollback to 1"),
+	}
+	for rev := 4; rev <= releaseHistoryMax+44; rev++ {
+		status := release.StatusSuperseded
+		if rev == releaseHistoryMax+44 {
+			status = release.StatusDeployed
+		}
+		revisions = append(revisions, helmTestRelease("long-lived", "demo", rev, status, "Upgrade complete"))
+	}
+	secrets := make([]*corev1.Secret, 0, len(revisions))
+	for _, rel := range revisions {
+		secrets = append(secrets, helmReleaseSecret(t, "demo", rel, false))
+	}
+	client := fake.NewSimpleClientset(secretsToObjects(secrets)...)
+	snapshot, err := helmReleaseStorageSnapshotWithClient(client, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows := helmReleaseRowsFromStorageSnapshot(snapshot, nil)
+
+	if len(rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1", len(rows))
+	}
+	if rows[0].Revision != releaseHistoryMax+44 {
+		t.Fatalf("revision = %d, want %d", rows[0].Revision, releaseHistoryMax+44)
+	}
+	if rows[0].LastOperation != nil {
+		t.Fatalf("LastOperation = %#v, want nil for operations outside detail history window", rows[0].LastOperation)
+	}
+	if len(rows[0].Operations) != 0 {
+		t.Fatalf("Operations = %#v, want none for operations outside detail history window", rows[0].Operations)
+	}
+	if got := len(snapshot.histories["demo/long-lived"]); got != releaseHistoryMax {
+		t.Fatalf("history window = %d, want %d", got, releaseHistoryMax)
+	}
+}
+
+func TestComputeValuesDiffIsStableForReorderedMaps(t *testing.T) {
+	left := &HelmValues{UserSupplied: map[string]any{
+		"image": map[string]any{
+			"tag":        "1.0.0",
+			"repository": "example/cart",
+		},
+		"replicaCount": 2,
+	}}
+	right := &HelmValues{UserSupplied: map[string]any{
+		"replicaCount": 2,
+		"image": map[string]any{
+			"repository": "example/cart",
+			"tag":        "1.0.0",
+		},
+	}}
+
+	diff, err := computeValuesDiff(left, right, 1, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diffHasBodyChange(diff) {
+		t.Fatalf("diff has body changes for reordered equal maps:\n%s", diff)
+	}
+}
+
+func TestGetValuesWithAllValuesKeepsComputedWhenUserValuesReadFails(t *testing.T) {
+	rel := helmTestRelease("values-demo", "demo", 1, release.StatusDeployed, "deployed")
+	rel.Chart = &chart.Chart{
+		Metadata: &chart.Metadata{Name: "values-demo"},
+		Values: map[string]any{
+			"replicaCount": 1,
+			"image": map[string]any{
+				"repository": "example/app",
+				"tag":        "default",
+			},
+		},
+	}
+	rel.Config = map[string]any{
+		"image": map[string]any{
+			"tag": "2.0.0",
+		},
+	}
+	driver := &failSecondReadDriver{inner: storagedriver.NewMemory()}
+	actionConfig := &action.Configuration{
+		KubeClient: &kubefake.PrintingKubeClient{Out: io.Discard},
+		Releases:   helmstorage.Init(driver),
+	}
+	if err := actionConfig.Releases.Create(rel); err != nil {
+		t.Fatal(err)
+	}
+
+	values, err := getValuesWith(actionConfig, rel.Name, true, rel.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if values.Computed == nil {
+		t.Fatal("Computed = nil, want computed values from successful all-values read")
+	}
+	if got := values.Computed["replicaCount"]; got != 1 {
+		t.Fatalf("Computed[replicaCount] = %#v, want 1", got)
+	}
+	image, ok := values.Computed["image"].(map[string]any)
+	if !ok {
+		t.Fatalf("Computed[image] = %#v, want map", values.Computed["image"])
+	}
+	if got := image["tag"]; got != "2.0.0" {
+		t.Fatalf("Computed[image][tag] = %#v, want user override", got)
+	}
+	if len(values.UserSupplied) != 0 {
+		t.Fatalf("UserSupplied = %#v, want empty when secondary read fails", values.UserSupplied)
+	}
+}
+
+func TestChartForUpgradeTargetReusesReleaseChartForSameVersion(t *testing.T) {
+	client := testHelmClientWithRepoConfigOnly(t)
+	rel := helmTestRelease("argo-cd", "demo", 1, release.StatusDeployed, "deployed")
+	rel.Chart.Metadata.Version = "9.5.11"
+
+	got, err := client.chartForUpgradeTarget(nil, rel, "9.5.11", "missing-repo", func(phase, message, detail string) {
+		t.Fatalf("same-version chart selection should not resolve/download chart, got progress %q %q %q", phase, message, detail)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != rel.Chart {
+		t.Fatal("chartForUpgradeTarget returned a different chart, want current release chart")
+	}
+}
+
+// Regression for Values Preview/Apply on umbrella releases. Helm storage keeps
+// Chart.yaml's dependency declarations but JSON serialization drops the chart
+// dependency bodies. Both values paths select their chart through
+// chartForUpgradeTarget, so same-version selection must reconstruct the exact
+// installed version before rendering or applying.
+func TestValuesPreviewApplyReconstructSameVersionUmbrella(t *testing.T) {
+	complete := valuesIsolationUmbrellaChart()
+	stored := roundTripStoredChart(t, complete)
+	if len(stored.Metadata.Dependencies) != 1 || len(stored.Dependencies()) != 0 {
+		t.Fatalf("test precondition failed: stored chart declarations=%d bodies=%d, want 1 and 0", len(stored.Metadata.Dependencies), len(stored.Dependencies()))
+	}
+
+	rel := helmTestRelease("umbrella", "demo", 1, release.StatusDeployed, "deployed")
+	rel.Chart = stored
+	client := &Client{}
+	loadCalls := 0
+	selected, err := client.chartForUpgradeTargetWithLoader(nil, rel, "", "", func(string, string, string) {}, func(_ *action.Configuration, gotRel *release.Release, version, repository string, _ func(string, string, string)) (*chart.Chart, error) {
+		loadCalls++
+		if gotRel != rel || version != "1.0.4" || repository != "" {
+			t.Fatalf("loader got release=%p version=%q repository=%q", gotRel, version, repository)
+		}
+		return complete, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadCalls != 1 || selected != complete {
+		t.Fatalf("loader calls=%d selected=%p, want one call and complete chart %p", loadCalls, selected, complete)
+	}
+
+	before := renderValuesIsolationChart(t, selected, map[string]any{"parentTag": "1.0.0", "child": map[string]any{"imageTag": "2.0.0"}})
+	after := renderValuesIsolationChart(t, selected, map[string]any{"parentTag": "1.0.1", "child": map[string]any{"imageTag": "2.0.0"}})
+	if len(before) != 2 || len(after) != 2 {
+		t.Fatalf("rendered inventory before=%v after=%v, want parent and child", mapKeys(before), mapKeys(after))
+	}
+	for name, body := range before {
+		afterBody, ok := after[name]
+		if !ok {
+			t.Fatalf("object inventory changed: %q missing after values edit", name)
+		}
+		if strings.Contains(name, "/charts/child/") {
+			if afterBody != body {
+				t.Fatalf("child workload changed for parent-only values override\nbefore:\n%s\nafter:\n%s", body, afterBody)
+			}
+		} else if afterBody == body || !strings.Contains(afterBody, "parent:1.0.1") {
+			t.Fatalf("parent workload did not receive intended image override\nbefore:\n%s\nafter:\n%s", body, afterBody)
+		}
+	}
+}
+
+func TestValuesPreviewApplyFailsClosedWhenDependencyBodiesUnavailable(t *testing.T) {
+	stored := roundTripStoredChart(t, valuesIsolationUmbrellaChart())
+	rel := helmTestRelease("umbrella", "demo", 1, release.StatusDeployed, "deployed")
+	rel.Chart = stored
+
+	t.Run("source cannot resolve exact installed version", func(t *testing.T) {
+		_, err := (&Client{}).chartForUpgradeTargetWithLoader(nil, rel, "1.0.4", "", func(string, string, string) {}, func(*action.Configuration, *release.Release, string, string, func(string, string, string)) (*chart.Chart, error) {
+			return nil, errors.New("chart not found in configured sources")
+		})
+		if err == nil || !strings.Contains(err.Error(), "Radar could not rebuild the full chart") || !strings.Contains(err.Error(), "umbrella version 1.0.4") {
+			t.Fatalf("error = %v, want fail-closed reconstruction error", err)
+		}
+	})
+
+	t.Run("resolved package also lacks dependency body", func(t *testing.T) {
+		_, err := (&Client{}).chartForUpgradeTargetWithLoader(nil, rel, "1.0.4", "", func(string, string, string) {}, func(*action.Configuration, *release.Release, string, string, func(string, string, string)) (*chart.Chart, error) {
+			return stored, nil
+		})
+		if err == nil || !strings.Contains(err.Error(), "declares subcharts but does not include them") || !strings.Contains(err.Error(), "dependency body \"child\"") {
+			t.Fatalf("error = %v, want explicit missing-dependency refusal", err)
+		}
+	})
+}
+
+func valuesIsolationUmbrellaChart() *chart.Chart {
+	child := &chart.Chart{
+		Metadata: &chart.Metadata{Name: "child", Version: "2.0.0", Type: "application"},
+		Values:   map[string]any{"imageTag": "2.0.0"},
+		Templates: []*chart.File{{Name: "templates/deployment.yaml", Data: []byte(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: child
+spec:
+  selector:
+    matchLabels: {app: child}
+  template:
+    metadata:
+      labels: {app: child}
+    spec:
+      containers:
+      - name: child
+        image: child:{{ .Values.imageTag }}
+`)}},
+	}
+	parent := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name: "umbrella", Version: "1.0.4", Type: "application",
+			Dependencies: []*chart.Dependency{{Name: "child", Version: "2.0.0"}},
+		},
+		Values: map[string]any{"parentTag": "1.0.0", "child": map[string]any{"imageTag": "2.0.0"}},
+		Templates: []*chart.File{{Name: "templates/deployment.yaml", Data: []byte(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: parent
+spec:
+  selector:
+    matchLabels: {app: parent}
+  template:
+    metadata:
+      labels: {app: parent}
+    spec:
+      containers:
+      - name: parent
+        image: parent:{{ .Values.parentTag }}
+`)}},
+	}
+	parent.SetDependencies(child)
+	return parent
+}
+
+func roundTripStoredChart(t *testing.T, ch *chart.Chart) *chart.Chart {
+	t.Helper()
+	b, err := json.Marshal(ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored chart.Chart
+	if err := json.Unmarshal(b, &stored); err != nil {
+		t.Fatal(err)
+	}
+	return &stored
+}
+
+func renderValuesIsolationChart(t *testing.T, ch *chart.Chart, values map[string]any) map[string]string {
+	t.Helper()
+	renderValues, err := chartutil.ToRenderValues(ch, values, chartutil.ReleaseOptions{Name: "umbrella", Namespace: "demo", IsUpgrade: true}, chartutil.DefaultCapabilities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := engine.Render(ch, renderValues)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rendered
+}
+
+func mapKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func TestDiffResourceRefs(t *testing.T) {
+	left := []ResourceRef{
+		{APIVersion: "apps/v1", Kind: "Deployment", Namespace: "demo", Name: "cart"},
+		{APIVersion: "v1", Kind: "Service", Namespace: "demo", Name: "cart"},
+	}
+	right := []ResourceRef{
+		{APIVersion: "apps/v1", Kind: "Deployment", Namespace: "demo", Name: "cart"},
+		{APIVersion: "v1", Kind: "ConfigMap", Namespace: "demo", Name: "cart-config"},
+	}
+
+	removed, added, unchanged := diffResourceRefs(left, right)
+
+	if len(removed) != 1 || removed[0].Kind != "Service" {
+		t.Fatalf("removed = %#v, want Service", removed)
+	}
+	if len(added) != 1 || added[0].Kind != "ConfigMap" {
+		t.Fatalf("added = %#v, want ConfigMap", added)
+	}
+	if len(unchanged) != 1 || unchanged[0].Kind != "Deployment" {
+		t.Fatalf("unchanged = %#v, want Deployment", unchanged)
+	}
+}
+
+func TestDiffHooks(t *testing.T) {
+	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	later := now.Add(time.Minute)
+	left := []HelmHook{
+		{Name: "migrate", Namespace: "demo", Kind: "Job", Events: []string{"pre-upgrade"}, Weight: 0, Status: "Succeeded", StartedAt: &now, CompletedAt: &now},
+		{Name: "cleanup", Namespace: "demo", Kind: "Job", Events: []string{"post-delete"}, Weight: 0, Status: "Succeeded"},
+		{Name: "seed", Namespace: "demo", Kind: "Job", Events: []string{"post-install", "post-upgrade"}, DeletePolicies: []string{"hook-succeeded", "before-hook-creation"}, Weight: 0, Status: "Succeeded"},
+		{Name: "schema", Namespace: "demo", Kind: "Job", Events: []string{"pre-upgrade"}, Weight: 0, ManifestDigest: "old-body"},
+	}
+	right := []HelmHook{
+		{Name: "migrate", Namespace: "demo", Kind: "Job", Events: []string{"pre-upgrade"}, Weight: 10, Status: "Succeeded"},
+		{Name: "seed", Namespace: "demo", Kind: "Job", Events: []string{"post-upgrade", "post-install"}, DeletePolicies: []string{"before-hook-creation", "hook-succeeded"}, Weight: 0, Status: "Failed", StartedAt: &later, CompletedAt: &later},
+		{Name: "schema", Namespace: "demo", Kind: "Job", Events: []string{"pre-upgrade"}, Weight: 0, ManifestDigest: "new-body"},
+		{Name: "verify", Namespace: "demo", Kind: "Job", Events: []string{"post-upgrade"}, Weight: 0, Status: "Succeeded"},
+	}
+
+	removed, added, modified, unchanged := diffHooks(left, right)
+
+	if len(removed) != 1 || removed[0].Name != "cleanup" {
+		t.Fatalf("removed = %#v, want cleanup", removed)
+	}
+	if len(added) != 1 || added[0].Name != "verify" {
+		t.Fatalf("added = %#v, want verify", added)
+	}
+	if len(modified) != 2 {
+		t.Fatalf("modified = %#v, want migrate and schema", modified)
+	}
+	modifiedByName := map[string]HelmHook{}
+	for _, hook := range modified {
+		modifiedByName[hook.Name] = hook
+	}
+	if modifiedByName["migrate"].Weight != 10 {
+		t.Fatalf("modified = %#v, want updated migrate hook", modified)
+	}
+	if modifiedByName["schema"].ManifestDigest != "new-body" || !modifiedByName["schema"].ManifestChanged {
+		t.Fatalf("modified = %#v, want hook body change", modified)
+	}
+	if len(unchanged) != 1 || unchanged[0].Name != "seed" {
+		t.Fatalf("unchanged = %#v, want seed", unchanged)
+	}
+}
+
+func TestDiffRenderedResourceObjectsDetectsModifiedDeploymentFields(t *testing.T) {
+	oldManifest := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+  namespace: demo
+spec:
+  selector:
+    matchLabels:
+      app: cart
+  template:
+    metadata:
+      labels:
+        app: cart
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+`
+	newManifest := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+  namespace: demo
+spec:
+  selector:
+    matchLabels:
+      app: cart
+  template:
+    metadata:
+      labels:
+        app: cart
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.26
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+`
+
+	left, _ := parseManifestResourceObjects(oldManifest, "demo")
+	right, _ := parseManifestResourceObjects(newManifest, "demo")
+	removed, added, common := diffResourceRefs(resourceRefsFromRendered(left), resourceRefsFromRendered(right))
+	modified, unchanged := diffRenderedResourceObjects(common, left, right)
+
+	if len(removed) != 0 || len(added) != 0 || len(unchanged) != 0 {
+		t.Fatalf("removed=%#v added=%#v unchanged=%#v, want only modified", removed, added, unchanged)
+	}
+	if len(modified) != 1 {
+		t.Fatalf("modified = %#v, want one Deployment", modified)
+	}
+	gotPaths := map[string]bool{}
+	for _, field := range modified[0].Fields {
+		gotPaths[field.Path] = true
+	}
+	for _, want := range []string{
+		"spec.template.spec.containers[app].image",
+		"spec.template.spec.containers[app].readinessProbe",
+	} {
+		if !gotPaths[want] {
+			t.Fatalf("modified paths = %#v, missing %s", gotPaths, want)
+		}
+	}
+}
+
+func TestDiffRenderedResourceObjectsIgnoresDeploymentMetadataOnlyChanges(t *testing.T) {
+	oldManifest := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+  namespace: demo
+  labels:
+    helm.sh/chart: cart-1.0.0
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cart
+  template:
+    metadata:
+      labels:
+        app: cart
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+`
+	newManifest := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+  namespace: demo
+  labels:
+    helm.sh/chart: cart-1.0.1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cart
+  template:
+    metadata:
+      labels:
+        app: cart
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+`
+
+	left, _ := parseManifestResourceObjects(oldManifest, "demo")
+	right, _ := parseManifestResourceObjects(newManifest, "demo")
+	_, _, common := diffResourceRefs(resourceRefsFromRendered(left), resourceRefsFromRendered(right))
+	modified, unchanged := diffRenderedResourceObjects(common, left, right)
+
+	if len(modified) != 0 {
+		t.Fatalf("modified = %#v, want metadata-only change ignored", modified)
+	}
+	if len(unchanged) != 1 {
+		t.Fatalf("unchanged = %#v, want one unchanged Deployment", unchanged)
+	}
+}
+
+func TestDiffRenderedResourceObjectsIgnoresGenericHelmChartLabelOnlyChanges(t *testing.T) {
+	oldManifest := `apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: cart
+  namespace: demo
+  labels:
+    helm.sh/chart: cart-1.0.0
+spec:
+  size: medium
+`
+	newManifest := `apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: cart
+  namespace: demo
+  labels:
+    helm.sh/chart: cart-1.0.1
+spec:
+  size: medium
+`
+
+	left, _ := parseManifestResourceObjects(oldManifest, "demo")
+	right, _ := parseManifestResourceObjects(newManifest, "demo")
+	_, _, common := diffResourceRefs(resourceRefsFromRendered(left), resourceRefsFromRendered(right))
+	modified, unchanged := diffRenderedResourceObjects(common, left, right)
+
+	if len(modified) != 0 {
+		t.Fatalf("modified = %#v, want Helm chart label-only change ignored", modified)
+	}
+	if len(unchanged) != 1 {
+		t.Fatalf("unchanged = %#v, want one unchanged custom resource", unchanged)
+	}
+}
+
+func TestDiffRenderedResourceObjectsIgnoresGenericHelmChartLabelAdded(t *testing.T) {
+	oldManifest := `apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: cart
+  namespace: demo
+spec:
+  size: medium
+`
+	newManifest := `apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: cart
+  namespace: demo
+  labels:
+    helm.sh/chart: cart-1.0.1
+spec:
+  size: medium
+`
+
+	left, _ := parseManifestResourceObjects(oldManifest, "demo")
+	right, _ := parseManifestResourceObjects(newManifest, "demo")
+	_, _, common := diffResourceRefs(resourceRefsFromRendered(left), resourceRefsFromRendered(right))
+	modified, unchanged := diffRenderedResourceObjects(common, left, right)
+
+	if len(modified) != 0 {
+		t.Fatalf("modified = %#v, want Helm chart label add ignored", modified)
+	}
+	if len(unchanged) != 1 {
+		t.Fatalf("unchanged = %#v, want one unchanged custom resource", unchanged)
+	}
+}
+
+func TestParseManifestResourceObjectsUsesMetadataName(t *testing.T) {
+	resources, parseErrors := parseManifestResourceObjects(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        image: nginx
+`, "demo")
+
+	if parseErrors != 0 {
+		t.Fatalf("parseErrors = %d, want 0", parseErrors)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("resources = %#v, want one resource", resources)
+	}
+	ref := resources[0].Ref
+	if ref.Name != "cart" || ref.Namespace != "demo" || ref.Kind != "Deployment" || ref.APIVersion != "apps/v1" {
+		t.Fatalf("ref = %#v, want apps/v1 Deployment demo/cart", ref)
+	}
+}
+
+func TestParseManifestResourceObjectsKeepsClusterScopedNamespaceEmpty(t *testing.T) {
+	resources, parseErrors := parseManifestResourceObjects(`apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: chart-reader
+rules: []
+`, "demo")
+
+	if parseErrors != 0 {
+		t.Fatalf("parseErrors = %d, want 0", parseErrors)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("resources = %#v, want one resource", resources)
+	}
+	ref := resources[0].Ref
+	if ref.Name != "chart-reader" || ref.Namespace != "" || ref.Kind != "ClusterRole" || ref.APIVersion != "rbac.authorization.k8s.io/v1" {
+		t.Fatalf("ref = %#v, want rbac.authorization.k8s.io/v1 ClusterRole chart-reader with empty namespace", ref)
+	}
+}
+
+func TestParseManifestResourceObjectsReportsParseErrors(t *testing.T) {
+	resources, parseErrors := parseManifestResourceObjects(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: good
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bad
+  labels:
+    broken: [
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ok
+spec:
+  ports:
+  - port: 80
+`, "demo")
+
+	if parseErrors != 1 {
+		t.Fatalf("parseErrors = %d, want 1", parseErrors)
+	}
+	if len(resources) != 2 {
+		t.Fatalf("resources = %#v, want two parsed resources", resources)
+	}
+}
+
+type failSecondReadDriver struct {
+	inner *storagedriver.Memory
+	reads int
+}
+
+func (d *failSecondReadDriver) Name() string {
+	return d.inner.Name()
+}
+
+func (d *failSecondReadDriver) Create(key string, rls *release.Release) error {
+	return d.inner.Create(key, rls)
+}
+
+func (d *failSecondReadDriver) Update(key string, rls *release.Release) error {
+	return d.inner.Update(key, rls)
+}
+
+func (d *failSecondReadDriver) Delete(key string) (*release.Release, error) {
+	return d.inner.Delete(key)
+}
+
+func (d *failSecondReadDriver) Get(key string) (*release.Release, error) {
+	d.reads++
+	if d.reads > 1 {
+		return nil, fmt.Errorf("forced second read failure")
+	}
+	return d.inner.Get(key)
+}
+
+func (d *failSecondReadDriver) List(filter func(*release.Release) bool) ([]*release.Release, error) {
+	return d.inner.List(filter)
+}
+
+func (d *failSecondReadDriver) Query(labels map[string]string) ([]*release.Release, error) {
+	return d.inner.Query(labels)
+}
+
+func TestNonNilResourceRefs(t *testing.T) {
+	refs := nonNilResourceRefs(nil)
+	if refs == nil {
+		t.Fatal("nonNilResourceRefs(nil) returned nil")
+	}
+}
+
+func TestExtractHookDiagnosticsSurfacesFailedHookDeletePolicy(t *testing.T) {
+	rel := helmTestRelease("hooks", "demo", 2, release.StatusFailed, `Upgrade "hooks" failed: hook failed`)
+	rel.Hooks = []*release.Hook{
+		{
+			Name:           "hooks-pre-upgrade",
+			Kind:           "Job",
+			Path:           "templates/hook.yaml",
+			Events:         []release.HookEvent{release.HookPreUpgrade},
+			DeletePolicies: []release.HookDeletePolicy{release.HookFailed},
+			LastRun: release.HookExecution{
+				Phase:       release.HookPhaseFailed,
+				StartedAt:   helmtime.Unix(10, 0),
+				CompletedAt: helmtime.Unix(11, 0),
+			},
+		},
+	}
+
+	hooks := extractHooks(rel)
+	diagnostics := extractHookDiagnostics(hooks)
+
+	if len(hooks) != 1 {
+		t.Fatalf("len(hooks) = %d, want 1", len(hooks))
+	}
+	if hooks[0].Path != "templates/hook.yaml" || hooks[0].Status != "Failed" {
+		t.Fatalf("hook metadata = %#v", hooks[0])
+	}
+	if hooks[0].StartedAt == nil || hooks[0].CompletedAt == nil {
+		t.Fatalf("hook times = started %v completed %v, want non-nil", hooks[0].StartedAt, hooks[0].CompletedAt)
+	}
+	if len(diagnostics) != 1 {
+		t.Fatalf("len(diagnostics) = %d, want 1", len(diagnostics))
+	}
+	if !diagnostics[0].EvidenceUnavailable || !strings.Contains(diagnostics[0].EvidenceUnavailableReason, "hook-failed") {
+		t.Fatalf("diagnostic = %#v, want delete-policy evidence warning", diagnostics[0])
+	}
+}
+
+func TestExtractHooksOmitsZeroTimes(t *testing.T) {
+	rel := helmTestRelease("hooks", "demo", 2, release.StatusPendingUpgrade, "Running hook")
+	rel.Hooks = []*release.Hook{
+		{
+			Name:   "hooks-pre-upgrade",
+			Kind:   "Job",
+			Events: []release.HookEvent{release.HookPreUpgrade},
+			LastRun: release.HookExecution{
+				Phase: release.HookPhaseRunning,
+			},
+		},
+	}
+
+	hooks := extractHooks(rel)
+	if len(hooks) != 1 {
+		t.Fatalf("len(hooks) = %d, want 1", len(hooks))
+	}
+	if hooks[0].StartedAt != nil || hooks[0].CompletedAt != nil {
+		t.Fatalf("hook times = started %v completed %v, want nil zero times", hooks[0].StartedAt, hooks[0].CompletedAt)
+	}
+}
+
+func TestEnrichHookDiagnosticsWithClusterEvidenceCorrelatesJobPodsEvents(t *testing.T) {
+	rel := helmTestRelease("hooks", "demo", 2, release.StatusFailed, `Upgrade "hooks" failed: hook failed`)
+	rel.Hooks = []*release.Hook{
+		{
+			Name:   "hooks-pre-upgrade",
+			Kind:   "Job",
+			Events: []release.HookEvent{release.HookPreUpgrade},
+			Manifest: `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hooks-pre-upgrade
+  namespace: demo-hooks
+`,
+			LastRun: release.HookExecution{
+				Phase:       release.HookPhaseFailed,
+				StartedAt:   helmtime.Unix(10, 0),
+				CompletedAt: helmtime.Unix(11, 0),
+			},
+		},
+	}
+	hooks := extractHooks(rel)
+	detail := &HelmReleaseDetail{
+		Name:            rel.Name,
+		Namespace:       rel.Namespace,
+		Hooks:           hooks,
+		HookDiagnostics: extractHookDiagnostics(hooks),
+	}
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "hooks-pre-upgrade", Namespace: "demo-hooks"},
+		Status: batchv1.JobStatus{
+			Failed: 1,
+			Conditions: []batchv1.JobCondition{{
+				Type:    batchv1.JobFailed,
+				Status:  corev1.ConditionTrue,
+				Reason:  "BackoffLimitExceeded",
+				Message: "migration failed password=supersecret",
+			}},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hooks-pre-upgrade-abcde",
+			Namespace: "demo-hooks",
+			Labels:    map[string]string{"job-name": "hooks-pre-upgrade"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "migrate"}}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "migrate",
+				Ready: false,
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 1,
+						Reason:   "Error",
+						Message:  "migration failed password=supersecret",
+					},
+				},
+			}},
+		},
+	}
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{Name: "hook-event", Namespace: "demo-hooks"},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:      "Pod",
+			Namespace: "demo-hooks",
+			Name:      "hooks-pre-upgrade-abcde",
+		},
+		Type:          corev1.EventTypeWarning,
+		Reason:        "BackOff",
+		Message:       "Back-off restarting failed container password=supersecret",
+		Count:         2,
+		LastTimestamp: metav1.NewTime(time.Unix(20, 0)),
+	}
+	client := fake.NewSimpleClientset(job, pod, event)
+
+	EnrichHookDiagnosticsWithClusterEvidence(context.Background(), detail, client)
+
+	if len(detail.HookDiagnostics) != 1 {
+		t.Fatalf("len(HookDiagnostics) = %d, want 1", len(detail.HookDiagnostics))
+	}
+	diag := detail.HookDiagnostics[0]
+	if diag.Namespace != "demo-hooks" {
+		t.Fatalf("diagnostic namespace = %q, want demo-hooks", diag.Namespace)
+	}
+	if diag.EvidenceUnavailable {
+		t.Fatalf("EvidenceUnavailable = true, reason %q", diag.EvidenceUnavailableReason)
+	}
+	if diag.Evidence == nil {
+		t.Fatal("Evidence = nil")
+	}
+	if len(diag.Evidence.Jobs) != 1 || diag.Evidence.Jobs[0].Status != "failed" {
+		t.Fatalf("jobs = %#v, want failed job evidence", diag.Evidence.Jobs)
+	}
+	if len(diag.Evidence.Pods) != 1 || diag.Evidence.Pods[0].Reason != "Error" {
+		t.Fatalf("pods = %#v, want pod error evidence", diag.Evidence.Pods)
+	}
+	if strings.Contains(diag.Evidence.Pods[0].Message, "supersecret") {
+		t.Fatalf("pod message was not redacted: %q", diag.Evidence.Pods[0].Message)
+	}
+	if len(diag.Evidence.Events) != 1 || diag.Evidence.Events[0].Reason != "BackOff" {
+		t.Fatalf("events = %#v, want BackOff evidence", diag.Evidence.Events)
+	}
+	if strings.Contains(diag.Evidence.Events[0].Message, "supersecret") {
+		t.Fatalf("event message was not redacted: %q", diag.Evidence.Events[0].Message)
+	}
+	if diag.Evidence.Summary == "" {
+		t.Fatal("Evidence summary is empty")
+	}
+}
+
+func TestEnrichHookDiagnosticsPrefersReadErrorOverDeletePolicyHint(t *testing.T) {
+	hooks := []HelmHook{{
+		Name:           "hooks-pre-upgrade",
+		Namespace:      "demo-hooks",
+		Kind:           "Job",
+		Events:         []string{"pre-upgrade"},
+		Status:         "Failed",
+		DeletePolicies: []string{"before-hook-creation"},
+	}}
+	detail := &HelmReleaseDetail{
+		Name:            "hooks",
+		Namespace:       "demo-hooks",
+		Hooks:           hooks,
+		HookDiagnostics: extractHookDiagnostics(hooks),
+	}
+	client := fake.NewSimpleClientset()
+	client.Fake.PrependReactor("get", "jobs", func(action ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "batch", Resource: "jobs"}, "hooks-pre-upgrade", fmt.Errorf("denied"))
+	})
+
+	EnrichHookDiagnosticsWithClusterEvidence(context.Background(), detail, client)
+
+	if len(detail.HookDiagnostics) != 1 {
+		t.Fatalf("len(HookDiagnostics) = %d, want 1", len(detail.HookDiagnostics))
+	}
+	diag := detail.HookDiagnostics[0]
+	if !diag.EvidenceUnavailable {
+		t.Fatal("EvidenceUnavailable = false, want true")
+	}
+	if !strings.Contains(diag.EvidenceUnavailableReason, "current Kubernetes identity") {
+		t.Fatalf("EvidenceUnavailableReason = %q, want RBAC/read error", diag.EvidenceUnavailableReason)
+	}
+	if diag.Evidence == nil || len(diag.Evidence.Errors) == 0 {
+		t.Fatalf("Evidence errors = %#v, want read error evidence", diag.Evidence)
+	}
+}
+
+func TestEnrichHookDiagnosticsDoesNotTreatEventsOnlyErrorAsPrimaryRBAC(t *testing.T) {
+	hooks := []HelmHook{{
+		Name:      "hooks-pre-upgrade",
+		Namespace: "demo-hooks",
+		Kind:      "Job",
+		Events:    []string{"pre-upgrade"},
+		Status:    "Failed",
+	}}
+	detail := &HelmReleaseDetail{
+		Name:            "hooks",
+		Namespace:       "demo-hooks",
+		Hooks:           hooks,
+		HookDiagnostics: extractHookDiagnostics(hooks),
+	}
+	client := fake.NewSimpleClientset()
+	client.Fake.PrependReactor("list", "events", func(action ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "events"}, "", fmt.Errorf("denied"))
+	})
+
+	EnrichHookDiagnosticsWithClusterEvidence(context.Background(), detail, client)
+
+	if len(detail.HookDiagnostics) != 1 {
+		t.Fatalf("len(HookDiagnostics) = %d, want 1", len(detail.HookDiagnostics))
+	}
+	diag := detail.HookDiagnostics[0]
+	if !diag.EvidenceUnavailable {
+		t.Fatal("EvidenceUnavailable = false, want true")
+	}
+	if !strings.Contains(diag.EvidenceUnavailableReason, "No live Job/Pod evidence") {
+		t.Fatalf("EvidenceUnavailableReason = %q, want no-live-evidence reason", diag.EvidenceUnavailableReason)
+	}
+	if diag.Evidence == nil || len(diag.Evidence.Errors) == 0 || !strings.HasPrefix(diag.Evidence.Errors[0], "events:") {
+		t.Fatalf("Evidence errors = %#v, want event read error retained", diag.Evidence)
+	}
+}
+
+func TestListHookEventsPrioritizesWarningsBeforeNormalBackfill(t *testing.T) {
+	namespace := "demo-hooks"
+	podName := "hooks-pre-upgrade-abcde"
+	objs := make([]runtime.Object, 0, maxHookEvidenceEvents+1)
+	for i := range maxHookEvidenceEvents {
+		objs = append(objs, &corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("normal-%d", i), Namespace: namespace},
+			InvolvedObject: corev1.ObjectReference{
+				Kind:      "Pod",
+				Namespace: namespace,
+				Name:      podName,
+			},
+			Type:          corev1.EventTypeNormal,
+			Reason:        fmt.Sprintf("Normal%d", i),
+			Message:       "normal lifecycle event",
+			LastTimestamp: metav1.NewTime(time.Unix(100+int64(i), 0)),
+		})
+	}
+	objs = append(objs, &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{Name: "warning", Namespace: namespace},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:      "Pod",
+			Namespace: namespace,
+			Name:      podName,
+		},
+		Type:          corev1.EventTypeWarning,
+		Reason:        "BackoffLimitExceeded",
+		Message:       "job failed",
+		LastTimestamp: metav1.NewTime(time.Unix(1, 0)),
+	})
+	client := fake.NewSimpleClientset(objs...)
+
+	events, errText := listHookEvents(context.Background(), client, namespace, []hookObjectRef{{kind: "Pod", name: podName}})
+
+	if errText != "" {
+		t.Fatalf("errText = %q, want empty", errText)
+	}
+	if len(events) != maxHookEvidenceEvents {
+		t.Fatalf("len(events) = %d, want %d", len(events), maxHookEvidenceEvents)
+	}
+	if events[0].Type != corev1.EventTypeWarning || events[0].Reason != "BackoffLimitExceeded" {
+		t.Fatalf("first event = %#v, want warning before normal backfill", events[0])
+	}
+	for _, event := range events {
+		if event.Reason == "Normal0" {
+			t.Fatalf("oldest normal event was retained; events = %#v", events)
+		}
+	}
+}
+
+func TestEnrichHookDiagnosticsMarksUnavailableWhenClientMissing(t *testing.T) {
+	hooks := []HelmHook{{
+		Name:           "hooks-pre-upgrade",
+		Namespace:      "demo-hooks",
+		Kind:           "Job",
+		Events:         []string{"pre-upgrade"},
+		Status:         "Failed",
+		DeletePolicies: []string{"before-hook-creation"},
+	}}
+	detail := &HelmReleaseDetail{
+		Name:            "hooks",
+		Namespace:       "demo-hooks",
+		Hooks:           hooks,
+		HookDiagnostics: extractHookDiagnostics(hooks),
+	}
+
+	EnrichHookDiagnosticsWithClusterEvidence(context.Background(), detail, nil)
+
+	if len(detail.HookDiagnostics) != 1 {
+		t.Fatalf("len(HookDiagnostics) = %d, want 1", len(detail.HookDiagnostics))
+	}
+	diag := detail.HookDiagnostics[0]
+	if !diag.EvidenceUnavailable {
+		t.Fatal("EvidenceUnavailable = false, want true")
+	}
+	if !strings.Contains(diag.EvidenceUnavailableReason, "no Kubernetes client") {
+		t.Fatalf("EvidenceUnavailableReason = %q, want missing client reason", diag.EvidenceUnavailableReason)
+	}
+}
+
+func diffHasBodyChange(diff string) bool {
+	for _, line := range strings.Split(diff, "\n") {
+		if line == "" || strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "@@") {
+			continue
+		}
+		if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") {
+			return true
+		}
+	}
+	return false
+}
+
 func assertStorageNamespaceFromSecret(t *testing.T, gzipped bool) {
 	t.Helper()
-	rel := &release.Release{
-		Name:      "podinfo",
-		Namespace: "demo-flux-helm",
-		Version:   1,
-		Info:      &release.Info{Status: release.StatusDeployed},
-		Chart:     &chart.Chart{Metadata: &chart.Metadata{Name: "podinfo", Version: "6.11.2"}},
+	rel := helmTestRelease("podinfo", "demo-flux-helm", 1, release.StatusDeployed, "Install complete")
+	client := fake.NewSimpleClientset(helmReleaseSecret(t, "flux-system", rel, gzipped))
+
+	storageNamespaces, err := helmReleaseStorageNamespacesWithClient(client)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if got := storageNamespaces[releaseStorageKey(rel)]; got != "flux-system" {
+		t.Fatalf("storage namespace = %q, want flux-system", got)
+	}
+}
+
+func helmTestRelease(name, namespace string, version int, status release.Status, description string) *release.Release {
+	return &release.Release{
+		Name:      name,
+		Namespace: namespace,
+		Version:   version,
+		Info: &release.Info{
+			Status:       status,
+			Description:  description,
+			LastDeployed: helmtime.Unix(int64(version), 0),
+		},
+		Chart: &chart.Chart{Metadata: &chart.Metadata{
+			Name:       name,
+			Version:    "1.0.0",
+			AppVersion: "1.0.0",
+		}},
+	}
+}
+
+func helmReleaseSecret(t *testing.T, storageNamespace string, rel *release.Release, gzipped bool) *corev1.Secret {
+	t.Helper()
 	payload, err := json.Marshal(rel)
 	if err != nil {
 		t.Fatal(err)
@@ -314,25 +1577,24 @@ func assertStorageNamespaceFromSecret(t *testing.T, gzipped bool) {
 		}
 		payload = b.Bytes()
 	}
-
-	client := fake.NewSimpleClientset(&corev1.Secret{
+	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "sh.helm.release.v1.podinfo.v1",
-			Namespace: "flux-system",
+			Name:      fmt.Sprintf("sh.helm.release.v1.%s.v%d", rel.Name, rel.Version),
+			Namespace: storageNamespace,
 			Labels:    map[string]string{"owner": "helm"},
 		},
 		Data: map[string][]byte{
 			"release": []byte(base64.StdEncoding.EncodeToString(payload)),
 		},
-	})
+	}
+}
 
-	storageNamespaces, err := helmReleaseStorageNamespacesWithClient(client)
-	if err != nil {
-		t.Fatal(err)
+func secretsToObjects(secrets []*corev1.Secret) []runtime.Object {
+	objects := make([]runtime.Object, 0, len(secrets))
+	for _, secret := range secrets {
+		objects = append(objects, secret)
 	}
-	if got := storageNamespaces[releaseStorageKey(rel)]; got != "flux-system" {
-		t.Fatalf("storage namespace = %q, want flux-system", got)
-	}
+	return objects
 }
 
 func TestResolveUpgradeChartPath_UsesRepositoryHint(t *testing.T) {
@@ -347,6 +1609,63 @@ func TestResolveUpgradeChartPath_UsesRepositoryHint(t *testing.T) {
 	}
 	if !strings.Contains(chartPath, "argoproj.github.io") {
 		t.Fatalf("chart path = %q, want argo repo URL", chartPath)
+	}
+}
+
+func TestResolveUpgradeChartPath_RepositoryIndexOCIURLIsAbsolute(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	if err := os.Mkdir(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	repoFile := filepath.Join(dir, "repositories.yaml")
+	if err := os.WriteFile(repoFile, []byte(`apiVersion: v1
+generated: "2026-05-05T00:00:00Z"
+repositories:
+- name: bitnami
+  url: https://charts.bitnami.com/bitnami
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, "bitnami-index.yaml"), []byte(`apiVersion: v1
+entries:
+  nginx:
+  - name: nginx
+    version: 25.0.5
+    urls:
+    - oci://registry-1.docker.io/bitnamicharts/nginx
+generated: "2026-05-05T00:00:00Z"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{settings: &cli.EnvSettings{
+		RepositoryConfig: repoFile,
+		RepositoryCache:  cacheDir,
+	}}
+
+	chartPath, repoName, err := client.resolveUpgradeChartPath("nginx", "25.0.5", "bitnami", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repoName != "bitnami" {
+		t.Fatalf("repo = %q, want bitnami", repoName)
+	}
+	if chartPath != "oci://registry-1.docker.io/bitnamicharts/nginx" {
+		t.Fatalf("chart path = %q, want OCI URL unchanged", chartPath)
+	}
+}
+
+func TestListReleasesAcrossNamespacesEmptySerializesAsArray(t *testing.T) {
+	releases, err := (&Client{}).ListReleasesAcrossNamespaces([]string{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(releases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "[]" {
+		t.Fatalf("empty releases JSON = %s, want []", data)
 	}
 }
 
@@ -389,6 +1708,48 @@ func TestResolveUpgradeChartPath_RepositoryHintDoesNotFallback(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "chart argo-cd version 9.5.11 not found in repository argo") {
 		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestResolveUpgradeChartPath_ReportsIndexErrorAfterOCIFallbackFails(t *testing.T) {
+	withOCISources(t, nil)
+	client := testHelmClientWithRepoConfigOnly(t)
+
+	_, _, err := client.resolveUpgradeChartPath("postgres", "0.19.6", "", nil)
+	if err == nil {
+		t.Fatal("expected index error after OCI fallback miss")
+	}
+	if !strings.Contains(err.Error(), "not found in configured repositories or registered OCI sources") {
+		t.Fatalf("error = %q", err)
+	}
+	if !strings.Contains(err.Error(), "failed to load indexes") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestResolveUpgradeChartPath_UsesOCIBeforeUnrelatedIndexError(t *testing.T) {
+	client := testHelmClientWithRepoConfigOnly(t)
+
+	chartPath, repoName, err := client.resolveUpgradeChartPathWithOCIResolver(
+		"postgres",
+		"0.19.6",
+		"",
+		nil,
+		func(chartName, targetVersion string) (string, bool) {
+			if chartName != "postgres" || targetVersion != "0.19.6" {
+				return "", false
+			}
+			return "oci://registry-1.docker.io/cloudpirates/postgres", true
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repoName != "oci" {
+		t.Fatalf("repoName = %q, want oci", repoName)
+	}
+	if chartPath != "oci://registry-1.docker.io/cloudpirates/postgres" {
+		t.Fatalf("chartPath = %q, want OCI chart path", chartPath)
 	}
 }
 
@@ -448,6 +1809,29 @@ entries:
 	}}
 }
 
+func testHelmClientWithRepoConfigOnly(t *testing.T) *Client {
+	t.Helper()
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	if err := os.Mkdir(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	repoFile := filepath.Join(dir, "repositories.yaml")
+	if err := os.WriteFile(repoFile, []byte(`apiVersion: v1
+generated: "2026-05-05T00:00:00Z"
+repositories:
+- name: broken
+  url: https://charts.example.invalid
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	return &Client{settings: &cli.EnvSettings{
+		RepositoryConfig: repoFile,
+		RepositoryCache:  cacheDir,
+	}}
+}
+
 func TestCompareVersions(t *testing.T) {
 	tests := []struct {
 		v1, v2 string
@@ -471,6 +1855,15 @@ func TestCompareVersions(t *testing.T) {
 	}
 }
 
+func TestListManifestResourcesAcrossNamespacesHonorsCancellationBetweenNamespaces(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	resources, unavailable, parseErrors, err := (&Client{}).ListManifestResourcesAcrossNamespaces(ctx, []string{"default"}, "", nil)
+	if !errors.Is(err, context.Canceled) || len(resources) != 0 || !equalStringSlices(unavailable, []string{"default"}) || parseErrors != 0 {
+		t.Fatalf("canceled collection = resources=%v unavailable=%v parseErrors=%d err=%v", resources, unavailable, parseErrors, err)
+	}
+}
+
 func equalStringSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -481,4 +1874,172 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// Helm lets one vendored subchart body satisfy several dependency declarations
+// that differ only by alias: charts/redis is present once, and Chart.yaml names
+// it twice under two aliases. chartutil.ProcessDependencies clones the body per
+// alias at render time, so a complete, valid chart has fewer bodies than
+// declarations. Dependency validation must not treat a body as consumed by the
+// first declaration that matches it, or it refuses charts Helm renders happily.
+func TestValidateChartDependencyBodiesAcceptsSharedBodyAcrossAliases(t *testing.T) {
+	shared := &chart.Chart{
+		Metadata: &chart.Metadata{Name: "redis", Version: "1.0.0", Type: "application"},
+	}
+	parent := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name: "umbrella", Version: "1.0.0", Type: "application",
+			Dependencies: []*chart.Dependency{
+				{Name: "redis", Version: "1.0.0", Alias: "cache-a"},
+				{Name: "redis", Version: "1.0.0", Alias: "cache-b"},
+			},
+		},
+	}
+	parent.AddDependency(shared)
+
+	if got := len(parent.Dependencies()); got != 1 {
+		t.Fatalf("test precondition failed: bodies=%d, want the single vendored redis body", got)
+	}
+	if err := validateChartDependencyBodies(parent); err != nil {
+		t.Fatalf("valid chart refused: %v", err)
+	}
+}
+
+// The same shape reaches the shared selection path, so the refusal would also
+// break ordinary version upgrades and upgrade preview, not just values editing.
+func TestChartForUpgradeTargetAcceptsSharedBodyAcrossAliases(t *testing.T) {
+	shared := &chart.Chart{
+		Metadata: &chart.Metadata{Name: "redis", Version: "1.0.0", Type: "application"},
+	}
+	complete := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name: "umbrella", Version: "1.0.0", Type: "application",
+			Dependencies: []*chart.Dependency{
+				{Name: "redis", Version: "1.0.0", Alias: "cache-a"},
+				{Name: "redis", Version: "1.0.0", Alias: "cache-b"},
+			},
+		},
+	}
+	complete.AddDependency(shared)
+
+	rel := helmTestRelease("umbrella", "demo", 1, release.StatusDeployed, "deployed")
+	rel.Chart = complete
+	client := &Client{}
+	loadCalls := 0
+	selected, err := client.chartForUpgradeTargetWithLoader(nil, rel, "", "", func(string, string, string) {}, func(*action.Configuration, *release.Release, string, string, func(string, string, string)) (*chart.Chart, error) {
+		loadCalls++
+		return nil, fmt.Errorf("resolver must not be reached for a complete chart")
+	})
+	if err != nil {
+		t.Fatalf("complete aliased chart refused: %v", err)
+	}
+	if loadCalls != 0 || selected != complete {
+		t.Fatalf("loader calls=%d selected=%p, want zero calls and the stored chart %p", loadCalls, selected, complete)
+	}
+}
+
+// Reconstruction resolves by name and version only, and the values-apply path
+// passes no repository hint, so a cluster with two sources publishing the same
+// name and version can hand back a chart the release was never installed from.
+// Release storage keeps the parent's own templates, so that mismatch is
+// detectable and must fail closed rather than be applied.
+func TestChartForUpgradeTargetRefusesReconstructedChartFromWrongSource(t *testing.T) {
+	stored := roundTripStoredChart(t, valuesIsolationUmbrellaChart())
+	rel := helmTestRelease("umbrella", "demo", 1, release.StatusDeployed, "deployed")
+	rel.Chart = stored
+
+	imposter := valuesIsolationUmbrellaChart()
+	for _, tpl := range imposter.Templates {
+		tpl.Data = append(tpl.Data, []byte("\n# injected by an unrelated chart of the same name and version\n")...)
+	}
+
+	client := &Client{}
+	_, err := client.chartForUpgradeTargetWithLoader(nil, rel, "", "", func(string, string, string) {}, func(*action.Configuration, *release.Release, string, string, func(string, string, string)) (*chart.Chart, error) {
+		return imposter, nil
+	})
+	if err == nil {
+		t.Fatal("mismatched chart accepted; a values apply would have rendered someone else's chart")
+	}
+	if !strings.Contains(err.Error(), "does not match the chart this release was installed from") {
+		t.Fatalf("unexpected error, want the source-mismatch refusal: %v", err)
+	}
+}
+
+// The identity check is limited to what Helm leaves intact in release storage:
+// the parent's templates and values schema. Anything altered there means the
+// candidate is not the chart the release was installed from.
+func TestStoredChartMatchesReconstructedRefusesAlteredParentContent(t *testing.T) {
+	base := func() *chart.Chart {
+		return &chart.Chart{
+			Metadata: &chart.Metadata{
+				Name: "umbrella", Version: "1.0.0", Type: "application",
+				Dependencies: []*chart.Dependency{{Name: "child", Version: "2.0.0", Repository: "https://charts.example.com"}},
+			},
+			Templates: []*chart.File{{Name: "templates/parent.yaml", Data: []byte("kind: ConfigMap")}},
+			Schema:    []byte(`{"type":"object"}`),
+		}
+	}
+
+	if err := storedChartMatchesReconstructed(base(), base()); err != nil {
+		t.Fatalf("identical charts reported as different: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*chart.Chart)
+		want   string
+	}{
+		{"different parent template", func(c *chart.Chart) {
+			c.Templates = []*chart.File{{Name: "templates/parent.yaml", Data: []byte("# injected")}}
+		}, "parent template"},
+		{"different values schema", func(c *chart.Chart) { c.Schema = []byte(`{"type":"string"}`) }, "values schema"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			imposter := base()
+			tc.mutate(imposter)
+			if err := storedChartMatchesReconstructed(base(), imposter); err == nil {
+				t.Fatalf("%s accepted; a values apply would have rendered another source's chart", tc.name)
+			} else if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error does not name the mismatch (want %q): %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// Helm mutates a chart on the way into release storage: it sets
+// Dependency.Enabled while resolving conditions, and it coalesces subchart
+// defaults plus a global key into the parent Values. A stored release therefore
+// never matches its own package on those fields, so the comparison must ignore
+// them or every umbrella release becomes uneditable.
+func TestStoredChartMatchesReconstructedIgnoresHelmRenderTimeMutations(t *testing.T) {
+	packaged := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name: "umbrella", Version: "1.0.0", Type: "application",
+			Dependencies: []*chart.Dependency{{Name: "child", Version: "2.0.0"}},
+		},
+		Values: map[string]any{"parentTag": "1.0.0"},
+	}
+	asStored := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name: "umbrella", Version: "1.0.0", Type: "application",
+			Dependencies: []*chart.Dependency{{Name: "child", Version: "2.0.0", Enabled: true}},
+		},
+		Values: map[string]any{
+			"parentTag": "1.0.0",
+			"child":     map[string]any{"imageTag": "2.0.0", "global": map[string]any{}},
+		},
+	}
+	if err := storedChartMatchesReconstructed(asStored, packaged); err != nil {
+		t.Fatalf("a stored release rejected against its own package: %v", err)
+	}
+}
+
+// A JSON round-trip through release storage turns YAML integers into float64.
+// The comparison must not read that as a different chart.
+func TestStoredChartMatchesReconstructedToleratesStorageRoundTrip(t *testing.T) {
+	loaded := valuesIsolationUmbrellaChart()
+	stored := roundTripStoredChart(t, loaded)
+	if err := storedChartMatchesReconstructed(stored, loaded); err != nil {
+		t.Fatalf("a chart compared against its own stored form reported as different: %v", err)
+	}
 }

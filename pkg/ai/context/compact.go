@@ -6,6 +6,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+
+	"github.com/skyhook-io/radar/pkg/prune"
 )
 
 // minifyCompact aggressively prunes both spec and status for token-constrained RCA prompts.
@@ -33,62 +35,41 @@ func minifyCompact(obj runtime.Object) (map[string]any, error) {
 // minifyCompactUnstructured applies Compact-level pruning to an unstructured resource.
 func minifyCompactUnstructured(obj map[string]any) map[string]any {
 	pruneMapCompact(obj)
+	redactUnstructuredSecrets(obj)
 	return obj
 }
 
 func pruneMapCompact(m map[string]any) {
 	// Prune metadata — strip noise keys AND filter annotations
+	// Metadata/spec/container key drops via the shared profiles; annotation
+	// filtering + per-container conditional pruning stay local (below).
+	prune.ApplyInPlace(m, detailBaseProfile)
+	prune.ApplyInPlace(m, compactExtraProfile)
 	if meta, ok := m["metadata"].(map[string]any); ok {
-		pruneMetadataCommon(meta)
 		pruneAnnotationsCompact(meta)
 	}
-
-	// Aggressively prune spec
-	if spec, ok := m["spec"].(map[string]any); ok {
-		pruneSpecCompact(spec)
-	}
+	pruneSpecElementsCompact(m)
 
 	// Per-type status pruning (same as Detail — savings come from spec)
 	kind, _ := m["kind"].(string)
-	if status, ok := m["status"].(map[string]any); ok {
-		pruneStatusForKind(strings.ToLower(kind), status)
+	if p, ok := statusProfileByKind[strings.ToLower(kind)]; ok {
+		prune.ApplyInPlace(m, p)
 	}
 }
 
-func pruneSpecCompact(spec map[string]any) {
-	// Strip all noisy pod spec fields (basic + compact)
-	for key := range stripPodSpecFields {
-		delete(spec, key)
-	}
-	for key := range stripPodSpecFieldsCompact {
-		delete(spec, key)
-	}
-
-	// Prune template.spec (for Deployments, StatefulSets, etc.)
-	if template, ok := spec["template"].(map[string]any); ok {
-		if tSpec, ok := template["spec"].(map[string]any); ok {
-			prunePodSpecCompact(tSpec)
-		}
-	}
-
-	// Direct pod spec (for Pod resources)
-	pruneContainersCompact(spec, "containers")
-	pruneContainersCompact(spec, "initContainers")
+// pruneSpecElementsCompact handles conditional per-element container pruning;
+// unconditional key drops ride the shared profiles' Drop + ElementDrops.
+func pruneSpecElementsCompact(m map[string]any) {
+	forEachContainer(m, pruneContainerConditionalCompact)
+	sanitizeSpecEnvLists(m, true)
 }
 
 func minifySecretCompact(secret *corev1.Secret) map[string]any {
-	keys := make([]string, 0, len(secret.Data)+len(secret.StringData))
-	for k := range secret.Data {
-		keys = append(keys, k)
-	}
-	for k := range secret.StringData {
-		keys = append(keys, k)
-	}
 	return map[string]any{
 		"kind":      "Secret",
 		"name":      secret.Name,
 		"namespace": secret.Namespace,
 		"type":      string(secret.Type),
-		"keys":      keys,
+		"keys":      secretKeyNames(secret),
 	}
 }

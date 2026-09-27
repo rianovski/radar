@@ -2,20 +2,23 @@ import { Shield, ArrowDownToLine, ArrowUpFromLine, GitFork } from 'lucide-react'
 import { clsx } from 'clsx'
 import { Section, LabelSelectorDisplay } from '../../ui/drawer-components'
 import { NetworkPolicyDiagram } from './NetworkPolicyDiagram'
+import { effectivePolicyTypeNames, effectivePolicyTypes, formatNetworkPolicyPort } from '../../../utils/network-policy'
 
 interface NetworkPolicyRendererProps {
   data: any
+  staged?: boolean
 }
 
-export function NetworkPolicyRenderer({ data }: NetworkPolicyRendererProps) {
+export function NetworkPolicyRenderer({ data, staged = false }: NetworkPolicyRendererProps) {
   const spec = data.spec || {}
   const podSelector = spec.podSelector || {}
-  const policyTypes: string[] = spec.policyTypes || []
   const ingress: any[] | undefined = spec.ingress
   const egress: any[] | undefined = spec.egress
 
-  const hasIngress = policyTypes.includes('Ingress')
-  const hasEgress = policyTypes.includes('Egress')
+  const types = effectivePolicyTypes(spec)
+  const policyTypes = effectivePolicyTypeNames(spec)
+  const hasIngress = types.ingress
+  const hasEgress = types.egress
 
   const hasDiagramContent = hasIngress || hasEgress
 
@@ -23,7 +26,7 @@ export function NetworkPolicyRenderer({ data }: NetworkPolicyRendererProps) {
     <>
       {hasDiagramContent && (
         <Section title="Policy Flow" icon={GitFork} defaultExpanded>
-          <NetworkPolicyDiagram spec={spec} />
+          <NetworkPolicyDiagram spec={spec} staged={staged} />
         </Section>
       )}
 
@@ -32,26 +35,29 @@ export function NetworkPolicyRenderer({ data }: NetworkPolicyRendererProps) {
           <div className="text-xs text-theme-text-tertiary mb-1">Pod Selector</div>
           <LabelSelectorDisplay selector={podSelector} emptyText="All pods in namespace" />
         </div>
-        {policyTypes.length > 0 && (
-          <div className="mt-2">
-            <div className="text-xs text-theme-text-tertiary mb-1">Policy Types</div>
-            <div className="flex flex-wrap gap-1">
-              {policyTypes.map((type) => (
-                <span
-                  key={type}
-                  className={clsx(
-                    'badge',
-                    type === 'Ingress'
-                      ? 'bg-blue-500/20 text-blue-400 border-blue-500/30'
-                      : 'bg-purple-500/20 text-purple-400 border-purple-500/30'
-                  )}
-                >
-                  {type}
-                </span>
-              ))}
-            </div>
+        <div className="mt-2">
+          <div className="text-xs text-theme-text-tertiary mb-1">Policy Types</div>
+          <div className="flex flex-wrap items-center gap-1">
+            {policyTypes.map((type) => (
+              <span
+                key={type}
+                className={clsx(
+                  'badge',
+                  type === 'Ingress'
+                    ? 'status-blue'
+                    : 'status-purple'
+                )}
+              >
+                {type}
+              </span>
+            ))}
+            {!types.explicit && (
+              <span className="text-xs text-theme-text-tertiary">
+                by default — policyTypes not set
+              </span>
+            )}
           </div>
-        )}
+        </div>
       </Section>
 
       {hasIngress && (
@@ -117,7 +123,7 @@ function IngressEgressRuleCard({
                 key={j}
                 className="badge bg-theme-elevated text-theme-text-secondary"
               >
-                {port.protocol || 'TCP'}/{port.port}
+                {formatNetworkPolicyPort(port)}
               </span>
             ))}
           </div>
@@ -125,27 +131,38 @@ function IngressEgressRuleCard({
       )}
 
       {peers.length === 0 && ports.length === 0 && (
-        <div className="text-xs text-theme-text-tertiary">Allow all</div>
+        <div className="text-xs text-theme-text-tertiary">
+          {direction === 'from' ? 'All sources' : 'All destinations'}
+        </div>
       )}
     </div>
   )
 }
 
 function PeerEntry({ peer }: { peer: any }) {
-  if (peer.podSelector) {
+  // podSelector and namespaceSelector on one peer are ANDed: the peer is the
+  // pods matching the first inside the namespaces matching the second. Both
+  // have to be shown, or a narrow cross-namespace grant reads as a broad
+  // same-namespace one.
+  const hasPod = peer.podSelector !== undefined
+  const hasNs = peer.namespaceSelector !== undefined
+  if (hasPod || hasNs) {
     return (
-      <div className="text-sm">
-        <span className="text-theme-text-secondary text-xs">podSelector: </span>
-        <LabelSelectorDisplay selector={peer.podSelector} emptyText="all pods" inline />
-      </div>
-    )
-  }
-
-  if (peer.namespaceSelector) {
-    return (
-      <div className="text-sm">
-        <span className="text-theme-text-secondary text-xs">namespaceSelector: </span>
-        <LabelSelectorDisplay selector={peer.namespaceSelector} emptyText="all namespaces" inline />
+      <div className="text-sm space-y-0.5">
+        {hasPod && (
+          <div>
+            <span className="text-theme-text-secondary text-xs">podSelector: </span>
+            <LabelSelectorDisplay selector={peer.podSelector} emptyText="all pods" inline />
+          </div>
+        )}
+        {hasNs && (
+          <div>
+            <span className="text-theme-text-secondary text-xs">
+              {hasPod ? 'in namespaceSelector: ' : 'namespaceSelector: '}
+            </span>
+            <LabelSelectorDisplay selector={peer.namespaceSelector} emptyText="all namespaces" inline />
+          </div>
+        )}
       </div>
     )
   }

@@ -89,7 +89,7 @@ func TestHandleAuthMe_AuthEnabled_WithUser(t *testing.T) {
 	if len(groups) != 2 {
 		t.Errorf("groups = %v, want 2 groups", groups)
 	}
-	// Non-Cloud user — cloudRole must be absent so the SPA's
+	// Non-Cloud user — cloudRole must be absent so the frontend's
 	// useCloudRole hook treats them as "not under Cloud."
 	if _, has := body["cloudRole"]; has {
 		t.Errorf("cloudRole should not be present for non-Cloud user (groups=%v)", groups)
@@ -101,7 +101,7 @@ func TestHandleAuthMe_CloudUser_ExposesCloudRole(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := requestWithUser("GET", "/api/auth/me", &auth.User{
 		Username: "bob",
-		Groups:   []string{"cloud:viewer", "cloud:org:abc"},
+		Groups:   []string{"radar:viewer", "radar:org:abc"},
 	})
 	s.handleAuthMe(w, r)
 
@@ -117,9 +117,9 @@ func TestHandleAuthMe_CloudUser_ExposesCloudRole(t *testing.T) {
 
 func TestParseNamespaces(t *testing.T) {
 	tests := []struct {
-		name   string
-		query  string
-		want   []string
+		name    string
+		query   string
+		want    []string
 		wantNil bool
 	}{
 		{"no params", "", nil, true},
@@ -128,6 +128,7 @@ func TestParseNamespaces(t *testing.T) {
 		{"plural takes precedence", "namespaces=dev&namespace=prod", []string{"dev"}, false},
 		{"trims whitespace", "namespaces= dev , staging ", []string{"dev", "staging"}, false},
 		{"filters empty segments", "namespaces=dev,,staging,", []string{"dev", "staging"}, false},
+		{"dedupes namespaces preserving order", "namespaces=dev,staging,dev,prod,staging", []string{"dev", "staging", "prod"}, false},
 	}
 
 	for _, tt := range tests {
@@ -200,7 +201,7 @@ func TestGetUserNamespaces_CachedClusterAdmin(t *testing.T) {
 	s := newAuthServer(auth.Config{Mode: "proxy"})
 	user := &auth.User{Username: "admin"}
 	// nil AllowedNamespaces = cluster admin (all namespaces)
-	s.permCache.Set("admin", &auth.UserPermissions{AllowedNamespaces: nil})
+	s.permCache.Set("admin", nil, &auth.UserPermissions{AllowedNamespaces: nil})
 
 	r := requestWithUser("GET", "/", user)
 	got := s.getUserNamespaces(r, []string{"dev", "prod"})
@@ -213,7 +214,7 @@ func TestGetUserNamespaces_CachedClusterAdmin(t *testing.T) {
 func TestGetUserNamespaces_CachedRestricted(t *testing.T) {
 	s := newAuthServer(auth.Config{Mode: "proxy"})
 	user := &auth.User{Username: "alice"}
-	s.permCache.Set("alice", &auth.UserPermissions{AllowedNamespaces: []string{"dev", "staging"}})
+	s.permCache.Set("alice", nil, &auth.UserPermissions{AllowedNamespaces: []string{"dev", "staging"}})
 
 	r := requestWithUser("GET", "/", user)
 	got := s.getUserNamespaces(r, []string{"dev", "prod", "staging"})
@@ -235,7 +236,7 @@ func TestGetUserNamespaces_CachedNoAccess(t *testing.T) {
 	s := newAuthServer(auth.Config{Mode: "proxy"})
 	user := &auth.User{Username: "nobody"}
 	// empty (not nil) = no access
-	s.permCache.Set("nobody", &auth.UserPermissions{AllowedNamespaces: []string{}})
+	s.permCache.Set("nobody", nil, &auth.UserPermissions{AllowedNamespaces: []string{}})
 
 	r := requestWithUser("GET", "/", user)
 	got := s.getUserNamespaces(r, []string{"dev"})
@@ -248,7 +249,7 @@ func TestGetUserNamespaces_CachedNoAccess(t *testing.T) {
 func TestGetUserNamespaces_CachedRestricted_AllNamespacesRequested(t *testing.T) {
 	s := newAuthServer(auth.Config{Mode: "proxy"})
 	user := &auth.User{Username: "alice"}
-	s.permCache.Set("alice", &auth.UserPermissions{AllowedNamespaces: []string{"dev", "staging"}})
+	s.permCache.Set("alice", nil, &auth.UserPermissions{AllowedNamespaces: []string{"dev", "staging"}})
 
 	r := requestWithUser("GET", "/", user)
 	// nil requested = "all namespaces" → should return user's allowed list
@@ -304,6 +305,28 @@ func newAuthTestServer(t *testing.T) *authTestEnv {
 	return &authTestEnv{ts: ts, srv: srv}
 }
 
+func TestProxyAuth_PodMetricsNamespaceGated(t *testing.T) {
+	paths := []string{
+		"/api/metrics/pods/default/web-0",
+		"/api/metrics/pods/default/web-0/history",
+		"/api/jobsets/default/training/resources",
+		"/api/jobsets/default/training/logs",
+	}
+
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			env := newAuthTestServer(t)
+			env.srv.permCache.Set("carol", nil, &auth.UserPermissions{AllowedNamespaces: []string{"other"}})
+
+			resp := env.authGet(t, path, "carol", "")
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("%s: status = %d, want %d", path, resp.StatusCode, http.StatusForbidden)
+			}
+		})
+	}
+}
+
 // authPost sends a POST with proxy auth headers and a JSON body.
 func (e *authTestEnv) authPost(t *testing.T, path, user, groups, body string) *http.Response {
 	t.Helper()
@@ -346,7 +369,11 @@ func TestProxyAuth_UnauthenticatedBlocked(t *testing.T) {
 		"/api/events",
 		"/api/changes",
 		"/api/dashboard",
+		"/api/connection",
 		"/mcp",
+		// pprof is mounted on non-cloud builds; the auth middleware must
+		// still gate it (leaks the in-memory K8s cache otherwise).
+		"/debug/pprof/heap",
 	}
 
 	for _, path := range endpoints {
@@ -361,6 +388,19 @@ func TestProxyAuth_UnauthenticatedBlocked(t *testing.T) {
 			}
 		})
 	}
+
+	// POST /api/connection/retry is the reported state-changing endpoint —
+	// assert the mutating verb is gated, not just the GET surface.
+	t.Run("POST /api/connection/retry", func(t *testing.T) {
+		resp, err := http.Post(env.ts.URL+"/api/connection/retry", "application/json", nil)
+		if err != nil {
+			t.Fatalf("POST /api/connection/retry: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("expected 401, got %d", resp.StatusCode)
+		}
+	})
 }
 
 func TestProxyAuth_ExemptPaths(t *testing.T) {
@@ -470,7 +510,7 @@ func TestProxyAuth_NamespaceFiltering_Restricted(t *testing.T) {
 	env := newAuthTestServer(t)
 
 	// Pre-populate cache: alice can only see "staging" (not "default" where resources live)
-	env.srv.permCache.Set("alice", &auth.UserPermissions{
+	env.srv.permCache.Set("alice", []string{"devs"}, &auth.UserPermissions{
 		AllowedNamespaces: []string{"staging"},
 	})
 
@@ -493,7 +533,7 @@ func TestProxyAuth_NamespaceFiltering_Allowed(t *testing.T) {
 	env := newAuthTestServer(t)
 
 	// Pre-populate cache: bob can see "default" (where test resources live)
-	env.srv.permCache.Set("bob", &auth.UserPermissions{
+	env.srv.permCache.Set("bob", []string{"ops"}, &auth.UserPermissions{
 		AllowedNamespaces: []string{"default"},
 	})
 
@@ -515,7 +555,7 @@ func TestProxyAuth_NamespaceFiltering_Topology(t *testing.T) {
 	env := newAuthTestServer(t)
 
 	// Pre-populate cache: restricted to a namespace with no resources
-	env.srv.permCache.Set("viewer", &auth.UserPermissions{
+	env.srv.permCache.Set("viewer", nil, &auth.UserPermissions{
 		AllowedNamespaces: []string{"empty-ns"},
 	})
 
@@ -535,11 +575,11 @@ func TestProxyAuth_NamespaceFiltering_ClusterAdmin(t *testing.T) {
 	env := newAuthTestServer(t)
 
 	// Pre-populate cache: nil AllowedNamespaces = cluster admin
-	env.srv.permCache.Set("admin", &auth.UserPermissions{
+	env.srv.permCache.Set("admin", []string{"platform-admins"}, &auth.UserPermissions{
 		AllowedNamespaces: nil,
 	})
 
-	resp := env.authGet(t, "/api/resources/deployments", "admin", "system:masters")
+	resp := env.authGet(t, "/api/resources/deployments", "admin", "platform-admins")
 	defer resp.Body.Close()
 
 	var deps []any
@@ -555,7 +595,7 @@ func TestProxyAuth_DashboardClusterScopedCountsRequireClusterScopedRBAC(t *testi
 	perms := &auth.UserPermissions{AllowedNamespaces: nil}
 	perms.SetCanI("list", "", "nodes", "", false)
 	perms.SetCanI("list", "", "namespaces", "", false)
-	env.srv.permCache.Set("broad-reader", perms)
+	env.srv.permCache.Set("broad-reader", nil, perms)
 
 	resp := env.authGet(t, "/api/dashboard", "broad-reader", "")
 	defer resp.Body.Close()
@@ -588,7 +628,7 @@ func TestProxyAuth_ClusterScopedReadsRequireClusterScopedRBAC(t *testing.T) {
 	perms := &auth.UserPermissions{AllowedNamespaces: nil}
 	perms.SetCanI("list", "", "nodes", "", false)
 	perms.SetCanI("list", "rbac.authorization.k8s.io", "clusterroles", "", false)
-	env.srv.permCache.Set("broad-reader", perms)
+	env.srv.permCache.Set("broad-reader", nil, perms)
 
 	for _, kind := range []string{"nodes", "clusterroles"} {
 		resp := env.authGet(t, "/api/resources/"+kind, "broad-reader", "")
@@ -628,7 +668,7 @@ func TestProxyAuth_NamespacesResource_RequiresListNamespacesSAR(t *testing.T) {
 
 	perms := &auth.UserPermissions{AllowedNamespaces: nil}
 	perms.SetCanI("list", "", "namespaces", "", false)
-	env.srv.permCache.Set("broad-reader", perms)
+	env.srv.permCache.Set("broad-reader", nil, perms)
 
 	resp := env.authGet(t, "/api/resources/namespaces", "broad-reader", "")
 	defer resp.Body.Close()
@@ -652,7 +692,7 @@ func TestProxyAuth_NamespacesResource_GetRequiresGetNamespacesSAR(t *testing.T) 
 
 	perms := &auth.UserPermissions{AllowedNamespaces: []string{"alpha"}}
 	perms.SetCanI("get", "", "namespaces", "", false)
-	env.srv.permCache.Set("alice", perms)
+	env.srv.permCache.Set("alice", nil, perms)
 
 	resp := env.authGet(t, "/api/resources/namespaces/_/alpha", "alice", "")
 	defer resp.Body.Close()
@@ -670,13 +710,13 @@ func TestProxyAuth_CanI_CacheIsPerUser(t *testing.T) {
 
 	alicePerms := &auth.UserPermissions{AllowedNamespaces: nil}
 	alicePerms.SetCanI("list", "", "nodes", "", true)
-	env.srv.permCache.Set("alice", alicePerms)
+	env.srv.permCache.Set("alice", nil, alicePerms)
 
 	// Bob has the same namespace ceiling but no cached node allow. He must
 	// not inherit alice's grant from the canI cache.
 	bobPerms := &auth.UserPermissions{AllowedNamespaces: nil}
 	bobPerms.SetCanI("list", "", "nodes", "", false)
-	env.srv.permCache.Set("bob", bobPerms)
+	env.srv.permCache.Set("bob", nil, bobPerms)
 
 	// Sanity: alice's grant works (she can see nodes — the SA has them).
 	aliceResp := env.authGet(t, "/api/resources/nodes", "alice", "")
@@ -701,7 +741,7 @@ func TestHandleSetActiveNamespace_RejectsDeniedNamespace(t *testing.T) {
 	// otherwise a restricted user could probe namespace existence by
 	// observing 200 vs 403. Pin the info-leak guard.
 	env := newAuthTestServer(t)
-	env.srv.permCache.Set("alice", &auth.UserPermissions{
+	env.srv.permCache.Set("alice", nil, &auth.UserPermissions{
 		AllowedNamespaces: []string{"alpha"},
 	})
 
@@ -733,7 +773,7 @@ func TestHandleSetActiveNamespace_RejectsLegacyShape(t *testing.T) {
 	t.Cleanup(func() { k8s.SetTestContextName(prev) })
 
 	env := newAuthTestServer(t)
-	env.srv.permCache.Set("alice", &auth.UserPermissions{
+	env.srv.permCache.Set("alice", nil, &auth.UserPermissions{
 		AllowedNamespaces: []string{"alpha"},
 	})
 
@@ -765,13 +805,13 @@ func TestHandleSetActiveNamespace_RejectsLegacyShape(t *testing.T) {
 }
 
 func TestHandleGetNamespaceScope_NoPick_EmitsEmptySliceNotNull(t *testing.T) {
-	// Pin the wire contract: actives and accessibleNamespaces must serialize
+	// Pin the wire contract: actives, accessibleNamespaces, and deniedNamespaces must serialize
 	// as [] (non-nil empty), not null. Without the nil-coercion in
 	// handleGetNamespaceScope the frontend crashed on `scope.actives.slice()`
 	// — caught by /visual-test. The defensive code is small and easy to
 	// regress in a refactor, so pin the byte-level wire shape here.
 	env := newAuthTestServer(t)
-	env.srv.permCache.Set("alice", &auth.UserPermissions{
+	env.srv.permCache.Set("alice", nil, &auth.UserPermissions{
 		AllowedNamespaces: []string{"alpha"},
 	})
 
@@ -794,13 +834,19 @@ func TestHandleGetNamespaceScope_NoPick_EmitsEmptySliceNotNull(t *testing.T) {
 	if !strings.Contains(string(body), `"accessibleNamespaces":[`) {
 		t.Errorf("expected accessibleNamespaces:[…] in body, got: %s", body)
 	}
+	if strings.Contains(string(body), `"deniedNamespaces":null`) {
+		t.Errorf("deniedNamespaces marshalled as null: %s", body)
+	}
+	if !strings.Contains(string(body), `"deniedNamespaces":[`) {
+		t.Errorf("expected deniedNamespaces:[…] in body, got: %s", body)
+	}
 }
 
 func TestProxyAuth_NamespaceFiltering_NoAccess(t *testing.T) {
 	env := newAuthTestServer(t)
 
 	// Pre-populate cache: empty slice = no access
-	env.srv.permCache.Set("nobody", &auth.UserPermissions{
+	env.srv.permCache.Set("nobody", nil, &auth.UserPermissions{
 		AllowedNamespaces: []string{},
 	})
 

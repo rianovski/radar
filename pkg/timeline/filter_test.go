@@ -3,7 +3,6 @@ package timeline
 import (
 	"slices"
 	"testing"
-	"time"
 )
 
 func TestCompiledFilter_ExcludeKinds(t *testing.T) {
@@ -229,6 +228,14 @@ func TestDefaultFilterPreset(t *testing.T) {
 	if !allPreset.IncludeManaged {
 		t.Error("all preset should have IncludeManaged=true")
 	}
+
+	workloadPreset, ok := presets["workloads"]
+	if !ok {
+		t.Fatal("workloads preset should exist")
+	}
+	if !slices.Contains(workloadPreset.IncludeKinds, "Rollout") {
+		t.Error("workloads preset should include Rollout")
+	}
 }
 
 func TestCompileFilter_InvalidRegex(t *testing.T) {
@@ -324,146 +331,4 @@ func TestCompiledFilter_ExcludeOperations(t *testing.T) {
 			t.Errorf("EventType=%s: expected %v, got %v", tt.eventType, tt.expected, result)
 		}
 	}
-}
-
-func TestResourceKey(t *testing.T) {
-	tests := []struct {
-		kind, namespace, name string
-		expected              string
-	}{
-		{"Pod", "default", "nginx", "Pod/default/nginx"},
-		{"Deployment", "prod", "api", "Deployment/prod/api"},
-		{"Node", "", "node-1", "Node//node-1"},
-	}
-
-	for _, tt := range tests {
-		result := ResourceKey(tt.kind, tt.namespace, tt.name)
-		if result != tt.expected {
-			t.Errorf("ResourceKey(%s, %s, %s) = %s, expected %s",
-				tt.kind, tt.namespace, tt.name, result, tt.expected)
-		}
-	}
-}
-
-func TestTimelineEvent_IsToplevelWorkload(t *testing.T) {
-	tests := []struct {
-		kind     string
-		expected bool
-	}{
-		{"Deployment", true},
-		{"DaemonSet", true},
-		{"StatefulSet", true},
-		{"Service", true},
-		{"Job", true},
-		{"CronJob", true},
-		{"Rollout", true},
-		{"Workflow", true},
-		{"CronWorkflow", true},
-		{"Pod", false},
-		{"ReplicaSet", false},
-		{"ConfigMap", false},
-		{"Secret", false},
-	}
-
-	for _, tt := range tests {
-		event := TimelineEvent{Kind: tt.kind}
-		result := event.IsToplevelWorkload()
-		if result != tt.expected {
-			t.Errorf("Kind=%s: expected IsToplevelWorkload()=%v, got %v", tt.kind, tt.expected, result)
-		}
-	}
-}
-
-func TestTimelineEvent_GetAppLabel(t *testing.T) {
-	tests := []struct {
-		labels   map[string]string
-		expected string
-	}{
-		{nil, ""},
-		{map[string]string{}, ""},
-		{map[string]string{"other": "value"}, ""},
-		{map[string]string{"app": "myapp"}, "myapp"},
-		{map[string]string{"app.kubernetes.io/name": "myapp"}, "myapp"},
-		// app.kubernetes.io/name takes precedence
-		{map[string]string{"app": "legacyapp", "app.kubernetes.io/name": "newapp"}, "newapp"},
-	}
-
-	for _, tt := range tests {
-		event := TimelineEvent{Labels: tt.labels}
-		result := event.GetAppLabel()
-		if result != tt.expected {
-			t.Errorf("Labels=%v: expected GetAppLabel()=%q, got %q", tt.labels, tt.expected, result)
-		}
-	}
-}
-
-func TestGroupEvents_ByNamespace(t *testing.T) {
-	events := []TimelineEvent{
-		{ID: "1", Kind: "Deployment", Namespace: "default", Name: "deploy-1", Timestamp: time.Now()},
-		{ID: "2", Kind: "Deployment", Namespace: "prod", Name: "deploy-2", Timestamp: time.Now()},
-		{ID: "3", Kind: "Deployment", Namespace: "default", Name: "deploy-3", Timestamp: time.Now()},
-	}
-
-	groups := GroupEvents(events, GroupByNamespace)
-
-	if len(groups) != 2 {
-		t.Errorf("Expected 2 groups, got %d", len(groups))
-	}
-
-	// Find groups by namespace
-	defaultGroup := findGroup(groups, "default")
-	prodGroup := findGroup(groups, "prod")
-
-	if defaultGroup == nil {
-		t.Error("Expected group for 'default' namespace")
-	} else if defaultGroup.EventCount != 2 {
-		t.Errorf("Expected 2 events in default, got %d", defaultGroup.EventCount)
-	}
-
-	if prodGroup == nil {
-		t.Error("Expected group for 'prod' namespace")
-	} else if prodGroup.EventCount != 1 {
-		t.Errorf("Expected 1 event in prod, got %d", prodGroup.EventCount)
-	}
-}
-
-func TestGroupEvents_ByApp(t *testing.T) {
-	events := []TimelineEvent{
-		{ID: "1", Kind: "Deployment", Namespace: "default", Name: "deploy-1", Labels: map[string]string{"app": "frontend"}, Timestamp: time.Now()},
-		{ID: "2", Kind: "Deployment", Namespace: "default", Name: "deploy-2", Labels: map[string]string{"app": "backend"}, Timestamp: time.Now()},
-		{ID: "3", Kind: "Deployment", Namespace: "default", Name: "deploy-3", Labels: map[string]string{"app": "frontend"}, Timestamp: time.Now()},
-		{ID: "4", Kind: "ConfigMap", Namespace: "default", Name: "config-1", Timestamp: time.Now()}, // no app label
-	}
-
-	groups := GroupEvents(events, GroupByApp)
-
-	if len(groups) != 3 {
-		t.Errorf("Expected 3 groups, got %d", len(groups))
-	}
-
-	// Find frontend group
-	frontendGroup := findGroupByName(groups, "frontend")
-	if frontendGroup == nil {
-		t.Error("Expected group for 'frontend' app")
-	} else if frontendGroup.EventCount != 2 {
-		t.Errorf("Expected 2 events in frontend, got %d", frontendGroup.EventCount)
-	}
-}
-
-func findGroup(groups []EventGroup, id string) *EventGroup {
-	for i := range groups {
-		if groups[i].ID == id {
-			return &groups[i]
-		}
-	}
-	return nil
-}
-
-func findGroupByName(groups []EventGroup, name string) *EventGroup {
-	for i := range groups {
-		if groups[i].Name == name {
-			return &groups[i]
-		}
-	}
-	return nil
 }

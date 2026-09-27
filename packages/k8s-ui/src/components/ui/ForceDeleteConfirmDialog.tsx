@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react'
-import { ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
+import { AlertTriangle, Loader2 } from 'lucide-react'
+import { Collapse, CollapseChevron, useDisclosure } from './Collapse'
 import { ConfirmDialog } from './ConfirmDialog'
-import { formatKindName } from './drawer-components'
 import { pluralize } from '../../utils/pluralize'
 
 export interface CascadeDependent {
@@ -21,6 +21,7 @@ interface ForceDeleteConfirmDialogProps {
   isLoading: boolean
   cascadeDependents?: CascadeDependent[]
   cascadeLoading?: boolean
+  cascadeRootResolved?: boolean
 }
 
 export function ForceDeleteConfirmDialog({
@@ -33,6 +34,7 @@ export function ForceDeleteConfirmDialog({
   isLoading,
   cascadeDependents,
   cascadeLoading,
+  cascadeRootResolved,
 }: ForceDeleteConfirmDialogProps) {
   const [forceDelete, setForceDelete] = useState(false)
 
@@ -69,6 +71,15 @@ export function ForceDeleteConfirmDialog({
           <CascadeDependentsList dependents={cascadeDependents} />
         )}
 
+        {!cascadeLoading && cascadeRootResolved === false && (
+          <div className="flex items-start gap-2 rounded border border-theme-border bg-theme-elevated px-3 py-2 text-xs text-warning-text">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              Radar couldn&apos;t verify which dependent resources Kubernetes will also delete. Additional resources may be deleted but aren&apos;t shown here.
+            </span>
+          </div>
+        )}
+
         <label className="flex items-center gap-2 text-sm text-theme-text-secondary">
           <input
             type="checkbox"
@@ -87,6 +98,7 @@ const MAX_NAMES_PER_KIND = 8
 
 function CascadeDependentsList({ dependents }: { dependents: CascadeDependent[] }) {
   const [expanded, setExpanded] = useState(false)
+  const { panelId, buttonProps } = useDisclosure(expanded)
 
   const grouped = useMemo(() => {
     const map = new Map<string, string[]>()
@@ -101,21 +113,22 @@ function CascadeDependentsList({ dependents }: { dependents: CascadeDependent[] 
   return (
     <div className="rounded border border-amber-500/30 bg-amber-500/5">
       <button
+        {...buttonProps}
         type="button"
         onClick={() => setExpanded(!expanded)}
         className="flex items-center gap-2 w-full px-3 py-2 text-left text-xs font-medium text-amber-400 hover:bg-amber-500/10 transition-colors"
       >
-        {expanded ? <ChevronDown className="w-3.5 h-3.5 shrink-0" /> : <ChevronRight className="w-3.5 h-3.5 shrink-0" />}
+        <CollapseChevron open={expanded} inheritColor className="w-3.5 h-3.5" />
         <span>
           Will also delete {pluralize(dependents.length, 'dependent resource')}
         </span>
       </button>
 
-      {expanded && (
+      <Collapse open={expanded} id={panelId}>
         <div className="px-3 pb-2.5 space-y-1.5">
           {grouped.map(([kind, names]) => (
             <div key={kind} className="text-xs">
-              <span className="font-medium text-theme-text-primary">{formatKindName(kind)}</span>
+              <span className="font-medium text-theme-text-primary">{kind}</span>
               <span className="text-theme-text-tertiary ml-1">({names.length})</span>
               <div className="ml-3 mt-0.5 text-theme-text-secondary font-mono break-all">
                 {names.slice(0, MAX_NAMES_PER_KIND).join(', ')}
@@ -126,7 +139,7 @@ function CascadeDependentsList({ dependents }: { dependents: CascadeDependent[] 
             </div>
           ))}
         </div>
-      )}
+      </Collapse>
     </div>
   )
 }

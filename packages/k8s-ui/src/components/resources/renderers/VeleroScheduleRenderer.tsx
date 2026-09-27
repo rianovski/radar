@@ -1,6 +1,5 @@
 import { Clock, Archive } from 'lucide-react'
-import { clsx } from 'clsx'
-import { Section, PropertyList, Property, ConditionsSection, AlertBanner } from '../../ui/drawer-components'
+import { Section, PropertyList, Property, ConditionsSection, AlertBanner, ResourceLink } from '../../ui/drawer-components'
 import {
   getScheduleStatus,
   getScheduleCron,
@@ -8,19 +7,24 @@ import {
   getSchedulePaused,
   getScheduleTemplate,
   getScheduleUseOwnerReferences,
+  getScheduleValidationErrors,
 } from '../resource-utils-velero'
+import { VeleroPhaseValue } from './velero-cells'
 
 interface VeleroScheduleRendererProps {
   data: any
+  /** The location every backup this schedule creates will be written to. */
+  onNavigate?: (ref: { kind: string; namespace: string; name: string; group?: string }) => void
 }
 
-export function VeleroScheduleRenderer({ data }: VeleroScheduleRendererProps) {
+export function VeleroScheduleRenderer({ data, onNavigate }: VeleroScheduleRendererProps) {
   const status = data.status || {}
   const conditions = status.conditions || []
 
   const scheduleStatus = getScheduleStatus(data)
   const isPaused = getSchedulePaused(data)
   const template = getScheduleTemplate(data)
+  const validationErrors = getScheduleValidationErrors(data)
 
   const templateIncludedNs = template.includedNamespaces || []
   const templateExcludedNs = template.excludedNamespaces || []
@@ -37,11 +41,17 @@ export function VeleroScheduleRenderer({ data }: VeleroScheduleRendererProps) {
           message="This backup schedule is currently paused. No new backups will be created."
         />
       )}
-      {scheduleStatus.text === 'FailedValidation' && (
+      {/* Gated on the errors themselves, not on the badge: a paused schedule
+          badges as "Paused", which would otherwise hide the validation errors
+          the user needs to fix before resuming. */}
+      {(validationErrors.length > 0 || status.phase === 'FailedValidation') && (
         <AlertBanner
           variant="error"
           title="Validation Failed"
-          message="The schedule spec failed validation and is not active."
+          message={isPaused
+            ? 'The schedule spec failed validation. Velero recorded that while the schedule was active; it does not re-validate a paused schedule, so this may or may not still be true when it resumes.'
+            : 'The schedule spec failed validation and is not active — no backups are being created.'}
+          items={validationErrors.length > 0 ? validationErrors : undefined}
         />
       )}
 
@@ -49,9 +59,7 @@ export function VeleroScheduleRenderer({ data }: VeleroScheduleRendererProps) {
       <Section title="Schedule" icon={Clock} defaultExpanded>
         <PropertyList>
           <Property label="Status" value={
-            <span className={clsx('badge', scheduleStatus.color)}>
-              {scheduleStatus.text}
-            </span>
+            <VeleroPhaseValue status={scheduleStatus} phase={status.phase || ''} />
           } />
           <Property label="Cron Schedule" value={
             <span className="font-mono text-sm">{getScheduleCron(data)}</span>
@@ -66,7 +74,15 @@ export function VeleroScheduleRenderer({ data }: VeleroScheduleRendererProps) {
       <Section title="Backup Template" icon={Archive} defaultExpanded>
         <PropertyList>
           {template.storageLocation && (
-            <Property label="Storage Location" value={template.storageLocation} />
+            <Property label="Storage Location" value={
+              <ResourceLink
+                name={template.storageLocation}
+                kind="BackupStorageLocation"
+                namespace={data?.metadata?.namespace ?? ''}
+                group="velero.io"
+                onNavigate={onNavigate}
+              />
+            } />
           )}
           {template.ttl && (
             <Property label="TTL" value={template.ttl} />
@@ -87,7 +103,7 @@ export function VeleroScheduleRenderer({ data }: VeleroScheduleRendererProps) {
             <Property label="Excluded Namespaces" value={
               <div className="flex flex-wrap gap-1">
                 {templateExcludedNs.map((ns: string) => (
-                  <span key={ns} className="badge-sm bg-red-500/10 text-red-400">{ns}</span>
+                  <span key={ns} className="badge-sm bg-red-500/10 text-red-700 dark:text-red-400">{ns}</span>
                 ))}
               </div>
             } />
@@ -105,7 +121,7 @@ export function VeleroScheduleRenderer({ data }: VeleroScheduleRendererProps) {
             <Property label="Excluded Resources" value={
               <div className="flex flex-wrap gap-1">
                 {templateExcludedResources.map((r: string) => (
-                  <span key={r} className="badge-sm bg-red-500/10 text-red-400">{r}</span>
+                  <span key={r} className="badge-sm bg-red-500/10 text-red-700 dark:text-red-400">{r}</span>
                 ))}
               </div>
             } />

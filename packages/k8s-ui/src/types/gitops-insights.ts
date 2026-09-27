@@ -13,6 +13,7 @@ export interface GitOpsInsight {
 }
 
 import type { GitOpsTool } from './gitops'
+import type { GitOpsHealthMode, GitOpsHealthSource } from './gitops-tree'
 
 // Closed enums mirroring `pkg/gitops/insights/vocab.go`. Keeping the FE
 // vocabulary in lockstep with the Go side means switches over these fields
@@ -32,7 +33,13 @@ export type GitOpsCategory =
   | 'Suspended'
   | 'Unknown'
 
-export type GitOpsDriftSource = 'lastAppliedAnnotation'
+// How a Drift's field entries were computed. `lastAppliedAnnotation` is the
+// built-in path (kubectl.kubernetes.io/last-applied-configuration); `argocd-api`
+// means the diff came from a connected Argo CD server's managed-resource diff.
+// The `(string & {})` arm keeps the union open: a library consumer may lag the
+// backend and receive a source it doesn't recognize — such values MUST render
+// with the neutral fallback (no source label), never crash a switch.
+export type GitOpsDriftSource = 'lastAppliedAnnotation' | 'argocd-api' | (string & {})
 
 export interface GitOpsInsightSummary {
   tool: GitOpsTool
@@ -45,6 +52,7 @@ export interface GitOpsInsightSummary {
   // Latest operation status message — surfaced inline in the status strip
   // when an operation is in flight or just failed.
   operationMessage?: string
+  rawOperationMessage?: string
   source?: string
   targetRevision?: string
   lastRevision?: string
@@ -65,6 +73,34 @@ export interface GitOpsInsightSummary {
   // Finalizers blocking deletion. When stuck, naming the finalizer points
   // the user at the controller they need to investigate.
   finalizers?: string[]
+  // Argo comparison-coverage disclosure: the field exclusions declared in
+  // spec.ignoreDifferences that suppress drift from comparison (both Argo's
+  // and Radar's). Undefined for Flux roots and Applications without any
+  // exclusions. unsupportedRuleCount counts entries Radar does NOT evaluate
+  // (jqPathExpressions / managedFieldsManagers rules) — the
+  // drift panel may surface fields Argo's own UI suppresses.
+  ignoredDifferences?: GitOpsIgnoredDifferences
+  // Argo roots: where Argo keeps per-resource health. 'appTree' means the
+  // controller's verdicts are not in the Application object and any
+  // per-resource health shown is Radar's own read.
+  resourceHealthMode?: GitOpsHealthMode
+  // The Application deploys to another cluster; Radar derives nothing about
+  // its resources from here.
+  remoteDestination?: boolean
+  // Per-resource health came from Argo CD's API server: the verdicts shown
+  // are Argo's even though the Application object doesn't carry them.
+  resourceHealthFromApi?: boolean
+  // The controller's API server was asked and didn't answer usefully — why,
+  // in the user's words. Only set when the integration is configured.
+  resourceHealthApiError?: string
+}
+
+export interface GitOpsIgnoredDifferences {
+  ruleCount: number
+  unsupportedRuleCount: number
+  // Sorted unique "Group/Kind" targets ("Kind" for core resources,
+  // "group/*" for a group-wide rule that omits kind).
+  kinds: string[]
 }
 
 export interface GitOpsInsightRef {
@@ -79,6 +115,7 @@ export interface GitOpsIssue {
   scope: GitOpsScope
   reason: string
   message: string
+  rawMessage?: string
   refs?: GitOpsInsightRef[]
   action?: string
   // Plain-English root cause when the message matched a recognized error
@@ -93,6 +130,10 @@ export interface GitOpsIssue {
   // a contextual action button. Nil when no automated remedy applies — the
   // `action` string still describes the manual path in that case.
   remediation?: GitOpsRemediation
+  // Set on resource-scoped issues: 'controller' when the GitOps controller's
+  // own per-resource health produced it, 'radar' when Radar's issues engine
+  // did because the controller's verdict wasn't available.
+  source?: GitOpsHealthSource
 }
 
 export type GitOpsRemediationKind = 'create-namespace'
@@ -108,10 +149,16 @@ export interface GitOpsChange {
   category: GitOpsCategory
   sync?: string
   health?: string
+  // Provenance of `health`; see GitOpsTreeNode.healthSource. `message` holds
+  // the health message from whichever source produced `health`.
+  healthSource?: GitOpsHealthSource
+  healthReason?: string
+  healthSeverity?: string
   message?: string
   // Per-resource sync failure message (Argo's status.resources[].syncResult).
   // Distinct from `message` (live health). Empty when sync succeeded.
   syncError?: string
+  rawSyncError?: string
   // Sync hook phase: PreSync / PostSync / SyncFail / PostDelete. Empty
   // for non-hook resources.
   hookPhase?: string
@@ -175,6 +222,7 @@ export interface GitOpsHistoryItem {
   deployedAt?: string
   phase?: string
   message?: string
+  rawMessage?: string
   source?: string
   initiatedBy?: string
 }
@@ -188,6 +236,53 @@ export interface GitOpsCapabilities {
   syncWithSource: boolean
   selectiveSync: boolean
   rollback: boolean
+  // True on an Argo CD Application detail when the Argo CD integration is
+  // connected, meaning the full Git-rendered desired-vs-live diff endpoint
+  // (/api/argo/applications/{ns}/{name}/resource-diff) can be called for this
+  // app's managed resources. Absent/false → offer only the last-applied field
+  // diff and (for disconnected Argo apps) the "connect Argo CD" hint.
+  argoDiffAvailable?: boolean
+  // True when the Argo CD integration has settings saved, even if the live
+  // connection is down / the token is rejected. Paired with argoDiffAvailable to
+  // tell "not set up" (offer Connect) from "set up but disconnected" (offer
+  // Reconnect) — instead of advertising a diff that would fail.
+  argoConfigured?: boolean
+  // True on an Argo CD Application detail when the integration is connected,
+  // meaning the revision-metadata endpoint can resolve Git commit details
+  // (author, message, signature) for this app's deployed revisions.
+  revisionMetadataAvailable?: boolean
   unsupportedReason?: string
   warnings?: string[]
+}
+
+// Response of GET /api/argo/applications/{ns}/{name}/revision-metadata — the Git
+// commit metadata for one deployed revision. Every field is best-effort (varies
+// across Argo CD versions); signatureInfo non-empty means a signature was checked.
+export interface ArgoRevisionMetadata {
+  author?: string
+  date?: string
+  tags?: string[]
+  message?: string
+  signatureInfo?: string
+}
+
+// Response of GET /api/argo/applications/{ns}/{name}/resource-diff. `desired`
+// is the Git-rendered manifest, `live` the normalized cluster state — both YAML
+// for the line-by-line view. `fieldEntries` is the same diff structured per
+// path for a compact summary. `redacted` is set when Secret values were masked
+// server-side; `hook` marks Argo sync-hook resources.
+export interface GitOpsResourceDiff {
+  source: string
+  desired: string
+  live: string
+  fieldEntries: GitOpsResourceDiffFieldEntry[]
+  redacted: boolean
+  hook: boolean
+}
+
+export interface GitOpsResourceDiffFieldEntry {
+  path: string
+  op: 'added' | 'removed' | 'changed'
+  desired?: string
+  live?: string
 }

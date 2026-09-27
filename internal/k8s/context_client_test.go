@@ -35,7 +35,7 @@ func swapGlobals(t *testing.T, cfg *rest.Config) {
 func TestClientFromContext_Impersonation(t *testing.T) {
 	swapGlobals(t, &rest.Config{Host: "https://example.invalid"})
 
-	user := &pkgauth.User{Username: "alice", Groups: []string{"cloud:owner"}}
+	user := &pkgauth.User{Username: "alice", Groups: []string{"radar:owner"}}
 	ctx := pkgauth.ContextWithUser(context.Background(), user)
 
 	client := ClientFromContext(ctx)
@@ -51,8 +51,32 @@ func TestClientFromContext_Impersonation(t *testing.T) {
 	if cfg.Impersonate.UserName != "alice" {
 		t.Errorf("Impersonate.UserName = %q, want %q", cfg.Impersonate.UserName, "alice")
 	}
-	if len(cfg.Impersonate.Groups) != 1 || cfg.Impersonate.Groups[0] != "cloud:owner" {
-		t.Errorf("Impersonate.Groups = %v, want [cloud:owner]", cfg.Impersonate.Groups)
+	if len(cfg.Impersonate.Groups) != 1 || cfg.Impersonate.Groups[0] != "radar:owner" {
+		t.Errorf("Impersonate.Groups = %v, want [radar:owner]", cfg.Impersonate.Groups)
+	}
+}
+
+func TestConfigSnapshotKeepsContextAndConfigTogether(t *testing.T) {
+	clientMu.Lock()
+	previousConfig := k8sConfig
+	previousContext := contextName
+	k8sConfig = &rest.Config{Host: "https://cluster-a.invalid"}
+	contextName = "cluster-a"
+	clientMu.Unlock()
+	t.Cleanup(func() {
+		clientMu.Lock()
+		k8sConfig = previousConfig
+		contextName = previousContext
+		clientMu.Unlock()
+	})
+
+	config, snapshotContext := GetConfigSnapshot()
+	if config == nil || config.Host != "https://cluster-a.invalid" || snapshotContext != "cluster-a" {
+		t.Fatalf("snapshot = (%+v, %q), want cluster-a config and context", config, snapshotContext)
+	}
+	config.Host = "https://mutated.invalid"
+	if current := GetConfig(); current.Host != "https://cluster-a.invalid" {
+		t.Fatalf("snapshot mutation changed shared config: %q", current.Host)
 	}
 }
 
@@ -62,7 +86,7 @@ func TestClientFromContext_Impersonation(t *testing.T) {
 func TestClientFromContext_ImpersonationFailureReturnsNil(t *testing.T) {
 	swapGlobals(t, nil) // no base config
 
-	user := &pkgauth.User{Username: "alice", Groups: []string{"cloud:viewer"}}
+	user := &pkgauth.User{Username: "alice", Groups: []string{"radar:viewer"}}
 	ctx := pkgauth.ContextWithUser(context.Background(), user)
 
 	if client := ClientFromContext(ctx); client != nil {
@@ -96,7 +120,7 @@ func TestClientFromContext_TypedNilGuard(t *testing.T) {
 func TestDynamicClientFromContext_Impersonation(t *testing.T) {
 	swapGlobals(t, &rest.Config{Host: "https://example.invalid"})
 
-	user := &pkgauth.User{Username: "alice", Groups: []string{"cloud:owner"}}
+	user := &pkgauth.User{Username: "alice", Groups: []string{"radar:owner"}}
 	ctx := pkgauth.ContextWithUser(context.Background(), user)
 
 	if client := DynamicClientFromContext(ctx); client == nil {
@@ -114,7 +138,7 @@ func TestDynamicClientFromContext_Impersonation(t *testing.T) {
 func TestDynamicClientFromContext_FailsClosedOnNoConfig(t *testing.T) {
 	swapGlobals(t, nil)
 
-	user := &pkgauth.User{Username: "alice", Groups: []string{"cloud:viewer"}}
+	user := &pkgauth.User{Username: "alice", Groups: []string{"radar:viewer"}}
 	ctx := pkgauth.ContextWithUser(context.Background(), user)
 
 	if client := DynamicClientFromContext(ctx); client != nil {

@@ -1,10 +1,13 @@
 package k8score
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"reflect"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,11 +17,14 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 )
 
 func TestNewResourceCache_Basic(t *testing.T) {
@@ -57,6 +63,12 @@ func TestNewResourceCache_Basic(t *testing.T) {
 	}
 	if rc.Nodes() != nil {
 		t.Error("expected Nodes() lister to be nil (not enabled)")
+	}
+	if !rc.IsKindClusterWide(Pods) {
+		t.Error("legacy cluster-wide ResourceTypes config must report cluster-wide authority")
+	}
+	if got := rc.KindNamespaces(Pods); got != nil {
+		t.Fatalf("cluster-wide Pod namespaces = %v, want nil", got)
 	}
 }
 
@@ -695,6 +707,47 @@ func TestNewResourceCache_OnReceived(t *testing.T) {
 	}
 }
 
+func TestNewResourceCache_OnObservedChangeSurvivesFiltering(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "test-pod", Namespace: "default", UID: "test-uid",
+	}}
+	client := fake.NewSimpleClientset(pod)
+
+	var mu sync.Mutex
+	var observed, delivered []ResourceChange
+	rc, err := NewResourceCache(CacheConfig{
+		Client:        client,
+		ResourceTypes: map[string]bool{Pods: true},
+		IsNoisyResource: func(string, string, string) bool {
+			return true
+		},
+		OnObservedChange: func(change ResourceChange, _, _ any) {
+			mu.Lock()
+			observed = append(observed, change)
+			mu.Unlock()
+		},
+		OnChange: func(change ResourceChange, _, _ any) {
+			mu.Lock()
+			delivered = append(delivered, change)
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewResourceCache failed: %v", err)
+	}
+	defer rc.Stop()
+
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(observed) != 1 || observed[0].Kind != "Pod" || observed[0].Name != "test-pod" {
+		t.Fatalf("observed changes = %+v, want filtered Pod add", observed)
+	}
+	if len(delivered) != 0 {
+		t.Fatalf("OnChange received filtered changes: %+v", delivered)
+	}
+}
+
 func TestNewResourceCache_NamespaceScopedValidation(t *testing.T) {
 	client := fake.NewSimpleClientset()
 
@@ -857,6 +910,52 @@ func TestDropManagedFields(t *testing.T) {
 	}
 }
 
+func TestResourceCacheOnTransformSeesManagedFieldsBeforeStripping(t *testing.T) {
+	dataWrite := time.Date(2026, 7, 23, 8, 0, 0, 0, time.UTC)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "credentials",
+			Namespace: "default",
+			ManagedFields: []metav1.ManagedFieldsEntry{
+				{
+					Manager:    "secret-controller",
+					Operation:  metav1.ManagedFieldsOperationUpdate,
+					Time:       &metav1.Time{Time: dataWrite},
+					FieldsType: "FieldsV1",
+					FieldsV1:   &metav1.FieldsV1{Raw: []byte(`{"f:data":{"f:password":{}}}`)},
+				},
+			},
+		},
+		Data: map[string][]byte{"password": []byte("must-not-leak")},
+	}
+	client := fake.NewSimpleClientset(secret)
+	var captured time.Time
+	rc, err := NewResourceCache(CacheConfig{
+		Client:        client,
+		ResourceTypes: map[string]bool{Secrets: true},
+		OnTransform: func(obj any) {
+			if transformed, ok := obj.(*corev1.Secret); ok && len(transformed.ManagedFields) == 1 {
+				captured = transformed.ManagedFields[0].Time.Time
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewResourceCache failed: %v", err)
+	}
+	defer rc.Stop()
+
+	if !captured.Equal(dataWrite) {
+		t.Fatalf("OnTransform captured %v, want %v", captured, dataWrite)
+	}
+	cached, err := rc.Secrets().Secrets("default").Get("credentials")
+	if err != nil {
+		t.Fatalf("cached Secret lookup failed: %v", err)
+	}
+	if len(cached.ManagedFields) != 0 {
+		t.Fatalf("cached Secret leaked %d managedFields entries", len(cached.ManagedFields))
+	}
+}
+
 func TestDropManagedFields_Event(t *testing.T) {
 	event := &corev1.Event{
 		ObjectMeta: metav1.ObjectMeta{
@@ -908,7 +1007,7 @@ func TestNewResourceCache_ResourceScopesMixed(t *testing.T) {
 		ResourceScopes: map[string]ResourceScope{
 			Pods:        {Enabled: true, Namespace: ns}, // namespace-scoped
 			Deployments: {Enabled: true, Namespace: ns}, // namespace-scoped
-			Nodes:       {Enabled: true, Namespace: ""}, // cluster-wide (cluster-scoped kind)
+			Nodes:       {Enabled: true, Namespace: ns}, // cluster-scoped kinds ignore namespace fallback
 			Services:    {Enabled: false},               // denied — no informer
 		},
 	})
@@ -929,6 +1028,9 @@ func TestNewResourceCache_ResourceScopesMixed(t *testing.T) {
 	if rc.Services() != nil {
 		t.Error("Services lister should be nil — kind was disabled")
 	}
+	if !rc.IsKindClusterWide(Nodes) || rc.KindNamespaces(Nodes) != nil {
+		t.Fatal("cluster-scoped Node informer did not report its effective cluster-wide scope")
+	}
 
 	enabled := rc.GetEnabledResources()
 	if !enabled[Pods] || !enabled[Deployments] || !enabled[Nodes] {
@@ -942,6 +1044,132 @@ func TestNewResourceCache_ResourceScopesMixed(t *testing.T) {
 	// the namespace used by Pods/Deployments.
 	if _, ok := rc.nsFactories[ns]; !ok {
 		t.Errorf("expected nsFactories to contain %q, got keys %v", ns, mapKeys(rc.nsFactories))
+	}
+}
+
+func TestNewResourceCache_ResourceScopeNamespacesUnion(t *testing.T) {
+	const nsA, nsB, nsOther = "team-a", "team-b", "team-c"
+	client := fake.NewSimpleClientset(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-a", Namespace: nsA, UID: "pod-a"}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-b", Namespace: nsB, UID: "pod-b"}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-c", Namespace: nsOther, UID: "pod-c"}},
+	)
+
+	rc, err := NewResourceCache(CacheConfig{
+		Client: client,
+		ResourceScopes: map[string]ResourceScope{
+			Pods: {Enabled: true, Namespace: nsA},
+		},
+		ResourceScopeNamespaces: map[string][]string{
+			Pods: {nsA, nsB},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewResourceCache failed: %v", err)
+	}
+	defer rc.Stop()
+
+	lister := rc.Pods()
+	if lister == nil {
+		t.Fatal("Pods lister should exist")
+	}
+	all, err := lister.List(labels.Everything())
+	if err != nil {
+		t.Fatalf("list all pods: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("all pods = %d, want 2 from %s/%s (items=%v)", len(all), nsA, nsB, all)
+	}
+	for _, tc := range []struct {
+		namespace string
+		want      int
+	}{
+		{nsA, 1},
+		{nsB, 1},
+		{nsOther, 0},
+	} {
+		items, err := lister.Pods(tc.namespace).List(labels.Everything())
+		if err != nil {
+			t.Fatalf("list pods in %s: %v", tc.namespace, err)
+		}
+		if len(items) != tc.want {
+			t.Fatalf("pods in %s = %d, want %d", tc.namespace, len(items), tc.want)
+		}
+	}
+	if got := ListCountNamespaced(lister, []string{nsA, nsB}); got != 2 {
+		t.Fatalf("ListCountNamespaced = %d, want 2", got)
+	}
+	if rc.IsKindClusterWide(Pods) {
+		t.Fatal("multi-namespace scoped Pods must not report cluster-wide authority")
+	}
+	if got := rc.KindNamespaces(Pods); !slices.Equal(got, []string{nsA, nsB}) {
+		t.Fatalf("Pod informer namespaces = %v, want [%s %s]", got, nsA, nsB)
+	}
+	got := rc.KindNamespaces(Pods)
+	got[0] = "mutated"
+	if next := rc.KindNamespaces(Pods); !slices.Equal(next, []string{nsA, nsB}) {
+		t.Fatalf("caller mutation changed Pod informer namespaces: %v", next)
+	}
+}
+
+func TestUnionIndexer_ReadFanout(t *testing.T) {
+	const nsA, nsB = "team-a", "team-b"
+	mkIndexer := func(pods ...*corev1.Pod) cache.Indexer {
+		idx := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+		for _, p := range pods {
+			if err := idx.Add(p); err != nil {
+				t.Fatalf("seed indexer: %v", err)
+			}
+		}
+		return idx
+	}
+	podA := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-a", Namespace: nsA, UID: "pod-a"}}
+	podB := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-b", Namespace: nsB, UID: "pod-b"}}
+	u := &unionIndexer{indexers: []cache.Indexer{mkIndexer(podA), mkIndexer(podB)}}
+
+	if got := len(u.List()); got != 2 {
+		t.Fatalf("List() = %d items, want 2", got)
+	}
+	if got := len(u.ListKeys()); got != 2 {
+		t.Fatalf("ListKeys() = %d, want 2", got)
+	}
+	for key, want := range map[string]bool{nsA + "/pod-a": true, nsB + "/pod-b": true, "other/pod-x": false} {
+		_, exists, err := u.GetByKey(key)
+		if err != nil {
+			t.Fatalf("GetByKey(%s): %v", key, err)
+		}
+		if exists != want {
+			t.Fatalf("GetByKey(%s) exists = %v, want %v", key, exists, want)
+		}
+	}
+	byNs, err := u.ByIndex(cache.NamespaceIndex, nsB)
+	if err != nil {
+		t.Fatalf("ByIndex: %v", err)
+	}
+	if len(byNs) != 1 || byNs[0].(*corev1.Pod).Name != "pod-b" {
+		t.Fatalf("ByIndex(%s) = %v, want [pod-b]", nsB, byNs)
+	}
+	if vals := u.ListIndexFuncValues(cache.NamespaceIndex); len(vals) != 2 {
+		t.Fatalf("ListIndexFuncValues = %v, want two namespaces", vals)
+	}
+}
+
+func TestUnionIndexer_WritesRejected(t *testing.T) {
+	u := &unionIndexer{indexers: []cache.Indexer{cache.NewIndexer(cache.MetaNamespaceKeyFunc, nil)}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns"}}
+	for name, err := range map[string]error{
+		"Add":     u.Add(pod),
+		"Update":  u.Update(pod),
+		"Delete":  u.Delete(pod),
+		"Replace": u.Replace(nil, ""),
+		"Resync":  u.Resync(),
+	} {
+		if err == nil {
+			t.Fatalf("%s on read-only union indexer returned nil error", name)
+		}
+	}
+	if got := len(u.List()); got != 0 {
+		t.Fatalf("rejected writes still stored %d items", got)
 	}
 }
 
@@ -1093,18 +1321,20 @@ func TestDynamicResourceCache_NamespaceFallbackIsPerGVR(t *testing.T) {
 		t.Fatalf("NewDynamicResourceCache failed: %v", err)
 	}
 
-	if err := d.probeAccess(clusterGVR); err != nil {
+	clusterScopes, _, err := d.probeScopes(clusterGVR, "")
+	if err != nil {
 		t.Fatalf("cluster GVR probe failed: %v", err)
 	}
-	if err := d.probeAccess(namespacedGVR); err != nil {
-		t.Fatalf("namespaced GVR probe failed: %v", err)
+	if !reflect.DeepEqual(clusterScopes, []string{""}) {
+		t.Errorf("cluster GVR scopes = %q, want cluster-wide", clusterScopes)
 	}
 
-	if got := d.informerScopes[clusterGVR]; got != "" {
-		t.Errorf("cluster GVR scope = %q, want cluster-wide", got)
+	nsScopes, _, err := d.probeScopes(namespacedGVR, "")
+	if err != nil {
+		t.Fatalf("namespaced GVR probe failed: %v", err)
 	}
-	if got := d.informerScopes[namespacedGVR]; got != ns {
-		t.Errorf("namespaced GVR scope = %q, want %q", got, ns)
+	if !reflect.DeepEqual(nsScopes, []string{ns}) {
+		t.Errorf("namespaced GVR scopes = %q, want [%q]", nsScopes, ns)
 	}
 }
 
@@ -1126,11 +1356,451 @@ func TestDynamicResourceCache_ForcedNamespaceScopesEveryGVR(t *testing.T) {
 		t.Fatalf("NewDynamicResourceCache failed: %v", err)
 	}
 
-	if err := d.probeAccess(gvr); err != nil {
+	scopes, _, err := d.probeScopes(gvr, "")
+	if err != nil {
 		t.Fatalf("forced namespace probe failed: %v", err)
 	}
-	if got := d.informerScopes[gvr]; got != ns {
-		t.Errorf("GVR scope = %q, want %q", got, ns)
+	if !reflect.DeepEqual(scopes, []string{ns}) {
+		t.Errorf("GVR scopes = %q, want [%q]", scopes, ns)
+	}
+}
+
+// The #768 core: when cluster-wide list is denied but the caller names a
+// specific namespace they CAN list, the probe scopes to that namespace —
+// not to the configured single fallback. This is what lets a namespace-
+// restricted user read a CRD in the namespaces they actually have access to.
+func TestDynamicResourceCache_ProbeScope_HonorsRequestedNamespace(t *testing.T) {
+	const fallbackNs, wantedNs = "fallback-ns", "argocd"
+	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "ApplicationList",
+	}, func(_ schema.GroupVersionResource, namespace string) bool {
+		return namespace == wantedNs // not cluster-wide, not the fallback
+	})
+
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{
+		DynamicClient:     dyn,
+		NamespaceFallback: fallbackNs,
+	})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+
+	// Requesting the namespace the user can list scopes the informer there.
+	scopes, _, err := d.probeScopes(gvr, wantedNs)
+	if err != nil {
+		t.Fatalf("probeScopes(%q) failed: %v", wantedNs, err)
+	}
+	if !reflect.DeepEqual(scopes, []string{wantedNs}) {
+		t.Errorf("scopes = %q, want [%q]", scopes, wantedNs)
+	}
+
+	// With no requested namespace, it falls back to the configured fallback,
+	// which the user cannot list — so the probe is forbidden.
+	if _, _, err := d.probeScopes(gvr, ""); !apierrors.IsForbidden(err) {
+		t.Errorf("probeScopes(\"\") err = %v, want forbidden", err)
+	}
+}
+
+// List(gvr, "") must be served ONLY by a cluster-wide informer — it must not
+// union incidental per-namespace informers, which would make results depend on
+// what other requests warmed. ListNamespaces is the explicit union path.
+func TestDynamicResourceCache_ListEmptyNamespaceDoesNotUnion(t *testing.T) {
+	const nsA, nsB = "team-a", "team-b"
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "WidgetList",
+	}, func(_ schema.GroupVersionResource, namespace string) bool {
+		return namespace == nsA || namespace == nsB // namespaced only, never cluster-wide
+	})
+
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{DynamicClient: dyn})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+
+	// Warm per-namespace informers for both namespaces.
+	if _, err := d.ListBlocking(gvr, nsA, 2*time.Second); err != nil {
+		t.Fatalf("ListBlocking(%q) failed: %v", nsA, err)
+	}
+	if _, err := d.ListBlocking(gvr, nsB, 2*time.Second); err != nil {
+		t.Fatalf("ListBlocking(%q) failed: %v", nsB, err)
+	}
+
+	// List(gvr, "") finds no cluster-wide informer and must NOT union the two
+	// per-namespace informers.
+	if got := d.readEntries(gvr, ""); got != nil {
+		t.Errorf("readEntries(gvr, \"\") returned %d entries, want none (no cluster-wide informer)", len(got))
+	}
+}
+
+// Mirror of ListEmptyNamespaceDoesNotUnion for namespace-scoped mode: when Radar
+// connects with a namespace-restricted identity (NamespaceFallback set),
+// cluster-wide list is denied so a GVR's only informers are per-namespace. An
+// all-namespaces read — List(gvr, "") and Count(gvr, nil) — MUST union them, or
+// namespaced CRDs show 0 in the UI despite synced per-namespace informers. The
+// NamespaceFallback gate is what keeps the no-union contract intact for a
+// cluster-wide cache (the sibling test) while fixing the namespace-scoped case.
+func TestDynamicResourceCache_ListEmptyNamespaceUnionsWhenNamespaceScoped(t *testing.T) {
+	const nsA, nsB = "team-a", "team-b"
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "WidgetList",
+	}, func(_ schema.GroupVersionResource, namespace string) bool {
+		return namespace == nsA || namespace == nsB // namespaced only, never cluster-wide
+	})
+	for _, ns := range []string{nsA, nsB} {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "example.com/v1",
+			"kind":       "Widget",
+			"metadata":   map[string]any{"name": "w-" + ns, "namespace": ns},
+		}}
+		if _, err := dyn.Resource(gvr).Namespace(ns).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("seed %s: %v", ns, err)
+		}
+	}
+
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{DynamicClient: dyn, NamespaceFallback: nsA})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+	for _, ns := range []string{nsA, nsB} {
+		if _, err := d.ListBlocking(gvr, ns, 2*time.Second); err != nil {
+			t.Fatalf("ListBlocking(%q) failed: %v", ns, err)
+		}
+	}
+
+	got, err := d.List(gvr, "")
+	if err != nil {
+		t.Fatalf("List(gvr, \"\") failed: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("List(gvr, \"\") = %d objects, want 2 (union of per-namespace informers in namespace-scoped mode)", len(got))
+	}
+
+	// Count gates on the cache's own per-informer `synced` flag, which a
+	// background goroutine sets shortly AFTER informer.HasSynced() (what
+	// ListBlocking waited on) — so poll briefly rather than racing that
+	// propagation.
+	var n int
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		n, err = d.Count(gvr, nil)
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("Count(gvr, nil) failed: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("Count(gvr, nil) = %d, want 2", n)
+	}
+}
+
+// ListWatched is the internal "scan what's already cached" path: it unions
+// every watched scope so namespace-restricted callers (audit, PolicyReport
+// indexing) don't silently drop namespace-scoped contents the way List(gvr,
+// "") would.
+func TestDynamicResourceCache_ListWatchedUnionsNamespaceInformers(t *testing.T) {
+	const nsA, nsB = "team-a", "team-b"
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "WidgetList",
+	}, func(_ schema.GroupVersionResource, namespace string) bool {
+		return namespace == nsA || namespace == nsB // namespaced only, never cluster-wide
+	})
+
+	// Seed one object in each namespace so the informers have content.
+	for _, ns := range []string{nsA, nsB} {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "example.com/v1",
+			"kind":       "Widget",
+			"metadata":   map[string]any{"name": "w-" + ns, "namespace": ns},
+		}}
+		if _, err := dyn.Resource(gvr).Namespace(ns).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("seed %s: %v", ns, err)
+		}
+	}
+
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{DynamicClient: dyn})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+	for _, ns := range []string{nsA, nsB} {
+		if _, err := d.ListBlocking(gvr, ns, 2*time.Second); err != nil {
+			t.Fatalf("ListBlocking(%q) failed: %v", ns, err)
+		}
+	}
+
+	got, err := d.ListWatched(gvr)
+	if err != nil {
+		t.Fatalf("ListWatched failed: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("ListWatched returned %d objects, want 2 (union of both namespace-scoped informers)", len(got))
+	}
+
+	readOnly, err := d.ListWatchedReadOnly(gvr)
+	if err != nil {
+		t.Fatalf("ListWatchedReadOnly failed: %v", err)
+	}
+	if len(readOnly) != 2 {
+		t.Fatalf("ListWatchedReadOnly returned %d objects, want 2", len(readOnly))
+	}
+	copiesByName := make(map[string]*unstructured.Unstructured, len(got))
+	for _, item := range got {
+		copiesByName[item.GetName()] = item
+	}
+	for _, item := range readOnly {
+		if item == copiesByName[item.GetName()] {
+			t.Fatalf("ListWatched returned cached pointer for %s instead of a defensive copy", item.GetName())
+		}
+	}
+	readOnlyAgain, err := d.ListWatchedReadOnly(gvr)
+	if err != nil {
+		t.Fatalf("second ListWatchedReadOnly failed: %v", err)
+	}
+	readOnlyByName := make(map[string]*unstructured.Unstructured, len(readOnly))
+	for _, item := range readOnly {
+		readOnlyByName[item.GetName()] = item
+	}
+	for _, item := range readOnlyAgain {
+		if item != readOnlyByName[item.GetName()] {
+			t.Fatalf("ListWatchedReadOnly copied cached object %s", item.GetName())
+		}
+	}
+
+	item, err := d.GetWatched(gvr, nsB, "w-"+nsB)
+	if err != nil {
+		t.Fatalf("GetWatched failed: %v", err)
+	}
+	if item.GetNamespace() != nsB || item.GetName() != "w-"+nsB {
+		t.Fatalf("GetWatched returned %s/%s, want %s/%s", item.GetNamespace(), item.GetName(), nsB, "w-"+nsB)
+	}
+	item.SetName("mutated-copy")
+	again, err := d.GetWatched(gvr, nsB, "w-"+nsB)
+	if err != nil || again.GetName() != "w-"+nsB {
+		t.Fatalf("GetWatched mutated informer object: item=%v err=%v", again, err)
+	}
+	if _, err := d.GetWatched(gvr, nsB, "absent"); !errors.Is(err, ErrResourceNotFound) {
+		t.Fatalf("GetWatched missing object error = %v, want ErrResourceNotFound", err)
+	}
+}
+
+// ListNamespaces must short-circuit a cluster-scoped GVR to a cluster-wide
+// read even when given a namespace set: cluster-scoped objects live under the
+// "" namespace, so a per-namespace filter would index them to nothing. Pins
+// the gvrIsNamespaced guard the topology paths rely on for Karpenter
+// NodePool/NodeClaim and other cluster-scoped CRDs.
+func TestDynamicResourceCache_ListNamespacesClusterScopedReadsClusterWide(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: "karpenter.sh", Version: "v1", Resource: "nodepools"}
+	disc := &ResourceDiscovery{
+		resources: []APIResource{{
+			Group: gvr.Group, Version: gvr.Version, Kind: "NodePool", Name: gvr.Resource,
+			Namespaced: false, IsCRD: true, Verbs: []string{"get", "list", "watch"},
+		}},
+		resourceMap: map[string]APIResource{},
+		gvrMap:      map[string]schema.GroupVersionResource{},
+		lastRefresh: time.Now(),
+		cacheTTL:    time.Hour,
+	}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "NodePoolList",
+	}, func(schema.GroupVersionResource, string) bool { return true }) // cluster-wide allowed
+
+	// Seed a cluster-scoped object (no namespace).
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "karpenter.sh/v1",
+		"kind":       "NodePool",
+		"metadata":   map[string]any{"name": "default"},
+	}}
+	if _, err := dyn.Resource(gvr).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed cluster-scoped object: %v", err)
+	}
+
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{DynamicClient: dyn, Discovery: disc})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+	if _, err := d.ListBlocking(gvr, "", 2*time.Second); err != nil {
+		t.Fatalf("ListBlocking failed: %v", err)
+	}
+
+	// A namespace filter must NOT zero out a cluster-scoped resource.
+	got, err := d.ListNamespaces(gvr, []string{"ns-a"})
+	if err != nil {
+		t.Fatalf("ListNamespaces failed: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("ListNamespaces(clusterScopedGVR, [ns-a]) = %d objects, want 1 (cluster-wide short-circuit)", len(got))
+	}
+}
+
+// Starting a cluster-wide informer must supersede (stop + drop) any
+// namespace-scoped informers for the same GVR — the "never both" invariant —
+// so reads (ListWatched) and change callbacks don't double up.
+func TestDynamicResourceCache_ClusterWideSupersedesNamespaceInformers(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "WidgetList",
+	}, func(schema.GroupVersionResource, string) bool { return true })
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{DynamicClient: dyn})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+	defer d.Stop()
+
+	has := func(ns string) bool {
+		d.mu.RLock()
+		defer d.mu.RUnlock()
+		_, ok := d.informers[informerKey{gvr: gvr, ns: ns}]
+		return ok
+	}
+
+	if err := d.startWatching(gvr, "team-a"); err != nil {
+		t.Fatalf("startWatching(team-a): %v", err)
+	}
+	if err := d.startWatching(gvr, "team-b"); err != nil {
+		t.Fatalf("startWatching(team-b): %v", err)
+	}
+	if !has("team-a") || !has("team-b") {
+		t.Fatal("expected both namespace-scoped informers before supersede")
+	}
+
+	if err := d.startWatching(gvr, ""); err != nil {
+		t.Fatalf("startWatching(cluster-wide): %v", err)
+	}
+	if !has("") {
+		t.Error("expected cluster-wide informer after supersede")
+	}
+	if has("team-a") || has("team-b") {
+		t.Error("namespace-scoped informers must be superseded by the cluster-wide one")
+	}
+}
+
+// A handler registered via AddGVRChangeHandler must reach informers created
+// AFTER registration (lazy per-namespace watches, reap re-creations) — not
+// only those present at call time — or derived caches miss those events.
+func TestDynamicResourceCache_GVRChangeHandlerAppliesToLaterInformers(t *testing.T) {
+	const nsA, nsB = "team-a", "team-b"
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "WidgetList",
+	}, func(_ schema.GroupVersionResource, ns string) bool { return ns != "" }) // namespaced only
+
+	// Seed an object in nsB so its (later-created) informer has an add to deliver.
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "example.com/v1",
+		"kind":       "Widget",
+		"metadata":   map[string]any{"name": "w", "namespace": nsB},
+	}}
+	if _, err := dyn.Resource(gvr).Namespace(nsB).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed nsB: %v", err)
+	}
+
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{DynamicClient: dyn})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+	defer d.Stop()
+
+	// Warm nsA so the handler has an existing informer to attach to at registration.
+	if _, err := d.ListBlocking(gvr, nsA, 2*time.Second); err != nil {
+		t.Fatalf("ListBlocking(nsA): %v", err)
+	}
+
+	var adds atomic.Int64
+	h := cache.ResourceEventHandlerFuncs{AddFunc: func(any) { adds.Add(1) }}
+	if err := d.AddGVRChangeHandler(gvr, h); err != nil {
+		t.Fatalf("AddGVRChangeHandler: %v", err)
+	}
+
+	// nsB's informer is created lazily after registration; it must still get h.
+	if _, err := d.ListBlocking(gvr, nsB, 2*time.Second); err != nil {
+		t.Fatalf("ListBlocking(nsB): %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && adds.Load() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if adds.Load() == 0 {
+		t.Error("handler did not fire for an informer created after registration")
+	}
+}
+
+// GVR-level status APIs must span namespace-scoped informers: with only
+// per-namespace watches (no cluster-wide one), the kind is still watched and
+// synced, so IsSynced/WaitForSync must report true and AddGVRChangeHandler
+// must register — they resolve via entriesForGVR, not readEntries(gvr, "").
+func TestDynamicResourceCache_StatusAPIsSpanNamespaceInformers(t *testing.T) {
+	const ns = "team-a"
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "WidgetList",
+	}, func(_ schema.GroupVersionResource, namespace string) bool {
+		return namespace == ns // namespaced only, never cluster-wide
+	})
+
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{DynamicClient: dyn})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+
+	if _, err := d.ListBlocking(gvr, ns, 2*time.Second); err != nil {
+		t.Fatalf("ListBlocking(%q) failed: %v", ns, err)
+	}
+
+	if !d.IsSynced(gvr) {
+		t.Error("IsSynced = false for a GVR watched only via a namespace-scoped informer, want true")
+	}
+	if !d.WaitForSync(gvr, 2*time.Second) {
+		t.Error("WaitForSync = false for a namespace-scoped-only GVR, want true")
+	}
+	if err := d.AddGVRChangeHandler(gvr, cache.ResourceEventHandlerFuncs{}); err != nil {
+		t.Errorf("AddGVRChangeHandler failed for a namespace-scoped-only GVR: %v", err)
+	}
+
+	// A subsequent List(gvr, "") must NOT short-circuit on the existing
+	// namespace-scoped informer and then find nothing. With no cluster-wide
+	// informer it re-probes cluster-wide (denied here) and returns a clean
+	// forbidden — never a spurious "informer not found".
+	_, err = d.List(gvr, "")
+	if err == nil {
+		t.Fatal("List(gvr, \"\") = nil error, want forbidden (cluster-wide denied)")
+	}
+	if !apierrors.IsForbidden(err) {
+		t.Errorf("List(gvr, \"\") err = %v, want a re-probed forbidden (not 'informer not found')", err)
+	}
+}
+
+// EnsureWatching must surface a probe that's forbidden everywhere it looks
+// (cluster-wide AND the fallback namespace) as an apierrors.IsForbidden-
+// classifiable error through the %w wrap — that's what lets the resources
+// handler map a denied CRD list to 403 instead of 500. Mirrors #768: a user
+// who can read the CRD only in a namespace the cache never probes.
+func TestDynamicResourceCache_EnsureWatching_ForbiddenIsClassifiable(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "ApplicationList",
+	}, func(schema.GroupVersionResource, string) bool { return false })
+
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{
+		DynamicClient:     dyn,
+		NamespaceFallback: "other-ns",
+	})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+
+	err = d.EnsureWatching(gvr)
+	if err == nil {
+		t.Fatal("EnsureWatching succeeded, want forbidden error")
+	}
+	if !apierrors.IsForbidden(err) {
+		t.Fatalf("EnsureWatching error not classifiable as forbidden (handler would 500 instead of 403): %v", err)
 	}
 }
 
@@ -1154,4 +1824,189 @@ func fakeDynamicForListAccess(
 		return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: gvr.Group, Resource: gvr.Resource}, "", nil)
 	})
 	return dyn
+}
+
+// TestKindCoversNamespace pins the empty-vs-unreadable distinction: an empty list
+// is only authoritative when the informer actually covers the namespace.
+func TestKindCoversNamespace(t *testing.T) {
+	// nil ResourceScopes = legacy / cluster-wide default → covers everything.
+	if !(&ResourceCache{}).KindCoversNamespace("pods", "any") {
+		t.Error("nil scopes must cover all (legacy cluster-wide)")
+	}
+	clusterWide := &ResourceCache{config: CacheConfig{ResourceScopes: map[string]ResourceScope{"pods": {Enabled: true, Namespace: ""}}}}
+	if !clusterWide.KindCoversNamespace("pods", "prod") {
+		t.Error("cluster-wide pods must cover any namespace")
+	}
+	scoped := &ResourceCache{config: CacheConfig{ResourceScopes: map[string]ResourceScope{"pods": {Enabled: true, Namespace: "prod"}}}}
+	if !scoped.KindCoversNamespace("pods", "prod") {
+		t.Error("namespace-scoped pods must cover its own namespace")
+	}
+	if scoped.KindCoversNamespace("pods", "other") {
+		t.Error("pods scoped to prod must NOT cover another namespace (empty there is out-of-scope, not 0 pods)")
+	}
+	disabled := &ResourceCache{config: CacheConfig{ResourceScopes: map[string]ResourceScope{}}}
+	if disabled.KindCoversNamespace("pods", "prod") {
+		t.Error("a kind absent from an authoritative scope set is not covered")
+	}
+}
+
+// The PR core for CRDs: cluster-wide denied but several fallback namespaces
+// granted → one scope per granted namespace, denied candidates skipped.
+func TestDynamicResourceCache_ProbeScopesFansOutAcrossFallbacks(t *testing.T) {
+	const nsA, nsB, nsDenied = "team-a", "team-b", "team-c"
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "WidgetList",
+	}, func(_ schema.GroupVersionResource, namespace string) bool {
+		return namespace == nsA || namespace == nsB
+	})
+
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{
+		DynamicClient:      dyn,
+		NamespaceFallbacks: []string{nsA, nsB, nsDenied},
+	})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+
+	scopes, complete, err := d.probeScopes(gvr, "")
+	if err != nil {
+		t.Fatalf("probeScopes failed: %v", err)
+	}
+	if !reflect.DeepEqual(scopes, []string{nsA, nsB}) {
+		t.Fatalf("scopes = %v, want [%s %s]", scopes, nsA, nsB)
+	}
+	if !complete {
+		t.Fatal("healthy fanout walk must report complete")
+	}
+}
+
+// End-to-end: an all-namespaces read of a fallback-scoped GVR starts one
+// informer per granted namespace, unions their contents, and does not
+// re-probe on subsequent reads.
+func TestDynamicResourceCache_EnsureWatchingFansOutAndUnions(t *testing.T) {
+	const nsA, nsB, nsDenied = "team-a", "team-b", "team-c"
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "WidgetList",
+	}, func(_ schema.GroupVersionResource, namespace string) bool {
+		return namespace == nsA || namespace == nsB
+	})
+	for _, ns := range []string{nsA, nsB} {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "example.com/v1",
+			"kind":       "Widget",
+			"metadata":   map[string]any{"name": "w-" + ns, "namespace": ns},
+		}}
+		if _, err := dyn.Resource(gvr).Namespace(ns).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("seed %s: %v", ns, err)
+		}
+	}
+
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{
+		DynamicClient:      dyn,
+		NamespaceFallbacks: []string{nsA, nsB, nsDenied},
+	})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+
+	items, err := d.ListBlocking(gvr, "", 3*time.Second)
+	if err != nil {
+		t.Fatalf("ListBlocking failed: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("union read = %d items, want 2 (one per granted namespace)", len(items))
+	}
+
+	if !d.hasCoveringInformer(gvr, "") {
+		t.Fatal("all-namespaces scope not marked resolved — every read would re-probe cluster + candidates")
+	}
+	if n, err := d.Count(gvr, nil); err != nil || n != 2 {
+		t.Fatalf("Count = %d, %v; want 2", n, err)
+	}
+}
+
+// Pins the unavailable-over-partial contract: a fanout GVR whose informers
+// exist only from namespace-specific reads (all-namespaces walk never
+// settled) must refuse an all-namespace count rather than sum the subset —
+// and must start counting once an all-namespaces read settles the walk.
+func TestDynamicResourceCache_CountRefusesUnsettledFanout(t *testing.T) {
+	const nsA, nsB = "team-a", "team-b"
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "WidgetList",
+	}, func(_ schema.GroupVersionResource, namespace string) bool {
+		return namespace == nsA || namespace == nsB
+	})
+	for _, ns := range []string{nsA, nsB} {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "example.com/v1",
+			"kind":       "Widget",
+			"metadata":   map[string]any{"name": "w-" + ns, "namespace": ns},
+		}}
+		if _, err := dyn.Resource(gvr).Namespace(ns).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("seed %s: %v", ns, err)
+		}
+	}
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{
+		DynamicClient:      dyn,
+		NamespaceFallbacks: []string{nsA, nsB},
+	})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+
+	// Namespace-specific read only — informer for nsA exists, walk unsettled.
+	if _, err := d.ListBlocking(gvr, nsA, 3*time.Second); err != nil {
+		t.Fatalf("ListBlocking(%s): %v", nsA, err)
+	}
+	if n, err := d.Count(gvr, nil); err == nil {
+		t.Fatalf("all-namespace count on unsettled fanout returned %d, want error", n)
+	}
+
+	// All-namespaces read settles the walk; the count becomes authoritative.
+	if _, err := d.ListBlocking(gvr, "", 3*time.Second); err != nil {
+		t.Fatalf("ListBlocking(all): %v", err)
+	}
+	if n, err := d.Count(gvr, nil); err != nil || n != 2 {
+		t.Fatalf("settled count = %d, %v; want 2", n, err)
+	}
+}
+
+// Legacy single-fallback regression: with exactly one configured fallback
+// namespace, an informer created by an explicit-namespace read fully covers
+// the configured scope — Count(gvr, nil) must work without ever seeing an
+// all-namespaces read.
+func TestDynamicResourceCache_SingleFallbackCountsWithoutAllNamespacesRead(t *testing.T) {
+	const ns = "team-a"
+	gvr := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "widgets"}
+	dyn := fakeDynamicForListAccess(t, map[schema.GroupVersionResource]string{
+		gvr: "WidgetList",
+	}, func(_ schema.GroupVersionResource, namespace string) bool {
+		return namespace == ns
+	})
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "example.com/v1",
+		"kind":       "Widget",
+		"metadata":   map[string]any{"name": "w-1", "namespace": ns},
+	}}
+	if _, err := dyn.Resource(gvr).Namespace(ns).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	d, err := NewDynamicResourceCache(DynamicCacheConfig{
+		DynamicClient:     dyn,
+		NamespaceFallback: ns,
+	})
+	if err != nil {
+		t.Fatalf("NewDynamicResourceCache failed: %v", err)
+	}
+
+	// Explicit-namespace read only — never an all-namespaces read.
+	if _, err := d.ListBlocking(gvr, ns, 3*time.Second); err != nil {
+		t.Fatalf("ListBlocking(%s): %v", ns, err)
+	}
+	if n, err := d.Count(gvr, nil); err != nil || n != 1 {
+		t.Fatalf("single-fallback Count = %d, %v; want 1", n, err)
+	}
 }

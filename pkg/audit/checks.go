@@ -2,15 +2,27 @@ package audit
 
 import (
 	"fmt"
+	"net/url"
+	"slices"
 	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	utilversion "k8s.io/apimachinery/pkg/util/version"
+
+	"github.com/skyhook-io/radar/pkg/configrefs"
+	"github.com/skyhook-io/radar/pkg/resourceid"
+	"github.com/skyhook-io/radar/pkg/rolloutdiag"
+	"github.com/skyhook-io/radar/pkg/timeutil"
 )
 
 // RunChecks runs all best-practice checks against the provided resources
@@ -21,6 +33,8 @@ func RunChecks(input *CheckInput) *ScanResults {
 	}
 
 	var findings []Finding
+	var missingInputs []string
+	tr := newEvalTracker()
 
 	// Build indexes needed by cross-resource checks
 	podsBySelector := indexPodsByLabels(input.Pods)
@@ -29,30 +43,98 @@ func RunChecks(input *CheckInput) *ScanResults {
 	servicesByName := indexServicesByName(input.Services)
 
 	// --- Security checks (container-level, attributed to owning workload) ---
-	findings = append(findings, checkWorkloadPodSpecs(input)...)
+	findings = append(findings, checkWorkloadPodSpecs(tr, input)...)
+	if input.ServiceAccounts == nil {
+		missingInputs = append(missingInputs, "serviceaccounts")
+	}
+	// Nil SUBJECT inventories matter too: zero evaluated subjects from an
+	// unlisted kind must read as incomplete, not clean.
+	if input.Deployments == nil {
+		missingInputs = append(missingInputs, "deployments")
+	}
+	if input.StatefulSets == nil {
+		missingInputs = append(missingInputs, "statefulsets")
+	}
+	if input.DaemonSets == nil {
+		missingInputs = append(missingInputs, "daemonsets")
+	}
+	// Jobs/CronJobs are ConfigMap/Secret reference sources too
+	// (configReferencePodSpecs): unlisted means orphan detection can't see
+	// refs from them, so their absence must read as incomplete, not clean.
+	if input.Jobs == nil {
+		missingInputs = append(missingInputs, "jobs")
+	}
+	if input.CronJobs == nil {
+		missingInputs = append(missingInputs, "cronjobs")
+	}
+	if input.LimitRanges == nil {
+		missingInputs = append(missingInputs, "limitranges")
+	}
 
 	// --- Reliability checks ---
-	findings = append(findings, checkSingleReplica(input.Deployments, hpaTargets)...)
+	findings = append(findings, checkTLSCertificateExpiry(tr, input.Secrets, time.Now())...)
+	// singleReplica's eligibility filter (HPA-managed deployments are out of
+	// scope) needs the HPA inventory to be authoritative — nil means
+	// unlisted, and an HPA-managed 1-replica deployment would otherwise be a
+	// false positive counted from incomplete prerequisites.
+	if input.HorizontalPodAutoscalers != nil {
+		findings = append(findings, checkSingleReplica(tr, input.Deployments, hpaTargets)...)
+	} else {
+		missingInputs = append(missingInputs, "horizontalpodautoscalers")
+	}
+	if input.Deployments != nil {
+		findings = append(findings, checkRolloutAvailabilityRisk(tr, input.Deployments)...)
+	}
 	// Only check PDB coverage if we can actually list PDBs (nil = RBAC denied, not "none exist")
 	if input.PodDisruptionBudgets != nil {
-		findings = append(findings, checkMissingPDB(input.Deployments, input.StatefulSets, pdbSelectors)...)
+		findings = append(findings, checkMissingPDB(tr, input.Deployments, input.StatefulSets, pdbSelectors)...)
+	} else {
+		missingInputs = append(missingInputs, "poddisruptionbudgets")
 	}
-	findings = append(findings, checkMissingTopologySpread(input.Deployments, input.StatefulSets)...)
-	findings = append(findings, checkPodHARisk(input.Pods, input.Deployments)...)
+	findings = append(findings, checkMissingTopologySpread(tr, input.Deployments, input.StatefulSets)...)
+	if input.Pods != nil && input.ReplicaSets != nil {
+		findings = append(findings, checkPodHARisk(tr, input.Pods, input.Deployments, input.ReplicaSets)...)
+	}
+	if input.Pods == nil {
+		missingInputs = append(missingInputs, "pods")
+	}
+	if input.ReplicaSets == nil {
+		missingInputs = append(missingInputs, "replicasets")
+	}
 
 	// --- Efficiency checks are included in checkWorkloadPodSpecs ---
-	findings = append(findings, checkOrphanConfigMapsSecrets(input)...)
-	findings = append(findings, checkSecretInConfigMap(input.ConfigMaps)...)
+	// Unknown consumer evidence must not turn an unreferenced visible subject
+	// into an orphan finding or a passing evaluation.
+	if input.ConfigMaps != nil || input.Secrets != nil {
+		findings = append(findings, checkOrphanConfigMapsSecrets(tr, input)...)
+	}
+	if input.ConfigMaps != nil {
+		findings = append(findings, checkSecretInConfigMap(tr, input.ConfigMaps)...)
+	} else {
+		missingInputs = append(missingInputs, "configmaps")
+	}
+	if input.Secrets == nil {
+		missingInputs = append(missingInputs, "secrets")
+	}
 
-	// --- Cross-resource checks ---
-	findings = append(findings, checkServiceNoMatchingPods(input.Services, podsBySelector)...)
-	findings = append(findings, checkIngressNoMatchingService(input.Ingresses, servicesByName)...)
-
-	// --- Utilization checks (optional, only when metrics provided) ---
-	findings = append(findings, checkResourceUtilization(input.PodMetrics)...)
+	// --- Cross-resource checks --- each needs BOTH sides of its relationship
+	// listed; a nil side would flag every subject as dangling.
+	if input.Services != nil && input.Pods != nil {
+		findings = append(findings, checkServiceNoMatchingPods(tr, input.Services, podsBySelector)...)
+	}
+	if input.Ingresses != nil && input.Services != nil {
+		findings = append(findings, checkIngressNoMatchingService(tr, input.Ingresses, servicesByName)...)
+	}
+	if input.Services == nil {
+		missingInputs = append(missingInputs, "services")
+	}
+	if input.Ingresses == nil {
+		missingInputs = append(missingInputs, "ingresses")
+	}
+	findings = append(findings, checkTraefikDanglingRefs(tr, input)...)
 
 	// --- Deprecated API checks ---
-	findings = append(findings, checkDeprecatedAPIs(input.ServedAPIs, input.ClusterVersion)...)
+	findings = append(findings, checkDeprecatedAPIs(tr, input.ServedAPIs, input.ClusterVersion)...)
 
 	// --- Lifecycle: stuck terminating resources ---
 	// Catches the "zombie awaiting finalizer cleanup" pattern across every
@@ -60,9 +142,65 @@ func RunChecks(input *CheckInput) *ScanResults {
 	// Terminating chip + insight; the audit surface broadens coverage to
 	// non-GitOps resources (stuck Pods on failed nodes, Deployments
 	// blocked by webhook finalizers, etc.).
-	findings = append(findings, checkStuckTerminating(input)...)
+	findings = append(findings, checkStuckTerminating(tr, input)...)
 
-	return buildResults(findings)
+	// --- Crossplane: MRs/XRs/Claims stuck Ready=False or Synced=False ---
+	// Same severity ramp as stuckTerminating (5min warning, 30min danger) so
+	// operators see the same "long enough to flag" semantics across surfaces.
+	findings = append(findings, checkCrossplaneStuck(tr, input)...)
+
+	// --- GitOps coverage: workloads not tracked by a GitOps controller ---
+	// Self-gates on input.GitOpsToolsPresent; a no-GitOps cluster records
+	// nothing, so the check is absent from CheckCounts rather than reported as a
+	// missing input (the gate is "not applicable here", not "couldn't list").
+	findings = append(findings, checkGitOpsCoverage(tr, input)...)
+
+	// --- CloudNativePG: clusters with no declarative backup schedule ---
+	// Self-gates on a nil Cluster inventory (CNPG not installed / RBAC denied)
+	// and on ScheduledBackup absence-authority — records nothing rather than
+	// reporting a missing input.
+	findings = append(findings, checkCNPGDeclarativeBackup(tr, input)...)
+
+	return buildResults(findings, tr, missingInputs)
+}
+
+// ============================================================================
+// Evaluation tracking
+// ============================================================================
+
+// evalTracker accumulates how many distinct subjects each check evaluated,
+// per namespace. Subjects are counted at the same (resource, checkID) grain
+// the finding merge uses — per-container checks record once per workload —
+// so buildResults can derive passed = evaluated - failed without unit
+// mismatch. Distinctness comes from call discipline: every check iterates
+// each of its subjects exactly once and records exactly once per subject
+// that passed the check's own eligibility filters.
+type evalTracker struct {
+	missingInputs []string
+	counts        map[string]map[string]int // checkID → namespace → subjects evaluated
+}
+
+func newEvalTracker() *evalTracker {
+	return &evalTracker{counts: make(map[string]map[string]int)}
+}
+
+// record counts one evaluated subject for checkID. Cluster-scoped subjects
+// use namespace "".
+func (t *evalTracker) record(checkID, namespace string) {
+	byNS := t.counts[checkID]
+	if byNS == nil {
+		byNS = make(map[string]int)
+		t.counts[checkID] = byNS
+	}
+	byNS[namespace]++
+}
+
+// recordAll counts one evaluated subject for every checkID in ids — used by
+// check families that evaluate several checkIDs against the same subject.
+func (t *evalTracker) recordAll(ids []string, namespace string) {
+	for _, id := range ids {
+		t.record(id, namespace)
+	}
 }
 
 // ============================================================================
@@ -70,7 +208,7 @@ func RunChecks(input *CheckInput) *ScanResults {
 // Applied to workload pod templates; falls back to bare pods.
 // ============================================================================
 
-func checkWorkloadPodSpecs(input *CheckInput) []Finding {
+func checkWorkloadPodSpecs(tr *evalTracker, input *CheckInput) []Finding {
 	var findings []Finding
 
 	// Collect pod specs from workloads (attributed to the workload, not individual pods)
@@ -101,13 +239,48 @@ func checkWorkloadPodSpecs(input *CheckInput) []Finding {
 	saByKey := indexServiceAccounts(input.ServiceAccounts)
 	limitsByNs := indexLimitRangesByNamespace(input.LimitRanges)
 
+	lrAuthoritative := input.LimitRanges != nil
+	saCovers := func(ns string) bool {
+		if input.ServiceAccounts == nil {
+			return false
+		}
+		return input.ServiceAccountsNamespace == "" || input.ServiceAccountsNamespace == ns
+	}
 	for _, w := range specs {
-		findings = append(findings, checkPodSpecSecurity(w.kind, w.namespace, w.name, w.spec, saByKey)...)
-		findings = append(findings, checkPodSpecReliability(w.kind, w.namespace, w.name, w.spec)...)
-		findings = append(findings, checkPodSpecEfficiency(w.kind, w.namespace, w.name, w.spec, limitsByNs[w.namespace])...)
-		findings = append(findings, checkPodSpecVolumes(w.kind, w.namespace, w.name, w.spec)...)
+		findings = append(findings, checkPodSpecSecurity(tr, w.kind, w.namespace, w.name, w.spec, saByKey, saCovers(w.namespace))...)
+		findings = append(findings, checkPodSpecReliability(tr, w.kind, w.namespace, w.name, w.spec)...)
+		findings = append(findings, checkPodSpecEfficiency(tr, w.kind, w.namespace, w.name, w.spec, limitsByNs[w.namespace], lrAuthoritative)...)
+		findings = append(findings, checkPodSpecVolumes(tr, w.kind, w.namespace, w.name, w.spec)...)
 	}
 	return findings
+}
+
+// Every checkID a pod-spec family member can emit. Each family function
+// records its whole list once per workload spec — container-level findings
+// merge to the workload, so the workload is the subject unit here.
+var (
+	podSpecSecurityCheckIDs = []string{
+		"hostNetwork", "hostPID", "hostIPC", "automountServiceAccountToken",
+		"runAsRoot", "privileged", "privilegeEscalation", "readOnlyRootFs",
+		"dangerousCapabilities", "insecureCapabilities",
+	}
+	podSpecReliabilityCheckIDs = []string{
+		"readinessProbeMissing", "livenessProbeMissing", "imageTagLatest", "pullPolicyNotAlways",
+	}
+	podSpecEfficiencyCheckIDs = []string{
+		"cpuRequestMissing", "memoryRequestMissing", "cpuLimitMissing", "memoryLimitMissing",
+	}
+	podSpecVolumeCheckIDs = []string{"dockerSocketMount", "sensitiveHostPath"}
+)
+
+func withoutID(ids []string, drop string) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id != drop {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // indexServiceAccounts returns a map keyed by "namespace/name".
@@ -172,7 +345,17 @@ func containerDefaultsFromLimitRanges(lrs []*corev1.LimitRange) containerDefault
 // Security checks
 // ============================================================================
 
-func checkPodSpecSecurity(kind, namespace, name string, spec corev1.PodSpec, saByKey map[string]*corev1.ServiceAccount) []Finding {
+func checkPodSpecSecurity(tr *evalTracker, kind, namespace, name string, spec corev1.PodSpec, saByKey map[string]*corev1.ServiceAccount, saAuthoritative bool) []Finding {
+	// The automount check needs the SA inventory only when the POD leaves
+	// the field unset (SA-level opt-outs then decide). A pod-level explicit
+	// value is evaluable regardless — skipping those too would drop real
+	// detections.
+	autoCheckable := saAuthoritative || spec.AutomountServiceAccountToken != nil
+	ids := podSpecSecurityCheckIDs
+	if !autoCheckable {
+		ids = withoutID(ids, "automountServiceAccountToken")
+	}
+	tr.recordAll(ids, namespace)
 	var findings []Finding
 	f := func(checkID, severity, msg string) {
 		findings = append(findings, Finding{
@@ -196,7 +379,7 @@ func checkPodSpecSecurity(kind, namespace, name string, spec corev1.PodSpec, saB
 	// Pod-level takes precedence. If neither is explicitly false, the token is
 	// auto-mounted. Only flag when the effective value is true (or unset, which
 	// defaults to true per K8s).
-	if tokenAutoMounted(namespace, spec, saByKey) {
+	if autoCheckable && tokenAutoMounted(namespace, spec, saByKey) {
 		f("automountServiceAccountToken", SeverityWarning, "Service account token is auto-mounted")
 	}
 
@@ -222,15 +405,19 @@ func tokenAutoMounted(namespace string, spec corev1.PodSpec, saByKey map[string]
 	if spec.AutomountServiceAccountToken != nil {
 		return *spec.AutomountServiceAccountToken
 	}
-	saName := spec.ServiceAccountName
-	if saName == "" {
-		saName = "default"
-	}
+	saName := podServiceAccountName(spec)
 	if sa, ok := saByKey[namespace+"/"+saName]; ok &&
 		sa.AutomountServiceAccountToken != nil && !*sa.AutomountServiceAccountToken {
 		return false
 	}
 	return true
+}
+
+func podServiceAccountName(spec corev1.PodSpec) string {
+	if spec.ServiceAccountName != "" {
+		return spec.ServiceAccountName
+	}
+	return "default"
 }
 
 // effectivelyNonRoot reports whether a container is guaranteed not to run as
@@ -302,7 +489,8 @@ func checkContainerSecurity(f func(string, string, string), c *corev1.Container,
 // sensitiveHostPaths lists host paths that should not be mounted into containers.
 var sensitiveHostPaths = []string{"/etc", "/proc", "/sys", "/var/run", "/var/log", "/root"}
 
-func checkPodSpecVolumes(kind, namespace, name string, spec corev1.PodSpec) []Finding {
+func checkPodSpecVolumes(tr *evalTracker, kind, namespace, name string, spec corev1.PodSpec) []Finding {
+	tr.recordAll(podSpecVolumeCheckIDs, namespace)
 	var findings []Finding
 	f := func(checkID, severity, msg string) {
 		findings = append(findings, Finding{
@@ -345,45 +533,163 @@ func checkPodSpecVolumes(kind, namespace, name string, spec corev1.PodSpec) []Fi
 // Secret detection in ConfigMaps
 // ============================================================================
 
-// sensitiveKeyPatterns matches ConfigMap keys that likely contain secrets.
 var sensitiveKeyPatterns = []string{
-	"password", "passwd", "secret", "api_key", "apikey", "api-key",
-	"token", "private_key", "privatekey", "private-key",
-	"credential", "credentials", "auth", "authorization",
+	"password", "passwd", "api_key", "apikey", "api-key",
+	"private_key", "privatekey", "private-key",
 	"access_key", "accesskey", "access-key",
 	"secret_key", "secretkey", "secret-key",
 }
 
-func checkSecretInConfigMap(configMaps []*corev1.ConfigMap) []Finding {
+var valueGatedSensitiveKeyPatterns = []string{
+	"secret", "token", "auth", "authorization", "credential", "credentials",
+}
+
+const configMapSensitiveValueMinLength = 24
+
+func checkSecretInConfigMap(tr *evalTracker, configMaps []*corev1.ConfigMap) []Finding {
 	if len(configMaps) == 0 {
 		return nil
 	}
 
 	var findings []Finding
 	for _, cm := range configMaps {
-		for key := range cm.Data {
-			keyLower := strings.ToLower(key)
-			for _, pattern := range sensitiveKeyPatterns {
-				if strings.Contains(keyLower, pattern) {
-					findings = append(findings, Finding{
-						Kind: "ConfigMap", Namespace: cm.Namespace, Name: cm.Name,
-						CheckID:  "secretInConfigMap",
-						Category: CategorySecurity, Severity: SeverityWarning,
-						Message:  fmt.Sprintf("ConfigMap key %q may contain sensitive data — use a Secret instead", key),
-					})
-					break // one finding per key is enough
-				}
+		tr.record("secretInConfigMap", cm.Namespace)
+		for key, value := range cm.Data {
+			if !configMapEntryLooksSensitive(key, value) {
+				continue
 			}
+			findings = append(findings, Finding{
+				Kind: "ConfigMap", Namespace: cm.Namespace, Name: cm.Name,
+				CheckID:  "secretInConfigMap",
+				Category: CategorySecurity, Severity: SeverityWarning,
+				Message: fmt.Sprintf("ConfigMap key %q may contain sensitive data — use a Secret instead", key),
+			})
 		}
 	}
 	return findings
+}
+
+func configMapEntryLooksSensitive(key, value string) bool {
+	keyLower := strings.ToLower(key)
+	if configMapKeyLooksSecretReference(keyLower) {
+		return false
+	}
+	if configMapKeyIsAlwaysSensitive(keyLower) {
+		return true
+	}
+	for _, pattern := range sensitiveKeyPatterns {
+		if strings.Contains(keyLower, pattern) {
+			return true
+		}
+	}
+	for _, pattern := range valueGatedSensitiveKeyPatterns {
+		if strings.Contains(keyLower, pattern) {
+			return configMapValueLooksSensitive(value)
+		}
+	}
+	return false
+}
+
+func configMapKeyLooksSecretReference(keyLower string) bool {
+	normalized := strings.NewReplacer("-", "_", ".", "_").Replace(keyLower)
+	return strings.HasSuffix(normalized, "secret_name") ||
+		strings.HasSuffix(normalized, "secret_names") ||
+		strings.HasSuffix(normalized, "secret_ref") ||
+		strings.HasSuffix(normalized, "secret_refs") ||
+		strings.HasSuffix(normalized, "secret_reference") ||
+		strings.HasSuffix(normalized, "secret_references")
+}
+
+func configMapKeyIsAlwaysSensitive(keyLower string) bool {
+	compact := strings.NewReplacer("_", "", "-", "", ".", "").Replace(keyLower)
+	if compact == "secret" || compact == "clientsecret" || strings.HasSuffix(compact, "clientsecret") {
+		return true
+	}
+	return false
+}
+
+func configMapValueLooksSensitive(value string) bool {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return false
+	}
+	switch strings.ToLower(v) {
+	case "true", "false", "yes", "no", "on", "off", "enabled", "disabled", "none", "null", "nil",
+		"basic", "bearer", "oauth", "oauth2", "oidc", "anonymous":
+		return false
+	}
+	if strings.HasPrefix(strings.ToLower(v), "bearer ") {
+		v = strings.TrimSpace(v[len("bearer "):])
+	}
+	if strings.HasPrefix(strings.ToLower(v), "basic ") {
+		v = strings.TrimSpace(v[len("basic "):])
+	}
+	if urlContainsUserInfo(v) {
+		return true
+	}
+	if strings.HasPrefix(v, "$(") || strings.HasPrefix(v, "${") || strings.HasPrefix(v, "/") || startsWithURLScheme(v) {
+		return false
+	}
+	if strings.Contains(v, "-----BEGIN ") {
+		return true
+	}
+	parts := strings.Split(v, ".")
+	if len(parts) == 3 && strings.HasPrefix(parts[0], "eyJ") {
+		return true
+	}
+	if len(v) < 16 || strings.ContainsAny(v, " \t\r\n") {
+		return false
+	}
+
+	classes := 0
+	if strings.IndexFunc(v, func(r rune) bool { return r >= 'a' && r <= 'z' }) >= 0 {
+		classes++
+	}
+	if strings.IndexFunc(v, func(r rune) bool { return r >= 'A' && r <= 'Z' }) >= 0 {
+		classes++
+	}
+	if strings.IndexFunc(v, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
+		classes++
+	}
+	if strings.IndexFunc(v, func(r rune) bool {
+		return (r >= '!' && r <= '/') || (r >= ':' && r <= '@') || (r >= '[' && r <= '`') || (r >= '{' && r <= '~')
+	}) >= 0 {
+		classes++
+	}
+	return len(v) >= configMapSensitiveValueMinLength && classes >= 2
+}
+
+func startsWithURLScheme(value string) bool {
+	scheme, _, ok := strings.Cut(value, "://")
+	if !ok || scheme == "" {
+		return false
+	}
+	for _, r := range scheme {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '+' || r == '-' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func urlContainsUserInfo(value string) bool {
+	u, err := url.Parse(value)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.User == nil {
+		return false
+	}
+	if _, ok := u.User.Password(); ok {
+		return true
+	}
+	return u.User.Username() != ""
 }
 
 // ============================================================================
 // Reliability checks
 // ============================================================================
 
-func checkPodSpecReliability(kind, namespace, name string, spec corev1.PodSpec) []Finding {
+func checkPodSpecReliability(tr *evalTracker, kind, namespace, name string, spec corev1.PodSpec) []Finding {
+	tr.recordAll(podSpecReliabilityCheckIDs, namespace)
 	var findings []Finding
 	f := func(checkID, severity, msg string) {
 		findings = append(findings, Finding{
@@ -413,14 +719,20 @@ func checkPodSpecReliability(kind, namespace, name string, spec corev1.PodSpec) 
 	return findings
 }
 
-func checkSingleReplica(deployments []*appsv1.Deployment, hpaTargets map[string]bool) []Finding {
+func checkSingleReplica(tr *evalTracker, deployments []*appsv1.Deployment, hpaTargets map[string]bool) []Finding {
 	var findings []Finding
 	for _, d := range deployments {
+		// HPA-managed deployments are out of scope, not passing — the HPA
+		// owns the replica count, so counting them would inflate "passed".
+		if hpaTargets[hpaKey("Deployment", d.Namespace, d.Name)] {
+			continue
+		}
+		tr.record("singleReplica", d.Namespace)
 		replicas := int32(1)
 		if d.Spec.Replicas != nil {
 			replicas = *d.Spec.Replicas
 		}
-		if replicas <= 1 && !hpaTargets[hpaKey("Deployment", d.Namespace, d.Name)] {
+		if replicas <= 1 {
 			findings = append(findings, Finding{
 				Kind: "Deployment", Namespace: d.Namespace, Name: d.Name,
 				CheckID: "singleReplica", Category: CategoryReliability, Severity: SeverityWarning,
@@ -431,7 +743,25 @@ func checkSingleReplica(deployments []*appsv1.Deployment, hpaTargets map[string]
 	return findings
 }
 
-func checkMissingPDB(deployments []*appsv1.Deployment, statefulSets []*appsv1.StatefulSet, pdbSelectors []namespacedSelector) []Finding {
+func checkRolloutAvailabilityRisk(tr *evalTracker, deployments []*appsv1.Deployment) []Finding {
+	var findings []Finding
+	for _, deployment := range deployments {
+		if !rolloutdiag.Applicable(deployment) {
+			continue
+		}
+		tr.record("rolloutAvailabilityRisk", deployment.Namespace)
+		if risk := rolloutdiag.Analyze(deployment); risk != nil {
+			findings = append(findings, Finding{
+				Kind: "Deployment", Namespace: deployment.Namespace, Name: deployment.Name,
+				CheckID: "rolloutAvailabilityRisk", Category: CategoryReliability, Severity: SeverityWarning,
+				Message: risk.Message,
+			})
+		}
+	}
+	return findings
+}
+
+func checkMissingPDB(tr *evalTracker, deployments []*appsv1.Deployment, statefulSets []*appsv1.StatefulSet, pdbSelectors []namespacedSelector) []Finding {
 	var findings []Finding
 
 	check := func(kind, namespace, name string, replicas *int32, matchLabels map[string]string) {
@@ -442,6 +772,7 @@ func checkMissingPDB(deployments []*appsv1.Deployment, statefulSets []*appsv1.St
 		if r <= 1 {
 			return // PDB only matters for multi-replica workloads
 		}
+		tr.record("missingPDB", namespace)
 		podLabels := labels.Set(matchLabels)
 		for _, ns := range pdbSelectors {
 			if ns.namespace == namespace && ns.selector.Matches(podLabels) {
@@ -468,7 +799,14 @@ func checkMissingPDB(deployments []*appsv1.Deployment, statefulSets []*appsv1.St
 // Efficiency checks
 // ============================================================================
 
-func checkPodSpecEfficiency(kind, namespace, name string, spec corev1.PodSpec, lrs []*corev1.LimitRange) []Finding {
+func checkPodSpecEfficiency(tr *evalTracker, kind, namespace, name string, spec corev1.PodSpec, lrs []*corev1.LimitRange, lrAuthoritative bool) []Finding {
+	if !lrAuthoritative {
+		// LimitRange defaults suppress these findings; without the inventory
+		// every emission would be a potential false positive. Skip the whole
+		// family rather than report on data Radar couldn't see.
+		return nil
+	}
+	tr.recordAll(podSpecEfficiencyCheckIDs, namespace)
 	var findings []Finding
 	f := func(checkID, severity, msg string) {
 		findings = append(findings, Finding{
@@ -504,7 +842,7 @@ func checkPodSpecEfficiency(kind, namespace, name string, spec corev1.PodSpec, l
 // Cross-resource checks (Radar-native)
 // ============================================================================
 
-func checkServiceNoMatchingPods(services []*corev1.Service, podsBySelector map[string][]*corev1.Pod) []Finding {
+func checkServiceNoMatchingPods(tr *evalTracker, services []*corev1.Service, podsBySelector map[string][]*corev1.Pod) []Finding {
 	var findings []Finding
 	for _, svc := range services {
 		if len(svc.Spec.Selector) == 0 {
@@ -513,6 +851,7 @@ func checkServiceNoMatchingPods(services []*corev1.Service, podsBySelector map[s
 		if svc.Spec.Type == corev1.ServiceTypeExternalName {
 			continue
 		}
+		tr.record("serviceNoMatchingPods", svc.Namespace)
 		sel := labels.SelectorFromSet(labels.Set(svc.Spec.Selector))
 		found := false
 		for _, pod := range podsBySelector[svc.Namespace] {
@@ -532,9 +871,10 @@ func checkServiceNoMatchingPods(services []*corev1.Service, podsBySelector map[s
 	return findings
 }
 
-func checkIngressNoMatchingService(ingresses []*networkingv1.Ingress, servicesByName map[string]bool) []Finding {
+func checkIngressNoMatchingService(tr *evalTracker, ingresses []*networkingv1.Ingress, servicesByName map[string]bool) []Finding {
 	var findings []Finding
 	for _, ing := range ingresses {
+		eligible := false
 		for _, rule := range ing.Spec.Rules {
 			if rule.HTTP == nil {
 				continue
@@ -543,15 +883,19 @@ func checkIngressNoMatchingService(ingresses []*networkingv1.Ingress, servicesBy
 				if path.Backend.Service == nil {
 					continue
 				}
+				eligible = true
 				svcKey := ing.Namespace + "/" + path.Backend.Service.Name
 				if !servicesByName[svcKey] {
 					findings = append(findings, Finding{
 						Kind: "Ingress", Namespace: ing.Namespace, Name: ing.Name,
-						CheckID:  "ingressNoMatchingService", Category: CategoryReliability, Severity: SeverityWarning,
-						Message:  fmt.Sprintf("Ingress references non-existent Service %q", path.Backend.Service.Name),
+						CheckID: "ingressNoMatchingService", Category: CategoryReliability, Severity: SeverityWarning,
+						Message: fmt.Sprintf("Ingress references non-existent Service %q", path.Backend.Service.Name),
 					})
 				}
 			}
+		}
+		if eligible {
+			tr.record("ingressNoMatchingService", ing.Namespace)
 		}
 	}
 	return findings
@@ -561,7 +905,7 @@ func checkIngressNoMatchingService(ingresses []*networkingv1.Ingress, servicesBy
 // Topology spread + HA checks
 // ============================================================================
 
-func checkMissingTopologySpread(deployments []*appsv1.Deployment, statefulSets []*appsv1.StatefulSet) []Finding {
+func checkMissingTopologySpread(tr *evalTracker, deployments []*appsv1.Deployment, statefulSets []*appsv1.StatefulSet) []Finding {
 	var findings []Finding
 
 	check := func(kind, namespace, name string, replicas *int32, spec corev1.PodSpec) {
@@ -572,6 +916,7 @@ func checkMissingTopologySpread(deployments []*appsv1.Deployment, statefulSets [
 		if r <= 1 {
 			return
 		}
+		tr.record("missingTopologySpread", namespace)
 		if len(spec.TopologySpreadConstraints) > 0 {
 			return
 		}
@@ -591,45 +936,79 @@ func checkMissingTopologySpread(deployments []*appsv1.Deployment, statefulSets [
 	return findings
 }
 
-func checkPodHARisk(pods []*corev1.Pod, deployments []*appsv1.Deployment) []Finding {
+func checkPodHARisk(tr *evalTracker, pods []*corev1.Pod, deployments []*appsv1.Deployment, replicaSets []*appsv1.ReplicaSet) []Finding {
+	sets := make(map[types.NamespacedName]*appsv1.ReplicaSet, len(replicaSets))
+	for _, rs := range replicaSets {
+		sets[types.NamespacedName{Namespace: rs.Namespace, Name: rs.Name}] = rs
+	}
+	placements := map[types.UID]map[string]int{}
+	incomplete := map[string]bool{}
+	owners := make(map[types.UID]*appsv1.Deployment, len(deployments))
+	for _, d := range deployments {
+		if d.UID != "" {
+			owners[d.UID] = d
+		}
+	}
+	for _, pod := range pods {
+		if pod.Status.Phase != corev1.PodRunning || pod.Spec.NodeName == "" || pod.DeletionTimestamp != nil {
+			continue
+		}
+		ref := metav1.GetControllerOf(pod)
+		if ref == nil || ref.Kind != "ReplicaSet" || schema.FromAPIVersionAndKind(ref.APIVersion, ref.Kind).Group != "apps" {
+			continue
+		}
+		rs := sets[types.NamespacedName{Namespace: pod.Namespace, Name: ref.Name}]
+		if ref.UID == "" || rs == nil || rs.UID != ref.UID {
+			incomplete[pod.Namespace] = true
+			continue
+		}
+		parent := metav1.GetControllerOf(rs)
+		if parent == nil || parent.Kind != "Deployment" || schema.FromAPIVersionAndKind(parent.APIVersion, parent.Kind).Group != "apps" {
+			continue
+		}
+		d := owners[parent.UID]
+		if d == nil || d.Name != parent.Name || d.Namespace != pod.Namespace {
+			continue
+		}
+		if placements[d.UID] == nil {
+			placements[d.UID] = map[string]int{}
+		}
+		placements[d.UID][pod.Spec.NodeName]++
+	}
 	var findings []Finding
 	for _, d := range deployments {
 		replicas := int32(1)
 		if d.Spec.Replicas != nil {
 			replicas = *d.Spec.Replicas
 		}
-		if replicas <= 1 || d.Spec.Selector == nil {
+		if replicas <= 1 || d.UID == "" {
 			continue
 		}
-		sel, err := metav1.LabelSelectorAsSelector(d.Spec.Selector)
-		if err != nil {
+		if len(placements[d.UID]) >= 2 {
+			// Additional unknown Pods cannot undo verified placement across nodes.
+			tr.record("podHARisk", d.Namespace)
 			continue
 		}
-		nodeSet := make(map[string]bool)
-		matchCount := 0
-		for _, pod := range pods {
-			if pod.Namespace != d.Namespace {
-				continue
+		if incomplete[d.Namespace] {
+			// An unresolved ReplicaSet may own another replica of this Deployment.
+			if !slices.Contains(tr.missingInputs, "replicaset-ownership") {
+				tr.missingInputs = append(tr.missingInputs, "replicaset-ownership")
 			}
-			if !sel.Matches(labels.Set(pod.Labels)) {
-				continue
-			}
-			// Skip pods not running (pending pods don't have a node yet)
-			if pod.Spec.NodeName == "" {
-				continue
-			}
-			nodeSet[pod.Spec.NodeName] = true
-			matchCount++
+			continue
 		}
-		if matchCount > 1 && len(nodeSet) == 1 {
-			var nodeName string
-			for n := range nodeSet {
-				nodeName = n
-			}
+		count := 0
+		for _, n := range placements[d.UID] {
+			count += n
+		}
+		if count < 2 {
+			continue
+		}
+		tr.record("podHARisk", d.Namespace)
+		for node := range placements[d.UID] {
 			findings = append(findings, Finding{
 				Kind: "Deployment", Namespace: d.Namespace, Name: d.Name,
 				CheckID: "podHARisk", Category: CategoryReliability, Severity: SeverityWarning,
-				Message: fmt.Sprintf("All %d running pods are on node %s", matchCount, nodeName),
+				Message: fmt.Sprintf("All %d observed running pods are on node %s", count, node),
 			})
 		}
 	}
@@ -640,89 +1019,80 @@ func checkPodHARisk(pods []*corev1.Pod, deployments []*appsv1.Deployment) []Find
 // Orphan resource checks
 // ============================================================================
 
-func checkOrphanConfigMapsSecrets(input *CheckInput) []Finding {
+func checkOrphanConfigMapsSecrets(tr *evalTracker, input *CheckInput) []Finding {
 	if len(input.ConfigMaps) == 0 && len(input.Secrets) == 0 {
 		return nil
 	}
 
-	// Build set of referenced ConfigMap and Secret names (namespace/name)
-	referencedCMs := make(map[string]bool)
-	referencedSecrets := make(map[string]bool)
-
-	for _, pod := range input.Pods {
-		ns := pod.Namespace
-		spec := pod.Spec
-		// Check all containers (init + regular)
-		for _, c := range spec.InitContainers {
-			collectContainerRefs(ns, c, referencedCMs, referencedSecrets)
-		}
-		for _, c := range spec.Containers {
-			collectContainerRefs(ns, c, referencedCMs, referencedSecrets)
-		}
-		// Volume references
-		for _, v := range spec.Volumes {
-			if v.ConfigMap != nil {
-				referencedCMs[ns+"/"+v.ConfigMap.Name] = true
-			}
-			if v.Secret != nil {
-				referencedSecrets[ns+"/"+v.Secret.SecretName] = true
-			}
-			if v.Projected != nil {
-				for _, src := range v.Projected.Sources {
-					if src.ConfigMap != nil {
-						referencedCMs[ns+"/"+src.ConfigMap.Name] = true
-					}
-					if src.Secret != nil {
-						referencedSecrets[ns+"/"+src.Secret.Name] = true
-					}
-				}
-			}
-		}
-		// ImagePullSecrets
-		for _, ips := range spec.ImagePullSecrets {
-			referencedSecrets[ns+"/"+ips.Name] = true
-		}
-		// ServiceAccount token secrets (referenced implicitly)
-		if spec.ServiceAccountName != "" {
-			// SA token secrets are named like "<sa-name>-token-xxxxx" — we can't match exactly,
-			// but we skip SA-related secrets via the type filter below
-		}
+	refs := CollectConfigObjectRefs(input)
+	var objects []configrefs.Object
+	for _, cm := range input.ConfigMaps {
+		objects = append(objects, configrefs.Metadata("ConfigMap", cm))
 	}
-
-	// Ingress TLS secrets
-	for _, ing := range input.Ingresses {
-		for _, tls := range ing.Spec.TLS {
-			if tls.SecretName != "" {
-				referencedSecrets[ing.Namespace+"/"+tls.SecretName] = true
-			}
+	for _, sec := range input.Secrets {
+		objects = append(objects, configrefs.Metadata("Secret", sec))
+	}
+	if input.ConfigReferenceEvidence != nil {
+		refs = append(refs, input.ConfigReferenceEvidence.Refs...)
+		objects = append(objects, input.ConfigReferenceEvidence.Objects...)
+	}
+	used := map[configrefs.Ref]bool{}
+	for _, ref := range refs {
+		used[configrefs.Ref{Kind: ref.Kind, Namespace: ref.Namespace, Name: ref.Name}] = true
+	}
+	reflections := configrefs.BuildReflections(objects)
+	reflections.PropagateUse(used)
+	eligible := func(kind, ns, name string) bool {
+		ref := configrefs.Ref{Kind: kind, Namespace: ns, Name: name}
+		if used[ref] {
+			tr.record("orphanConfigMapSecret", ns)
+			return false
 		}
+		if reflections.Automatic[ref] {
+			return false
+		}
+		evidence := input.ConfigReferenceEvidence
+		complete := evidence != nil && slices.Contains(evidence.CompleteNamespaces[kind], ns)
+		if complete && (reflections.Sources[ref] || reflections.Unresolved[ref]) {
+			complete = evidence.ReflectionsComplete[kind]
+		}
+		if !complete {
+			missing := strings.ToLower(kind) + "-references"
+			if !slices.Contains(tr.missingInputs, missing) {
+				tr.missingInputs = append(tr.missingInputs, missing)
+			}
+			return false
+		}
+		tr.record("orphanConfigMapSecret", ns)
+		return true
 	}
 
 	var findings []Finding
 
 	// Check ConfigMaps
 	for _, cm := range input.ConfigMaps {
-		key := cm.Namespace + "/" + cm.Name
-		if referencedCMs[key] {
-			continue
-		}
 		// Skip well-known system ConfigMaps
 		if cm.Name == "kube-root-ca.crt" {
+			continue
+		}
+		if isKnownPlatformConfigMap(cm) {
+			continue
+		}
+		if hasControllerOwnerReference(cm.OwnerReferences) {
+			continue
+		}
+		if !eligible("ConfigMap", cm.Namespace, cm.Name) {
 			continue
 		}
 		findings = append(findings, Finding{
 			Kind: "ConfigMap", Namespace: cm.Namespace, Name: cm.Name,
 			CheckID: "orphanConfigMapSecret", Category: CategoryEfficiency, Severity: SeverityWarning,
-			Message: fmt.Sprintf("ConfigMap %q is not referenced by any pod", cm.Name),
+			Message: fmt.Sprintf("ConfigMap %q is not referenced by any workload or supported controller config", cm.Name),
 		})
 	}
 
 	// Check Secrets
 	for _, sec := range input.Secrets {
-		key := sec.Namespace + "/" + sec.Name
-		if referencedSecrets[key] {
-			continue
-		}
 		// Skip service account tokens and Helm release secrets
 		if sec.Type == corev1.SecretTypeServiceAccountToken {
 			continue
@@ -730,121 +1100,448 @@ func checkOrphanConfigMapsSecrets(input *CheckInput) []Finding {
 		if sec.Type == "helm.sh/release.v1" {
 			continue
 		}
-		// Skip TLS secrets used by cert-manager (they may be referenced by Ingress annotations, not spec)
-		if sec.Labels != nil && sec.Labels["cert-manager.io/certificate-name"] != "" {
+		// Preserve the exemption when Certificate references are unavailable.
+		if isCertManagerCertificateSecret(sec) {
+			continue
+		}
+		if isKnownPlatformSecret(sec) {
+			continue
+		}
+		if hasControllerOwnerReference(sec.OwnerReferences) {
+			continue
+		}
+		if !eligible("Secret", sec.Namespace, sec.Name) {
 			continue
 		}
 		findings = append(findings, Finding{
 			Kind: "Secret", Namespace: sec.Namespace, Name: sec.Name,
 			CheckID: "orphanConfigMapSecret", Category: CategoryEfficiency, Severity: SeverityWarning,
-			Message: fmt.Sprintf("Secret %q is not referenced by any pod", sec.Name),
+			Message: fmt.Sprintf("Secret %q is not referenced by any workload, Ingress, or supported controller config", sec.Name),
 		})
 	}
 
 	return findings
 }
 
+func isKnownPlatformConfigMap(cm *corev1.ConfigMap) bool {
+	if cm == nil {
+		return false
+	}
+
+	if isDynamicLoaderConfigMap(cm) {
+		return true
+	}
+
+	// Leader-election locks are controller state and often have no owner ref.
+	if strings.TrimSpace(labelsValue(cm.Annotations, "control-plane.alpha.kubernetes.io/leader")) != "" {
+		return true
+	}
+
+	switch cm.Namespace + "/" + cm.Name {
+	case "kube-system/extension-apiserver-authentication",
+		"kube-system/kube-apiserver-legacy-service-account-token-tracking",
+		"kube-system/aws-auth",
+		"kube-system/amazon-vpc-cni":
+		return true
+	}
+
+	if cm.Name == "cluster-autoscaler-status" && (cm.Namespace == "kube-system" || cm.Namespace == "cluster-autoscaler") {
+		return true
+	}
+
+	if cm.Namespace == "kube-system" {
+		switch cm.Name {
+		case "cluster-kubestore",
+			"clustermetrics",
+			"gke-common-webhook-heartbeat",
+			"gke-common-webhook-lock",
+			"ingress-uid",
+			"kube-dns-autoscaler",
+			"konnectivity-agent-autoscaler-config",
+			"kubedns-config-images",
+			"pdcsi-metrics-collector-config-map":
+			return true
+		}
+	}
+	if cm.Namespace == "gmp-system" {
+		switch cm.Name {
+		case "config-images", "scheduled-jobs":
+			return true
+		}
+	}
+
+	if cm.Namespace == "argocd" || labelsValue(cm.Labels, "app.kubernetes.io/part-of") == "argocd" {
+		switch cm.Name {
+		case "argocd-cm",
+			"argocd-cmd-params-cm",
+			"argocd-dex-cm",
+			"argocd-gpg-keys-cm",
+			"argocd-notifications-cm",
+			"argocd-rbac-cm",
+			"argocd-ssh-known-hosts-cm",
+			"argocd-tls-certs-cm":
+			return true
+		}
+	}
+
+	if labelsValue(cm.Labels, "app.kubernetes.io/name") == "ingress-nginx" {
+		return true
+	}
+
+	if cm.Namespace == "argo-rollouts" {
+		switch cm.Name {
+		case "argo-rollouts-config", "argo-rollouts-notification-configmap":
+			return true
+		}
+	}
+
+	if labelsValue(cm.Labels, "app.kubernetes.io/part-of") == "kyverno" {
+		switch cm.Name {
+		case "kyverno", "kyverno-metrics":
+			return true
+		}
+	}
+
+	if cm.Name == "argo-workflows-workflow-controller-configmap" && labelsValue(cm.Labels, "app.kubernetes.io/part-of") == "argo-workflows" {
+		return true
+	}
+
+	if cm.Name == "cnpg-controller-manager-config" && labelsValue(cm.Labels, "app.kubernetes.io/name") == "cloudnative-pg" {
+		return true
+	}
+
+	return false
+}
+
+const certManagerCertificateNameKey = "cert-manager.io/certificate-name"
+
+func isCertManagerCertificateSecret(sec *corev1.Secret) bool {
+	if sec == nil {
+		return false
+	}
+	return strings.TrimSpace(labelsValue(sec.Annotations, certManagerCertificateNameKey)) != "" ||
+		strings.TrimSpace(labelsValue(sec.Labels, certManagerCertificateNameKey)) != ""
+}
+
+func isKnownPlatformSecret(sec *corev1.Secret) bool {
+	if sec == nil {
+		return false
+	}
+
+	if labelsValue(sec.Labels, "sealedsecrets.bitnami.com/sealed-secrets-key") != "" {
+		return true
+	}
+
+	if labelsValue(sec.Labels, "argocd.argoproj.io/secret-type") != "" {
+		return true
+	}
+	if labelsValue(sec.Labels, "app.kubernetes.io/part-of") == "argocd" {
+		switch sec.Name {
+		case "argocd-secret", "argocd-notifications-secret":
+			return true
+		}
+	}
+
+	if labelsValue(sec.Labels, "app.kubernetes.io/managed-by") == "cert-manager-webhook" && strings.Contains(sec.Name, "webhook-ca") {
+		return true
+	}
+	if sec.Annotations != nil && sec.Annotations["cert-manager.io/allow-direct-injection"] == "true" && strings.Contains(sec.Name, "webhook-ca") {
+		return true
+	}
+	if labelsValue(sec.Labels, "app.kubernetes.io/managed-by") == "cert-manager" && strings.Contains(sec.Name, "account-key") {
+		return true
+	}
+
+	if sec.Namespace == "gmp-public" && sec.Name == "alertmanager" {
+		return true
+	}
+
+	if sec.Namespace == "gmp-system" && sec.Name == "webhook-tls" {
+		if metadataValueEqual(sec.Labels, sec.Annotations, "addonmanager.kubernetes.io/mode", "Reconcile") {
+			return true
+		}
+		if hasMetadataKeyPrefix(sec.Labels, sec.Annotations, "components.gke.io/") {
+			return true
+		}
+	}
+
+	if sec.Namespace == "crossplane-system" && sec.Name == "crossplane-root-ca" {
+		return true
+	}
+
+	return false
+}
+
+func isDynamicLoaderConfigMap(cm *corev1.ConfigMap) bool {
+	// Sidecar loaders watch these label conventions instead of object refs.
+	for _, key := range []string{
+		"grafana_dashboard",
+		"grafana_datasource",
+		"prometheus_rule",
+		"fluentd_config",
+	} {
+		if metadataValueEnabled(labelsValue(cm.Labels, key)) {
+			return true
+		}
+	}
+
+	return metadataValueTruthy(labelsValue(cm.Labels, "k8sgpt.ai/dynamically-loaded"))
+}
+
+func labelsValue(labels map[string]string, key string) string {
+	if labels == nil {
+		return ""
+	}
+	return labels[key]
+}
+
+func metadataValueEnabled(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	switch strings.ToLower(value) {
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func metadataValueTruthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "1", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func metadataValueEqual(labels, annotations map[string]string, key, want string) bool {
+	return strings.EqualFold(labelsValue(labels, key), want) || strings.EqualFold(labelsValue(annotations, key), want)
+}
+
+func hasMetadataKeyPrefix(labels, annotations map[string]string, prefix string) bool {
+	for key := range labels {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	for key := range annotations {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+type configReferencePodSpec struct {
+	namespace string
+	spec      corev1.PodSpec
+}
+
+func (input *CheckInput) configReferencePodSpecs() []configReferencePodSpec {
+	var specs []configReferencePodSpec
+	for _, pod := range input.Pods {
+		if podIsTerminal(pod) {
+			continue
+		}
+		specs = append(specs, configReferencePodSpec{namespace: pod.Namespace, spec: pod.Spec})
+	}
+	for _, d := range input.Deployments {
+		specs = append(specs, configReferencePodSpec{namespace: d.Namespace, spec: d.Spec.Template.Spec})
+	}
+	for _, ss := range input.StatefulSets {
+		specs = append(specs, configReferencePodSpec{namespace: ss.Namespace, spec: ss.Spec.Template.Spec})
+	}
+	for _, ds := range input.DaemonSets {
+		specs = append(specs, configReferencePodSpec{namespace: ds.Namespace, spec: ds.Spec.Template.Spec})
+	}
+	for _, job := range input.Jobs {
+		if jobIsTerminal(job) {
+			continue
+		}
+		specs = append(specs, configReferencePodSpec{namespace: job.Namespace, spec: job.Spec.Template.Spec})
+	}
+	for _, cj := range input.CronJobs {
+		specs = append(specs, configReferencePodSpec{namespace: cj.Namespace, spec: cj.Spec.JobTemplate.Spec.Template.Spec})
+	}
+	return specs
+}
+
+func jobIsTerminal(job *batchv1.Job) bool {
+	for _, cond := range job.Status.Conditions {
+		if cond.Status != corev1.ConditionTrue {
+			continue
+		}
+		if cond.Type == batchv1.JobComplete || cond.Type == batchv1.JobFailed {
+			return true
+		}
+	}
+	return false
+}
+
+func podIsTerminal(pod *corev1.Pod) bool {
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
+}
+
+func collectPodSpecRefs(ns string, spec corev1.PodSpec, saByKey map[string]*corev1.ServiceAccount, cms, secrets map[string]bool) {
+	for _, c := range spec.InitContainers {
+		collectContainerRefs(ns, c, cms, secrets)
+	}
+	for _, c := range spec.Containers {
+		collectContainerRefs(ns, c, cms, secrets)
+	}
+	for _, c := range spec.EphemeralContainers {
+		collectEnvRefs(ns, c.Env, c.EnvFrom, cms, secrets)
+	}
+	for _, v := range spec.Volumes {
+		collectVolumeRefs(ns, v, cms, secrets)
+	}
+	for _, ips := range spec.ImagePullSecrets {
+		addRef(secrets, ns, ips.Name)
+	}
+	// ServiceAccount admission defaults imagePullSecrets only when the PodSpec leaves them empty.
+	if len(spec.ImagePullSecrets) == 0 {
+		collectServiceAccountImagePullSecrets(ns, spec, saByKey, secrets)
+	}
+}
+
 func collectContainerRefs(ns string, c corev1.Container, cms, secrets map[string]bool) {
-	for _, env := range c.Env {
+	collectEnvRefs(ns, c.Env, c.EnvFrom, cms, secrets)
+}
+
+func collectEnvRefs(ns string, envs []corev1.EnvVar, envFroms []corev1.EnvFromSource, cms, secrets map[string]bool) {
+	for _, env := range envs {
 		if env.ValueFrom != nil {
 			if env.ValueFrom.ConfigMapKeyRef != nil {
-				cms[ns+"/"+env.ValueFrom.ConfigMapKeyRef.Name] = true
+				addRef(cms, ns, env.ValueFrom.ConfigMapKeyRef.Name)
 			}
 			if env.ValueFrom.SecretKeyRef != nil {
-				secrets[ns+"/"+env.ValueFrom.SecretKeyRef.Name] = true
+				addRef(secrets, ns, env.ValueFrom.SecretKeyRef.Name)
 			}
 		}
 	}
-	for _, envFrom := range c.EnvFrom {
+	for _, envFrom := range envFroms {
 		if envFrom.ConfigMapRef != nil {
-			cms[ns+"/"+envFrom.ConfigMapRef.Name] = true
+			addRef(cms, ns, envFrom.ConfigMapRef.Name)
 		}
 		if envFrom.SecretRef != nil {
-			secrets[ns+"/"+envFrom.SecretRef.Name] = true
+			addRef(secrets, ns, envFrom.SecretRef.Name)
 		}
 	}
 }
 
-// ============================================================================
-// Resource utilization checks
-// ============================================================================
-
-func checkResourceUtilization(metrics []PodMetricsInput) []Finding {
-	if len(metrics) == 0 {
-		return nil
+func collectServiceAccountImagePullSecrets(ns string, spec corev1.PodSpec, saByKey map[string]*corev1.ServiceAccount, secrets map[string]bool) {
+	if len(saByKey) == 0 {
+		return
 	}
+	sa, ok := saByKey[ns+"/"+podServiceAccountName(spec)]
+	if !ok {
+		return
+	}
+	for _, ips := range sa.ImagePullSecrets {
+		addRef(secrets, ns, ips.Name)
+	}
+}
 
-	var findings []Finding
-	for _, m := range metrics {
-		// CPU utilization
-		if m.CPURequest > 0 {
-			cpuPct := float64(m.CPUUsage) / float64(m.CPURequest) * 100
-			if cpuPct < 10 && m.CPUUsage > 0 {
-				findings = append(findings, Finding{
-					Kind: "Pod", Namespace: m.Namespace, Name: m.Name,
-					CheckID: "resourceUtilization", Category: CategoryEfficiency, Severity: SeverityWarning,
-					Message: fmt.Sprintf("CPU usage is %.0f%% of request (%dm used, %dm requested) — consider reducing request", cpuPct, m.CPUUsage, m.CPURequest),
-				})
-			} else if cpuPct > 90 {
-				findings = append(findings, Finding{
-					Kind: "Pod", Namespace: m.Namespace, Name: m.Name,
-					CheckID: "resourceUtilization", Category: CategoryEfficiency, Severity: SeverityWarning,
-					Message: fmt.Sprintf("CPU usage is %.0f%% of request (%dm used, %dm requested) — at risk of throttling", cpuPct, m.CPUUsage, m.CPURequest),
-				})
+func collectVolumeRefs(ns string, v corev1.Volume, cms, secrets map[string]bool) {
+	if v.ConfigMap != nil {
+		addRef(cms, ns, v.ConfigMap.Name)
+	}
+	if v.Secret != nil {
+		addRef(secrets, ns, v.Secret.SecretName)
+	}
+	if v.Projected != nil {
+		for _, src := range v.Projected.Sources {
+			if src.ConfigMap != nil {
+				addRef(cms, ns, src.ConfigMap.Name)
 			}
-		}
-
-		// Memory utilization
-		if m.MemoryRequest > 0 {
-			memPct := float64(m.MemoryUsage) / float64(m.MemoryRequest) * 100
-			memUsageMi := m.MemoryUsage / (1024 * 1024)
-			memReqMi := m.MemoryRequest / (1024 * 1024)
-			if memPct < 10 && m.MemoryUsage > 0 {
-				findings = append(findings, Finding{
-					Kind: "Pod", Namespace: m.Namespace, Name: m.Name,
-					CheckID: "resourceUtilization", Category: CategoryEfficiency, Severity: SeverityWarning,
-					Message: fmt.Sprintf("Memory usage is %.0f%% of request (%dMi used, %dMi requested) — consider reducing request", memPct, memUsageMi, memReqMi),
-				})
-			} else if memPct > 90 {
-				findings = append(findings, Finding{
-					Kind: "Pod", Namespace: m.Namespace, Name: m.Name,
-					CheckID: "resourceUtilization", Category: CategoryEfficiency, Severity: SeverityWarning,
-					Message: fmt.Sprintf("Memory usage is %.0f%% of request (%dMi used, %dMi requested) — at risk of OOM kill", memPct, memUsageMi, memReqMi),
-				})
+			if src.Secret != nil {
+				addRef(secrets, ns, src.Secret.Name)
 			}
 		}
 	}
-	return findings
+	if v.CSI != nil && v.CSI.NodePublishSecretRef != nil {
+		addRef(secrets, ns, v.CSI.NodePublishSecretRef.Name)
+	}
+	if v.FlexVolume != nil && v.FlexVolume.SecretRef != nil {
+		addRef(secrets, ns, v.FlexVolume.SecretRef.Name)
+	}
+	if v.AzureFile != nil {
+		addRef(secrets, ns, v.AzureFile.SecretName)
+	}
+	if v.CephFS != nil && v.CephFS.SecretRef != nil {
+		addRef(secrets, ns, v.CephFS.SecretRef.Name)
+	}
+	if v.RBD != nil && v.RBD.SecretRef != nil {
+		addRef(secrets, ns, v.RBD.SecretRef.Name)
+	}
+	if v.Cinder != nil && v.Cinder.SecretRef != nil {
+		addRef(secrets, ns, v.Cinder.SecretRef.Name)
+	}
+	if v.ScaleIO != nil && v.ScaleIO.SecretRef != nil {
+		addRef(secrets, ns, v.ScaleIO.SecretRef.Name)
+	}
+	if v.ISCSI != nil && v.ISCSI.SecretRef != nil {
+		addRef(secrets, ns, v.ISCSI.SecretRef.Name)
+	}
+	if v.StorageOS != nil && v.StorageOS.SecretRef != nil {
+		addRef(secrets, ns, v.StorageOS.SecretRef.Name)
+	}
+}
+
+func addRef(refs map[string]bool, namespace, name string) {
+	if namespace == "" || name == "" {
+		return
+	}
+	refs[namespace+"/"+name] = true
+}
+
+func hasControllerOwnerReference(refs []metav1.OwnerReference) bool {
+	for _, ref := range refs {
+		if ref.Controller != nil && *ref.Controller {
+			return true
+		}
+	}
+	return false
 }
 
 // ============================================================================
 // Deprecated API checks
 // ============================================================================
 
-func checkDeprecatedAPIs(servedAPIs []string, clusterVersion string) []Finding {
+func checkDeprecatedAPIs(tr *evalTracker, servedAPIs []string, clusterVersion string) []Finding {
 	if len(servedAPIs) == 0 || clusterVersion == "" {
 		return nil
 	}
+	current, currentErr := utilversion.ParseGeneric(strings.TrimPrefix(strings.TrimSpace(clusterVersion), "v"))
 
 	deprecations := DeprecationsByGroupVersion()
 	var findings []Finding
 
 	for _, gv := range servedAPIs {
+		tr.record("deprecatedAPIVersion", "")
 		entries, ok := deprecations[gv]
 		if !ok {
 			continue
 		}
 		for _, entry := range entries {
-			kindLabel := gv
+			if currentErr == nil && current.LessThan(utilversion.MustParseGeneric(entry.DeprecatedIn)) {
+				continue
+			}
 			msg := fmt.Sprintf("API %s is deprecated (since %s, removed in %s) — use %s",
 				gv, entry.DeprecatedIn, entry.RemovedIn, entry.Replacement)
 			if entry.Kind != "" {
-				kindLabel = entry.Kind
 				msg = fmt.Sprintf("API %s %s is deprecated (since %s, removed in %s) — use %s",
 					gv, entry.Kind, entry.DeprecatedIn, entry.RemovedIn, entry.Replacement)
 			}
+			// One evaluated subject per served group/version, so all of a
+			// gv's deprecated kinds share one finding key (standard merge
+			// joins the messages) — keeps failed <= evaluated by
+			// construction instead of relying on the clamp.
 			findings = append(findings, Finding{
-				Kind:     kindLabel,
+				Kind:     "APIVersion",
 				Name:     gv,
 				CheckID:  "deprecatedAPIVersion",
 				Category: CategoryReliability,
@@ -920,11 +1617,20 @@ func indexServicesByName(services []*corev1.Service) map[string]bool {
 // Result aggregation
 // ============================================================================
 
-func buildResults(findings []Finding) *ScanResults {
+func buildResults(findings []Finding, tr *evalTracker, missingInputs []string) *ScanResults {
 	categories := map[string]CategorySummary{}
 	// Initialize all categories
 	for _, cat := range []string{CategorySecurity, CategoryReliability, CategoryEfficiency} {
 		categories[cat] = CategorySummary{}
+	}
+
+	// Populate Group from the built-in (Kind→Group) table. Check emission
+	// sites leave Group="" so the per-check code stays terse — single
+	// point of truth here instead of every Finding{} literal.
+	for i := range findings {
+		if findings[i].Group == "" {
+			findings[i].Group = resourceid.GroupForBuiltinKind(findings[i].Kind)
+		}
 	}
 
 	// Merge findings: same (resource, checkID) get combined into one finding
@@ -934,7 +1640,7 @@ func buildResults(findings []Finding) *ScanResults {
 	var dedupFindings []Finding
 
 	for _, f := range findings {
-		key := checkKey{ResourceKey(f.Kind, f.Namespace, f.Name), f.CheckID}
+		key := checkKey{ResourceKey(f.Group, f.Kind, f.Namespace, f.Name), f.CheckID}
 		if idx, exists := mergeIndex[key]; exists {
 			dedupFindings[idx].Message += "; " + f.Message
 			continue
@@ -958,6 +1664,8 @@ func buildResults(findings []Finding) *ScanResults {
 		totalDanger += cs.Danger
 	}
 
+	checkCounts, totalPassing := deriveCheckCounts(tr.counts, dedupFindings, categories)
+
 	// Include full registry so settings dialog can show all checks (including disabled ones)
 	checks := make(map[string]CheckMeta, len(CheckRegistry))
 	for id, meta := range CheckRegistry {
@@ -966,14 +1674,56 @@ func buildResults(findings []Finding) *ScanResults {
 
 	return &ScanResults{
 		Summary: ScanSummary{
+			Passing:    totalPassing,
 			Warning:    totalWarning,
 			Danger:     totalDanger,
 			Categories: categories,
 		},
-		Findings: dedupFindings,
-		Groups:   GroupByResource(dedupFindings),
-		Checks:   checks,
+		Findings:             dedupFindings,
+		Groups:               GroupByResource(dedupFindings),
+		Checks:               checks,
+		CheckCounts:          checkCounts,
+		EvaluatedByNamespace: tr.counts,
+		MissingInputs:        append(missingInputs, tr.missingInputs...),
 	}
+}
+
+// deriveCheckCounts turns per-namespace evaluation tallies plus MERGED
+// findings into per-check evaluated/passed counts, accumulating each check's
+// passed into its registry category's Passing (categories is mutated). Both
+// sides count distinct subjects, so passed = evaluated - failed; the zero
+// clamp absorbs the one legitimate mismatch — a deprecated group/version
+// serving several deprecated kinds yields one evaluated subject but one
+// merged finding per kind.
+func deriveCheckCounts(evalByNS map[string]map[string]int, mergedFindings []Finding, categories map[string]CategorySummary) (map[string]CheckCount, int) {
+	failedByCheck := make(map[string]int)
+	for _, f := range mergedFindings {
+		failedByCheck[f.CheckID]++
+	}
+
+	checkCounts := make(map[string]CheckCount, len(evalByNS))
+	totalPassing := 0
+	for id, byNS := range evalByNS {
+		evaluated := 0
+		for _, n := range byNS {
+			evaluated += n
+		}
+		if evaluated == 0 {
+			continue
+		}
+		passed := evaluated - failedByCheck[id]
+		if passed < 0 {
+			passed = 0
+		}
+		checkCounts[id] = CheckCount{Evaluated: evaluated, Passed: passed}
+		totalPassing += passed
+		if meta, ok := CheckRegistry[id]; ok {
+			cs := categories[meta.Category]
+			cs.Passing += passed
+			categories[meta.Category] = cs
+		}
+	}
+	return checkCounts, totalPassing
 }
 
 // ============================================================================
@@ -1026,13 +1776,14 @@ const (
 // Audit surfaces the *list* up-front; a per-resource insight only
 // helps once they've drilled into a specific app. The two surfaces
 // are complementary, not redundant.
-func checkStuckTerminating(input *CheckInput) []Finding {
+func checkStuckTerminating(tr *evalTracker, input *CheckInput) []Finding {
 	if input == nil {
 		return nil
 	}
 	var findings []Finding
 	now := time.Now()
 	emit := func(kind string, obj metav1.Object) {
+		tr.record("stuckTerminating", obj.GetNamespace())
 		dt := obj.GetDeletionTimestamp()
 		if dt == nil || dt.IsZero() {
 			return
@@ -1063,7 +1814,7 @@ func checkStuckTerminating(input *CheckInput) []Finding {
 			CheckID:   "stuckTerminating",
 			Category:  CategoryReliability,
 			Severity:  severity,
-			Message:   fmt.Sprintf("Has been pending deletion for %s%s", formatDurationShort(age), note),
+			Message:   fmt.Sprintf("Has been pending deletion for %s%s", timeutil.FormatAgeShort(age), note),
 		})
 	}
 	// Scan every typed slice we have. Adding a new type to CheckInput
@@ -1105,26 +1856,176 @@ func checkStuckTerminating(input *CheckInput) []Finding {
 	return findings
 }
 
-// formatDurationShort renders a duration as the same compact form used
-// by the gitops insights detector ("3s", "12m", "4h", "21d") so audit
-// findings and per-resource Issues read consistently to operators
-// glancing across both surfaces.
+// checkCrossplaneStuck finds Crossplane Managed Resources, Composites, and
+// Claims with Ready=False or Synced=False past the same 5-minute/30-minute
+// thresholds used by checkStuckTerminating. Reusing the thresholds keeps the
+// audit page consistent across stuck-resource categories so operators don't
+// have to relearn what "long enough to flag" means for each kind.
 //
-// keep in sync: pkg/gitops/insights/insights.go::formatAgeShort (Go)
-// and web/src/components/gitops/GitOpsView.tsx::formatRelativeAge
-// (TypeScript) carry the same tier breakpoints.
-func formatDurationShort(d time.Duration) string {
-	if d < 0 {
-		d = 0
+// The check inspects status.conditions on each unstructured object directly
+// — Crossplane condition semantics are stable across every provider (Ready,
+// Synced) so we don't need per-provider knowledge.
+func checkCrossplaneStuck(tr *evalTracker, input *CheckInput) []Finding {
+	if input == nil {
+		return nil
 	}
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh", int(d.Hours()))
-	default:
-		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	var findings []Finding
+	now := time.Now()
+
+	emit := func(category string, u *unstructured.Unstructured) {
+		// Skip terminating resources — they're already flagged by checkStuckTerminating
+		// with the right severity ramp. Reporting both creates noise.
+		if !u.GetDeletionTimestamp().IsZero() {
+			return
+		}
+		// Don't flag paused resources — the operator intentionally stopped
+		// reconciliation; lighting a "stuck" finding is misleading.
+		if u.GetAnnotations()["crossplane.io/paused"] == "true" {
+			return
+		}
+		tr.record("crossplaneStuck", u.GetNamespace())
+		cond, ok := findFalseCrossplaneCondition(u)
+		if !ok {
+			return
+		}
+		age := now.Sub(cond.transitionTime)
+		if age < stuckTerminatingThresholdWarning {
+			return
+		}
+		severity := SeverityWarning
+		if age >= stuckTerminatingThresholdDanger {
+			severity = SeverityDanger
+		}
+		// Crossplane conditions almost always include a reason+message — surface
+		// both, since the message often contains the upstream cloud-API error
+		// verbatim (the actionable thing) and the reason classifies it.
+		extra := ""
+		if cond.reason != "" {
+			extra = " (" + cond.reason + ")"
+		}
+		if cond.message != "" {
+			// Keep messages bounded — some providers return multi-line errors.
+			msg := strings.SplitN(cond.message, "\n", 2)[0]
+			extra += ": " + msg
+		}
+		findings = append(findings, Finding{
+			Kind:      u.GetKind(),
+			Group:     u.GroupVersionKind().Group,
+			Namespace: u.GetNamespace(),
+			Name:      u.GetName(),
+			CheckID:   "crossplaneStuck",
+			Category:  category,
+			Severity:  severity,
+			Message:   fmt.Sprintf("%s=False for %s%s", cond.condType, timeutil.FormatAgeShort(age), extra),
+		})
 	}
+	for _, mr := range input.ManagedResources {
+		if mr != nil {
+			emit(CategoryReliability, mr)
+		}
+	}
+	for _, xr := range input.CompositeResources {
+		if xr != nil {
+			emit(CategoryReliability, xr)
+		}
+	}
+	return findings
+}
+
+// crossplaneFalseCondition holds the fields we need from a False Ready/Synced
+// condition. Local to the audit package so it doesn't pollute the public API.
+type crossplaneFalseCondition struct {
+	condType       string
+	reason         string
+	message        string
+	transitionTime time.Time
+}
+
+// findFalseCrossplaneCondition returns the most-actionable False condition
+// for a Crossplane resource — Synced=False first (configuration error,
+// fixable), then Ready=False (provider can't converge, may resolve). Returns
+// false if neither is False or the transition time is missing.
+func findFalseCrossplaneCondition(u *unstructured.Unstructured) (crossplaneFalseCondition, bool) {
+	conds, found, err := unstructured.NestedSlice(u.Object, "status", "conditions")
+	if err != nil || !found {
+		return crossplaneFalseCondition{}, false
+	}
+	// Synced gets priority: it usually indicates the provider rejected
+	// the spec (bad ProviderConfig, malformed forProvider, missing perms).
+	// Ready=False is downstream — fixing Synced often resolves Ready.
+	priority := []string{"Synced", "Ready"}
+	for _, want := range priority {
+		for _, raw := range conds {
+			c, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			t, _ := c["type"].(string)
+			s, _ := c["status"].(string)
+			if t != want || s != "False" {
+				continue
+			}
+			reason, _ := c["reason"].(string)
+			message, _ := c["message"].(string)
+			tt, _ := c["lastTransitionTime"].(string)
+			var transitionTime time.Time
+			if tt != "" {
+				if parsed, err := time.Parse(time.RFC3339, tt); err == nil {
+					transitionTime = parsed
+				}
+			}
+			if transitionTime.IsZero() {
+				// Without a transition time we can't measure age — skip this
+				// condition and let the outer loop fall through to the next
+				// priority tier (Synced first, then Ready). Crossplane always
+				// sets it on its own conditions; missing means non-standard
+				// producer.
+				continue
+			}
+			return crossplaneFalseCondition{
+				condType:       t,
+				reason:         reason,
+				message:        message,
+				transitionTime: transitionTime,
+			}, true
+		}
+	}
+	return crossplaneFalseCondition{}, false
+}
+
+func CollectConfigObjectRefs(input *CheckInput) []ConfigObjectRef {
+	referencedCMs := make(map[string]bool)
+	referencedSecrets := make(map[string]bool)
+	saByKey := indexServiceAccounts(input.ServiceAccounts)
+
+	for _, refSpec := range input.configReferencePodSpecs() {
+		collectPodSpecRefs(refSpec.namespace, refSpec.spec, saByKey, referencedCMs, referencedSecrets)
+	}
+	for _, ref := range input.ConfigObjectRefs {
+		switch ref.Kind {
+		case "ConfigMap":
+			addRef(referencedCMs, ref.Namespace, ref.Name)
+		case "Secret":
+			addRef(referencedSecrets, ref.Namespace, ref.Name)
+		}
+	}
+
+	for _, ing := range input.Ingresses {
+		for _, tls := range ing.Spec.TLS {
+			if tls.SecretName != "" {
+				referencedSecrets[ing.Namespace+"/"+tls.SecretName] = true
+			}
+		}
+	}
+
+	refs := make([]ConfigObjectRef, 0, len(referencedCMs)+len(referencedSecrets))
+	for kind, names := range map[string]map[string]bool{"ConfigMap": referencedCMs, "Secret": referencedSecrets} {
+		for key := range names {
+			ns, name, ok := strings.Cut(key, "/")
+			if ok {
+				refs = append(refs, ConfigObjectRef{Kind: kind, Namespace: ns, Name: name})
+			}
+		}
+	}
+	return refs
 }

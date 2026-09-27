@@ -19,8 +19,8 @@ func cloudMode() bool { return cloud.Mode() }
 
 // Authenticate returns a chi middleware that extracts user identity from
 // proxy headers or session cookies. Returns 401 if unauthenticated.
-// Exempt paths (health, auth endpoints) are passed through.
-// Soft-auth paths (e.g. /api/auth/me) attempt auth but don't 401 on failure.
+// Mode-specific exempt paths are passed through.
+// Outside Cloud, soft-auth paths attempt auth but don't 401 on failure.
 func Authenticate(cfg Config) func(http.Handler) http.Handler {
 	cfg.Defaults()
 
@@ -31,25 +31,56 @@ func Authenticate(cfg Config) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
+			cloudProxyMode := cfg.Mode == "proxy" && cloudMode()
+			if cloudProxyMode && !cloud.IsAuthenticatedTunnelRequest(r.Context()) {
+				// Forwarded identity is authoritative only inside the yamux transport
+				// established with the cluster token. Radar also has an ordinary TCP
+				// listener for kubelet health checks; a pod reaching that listener can
+				// spoof headers, but it cannot forge the private context marker.
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error":    "authentication required",
+					"authMode": cfg.Mode,
+				})
+				return
+			}
 
 			// Determine whether to set Secure flag on cookies per-request.
 			// OIDC is always behind TLS. Proxy mode detects TLS via X-Forwarded-Proto
 			// (set by the upstream reverse proxy) or a direct TLS connection.
 			secure := cfg.Mode == "oidc" || r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 
-			// Try to get user from session cookie first.
-			// Cookie-valid path slides the TTL; header-auth path below is a full re-auth.
-			if session := ParseSessionCookie(r, cfg.Secret); session != nil {
+			// Cloud proxy identity is authoritative on every tunneled request. A
+			// browser-carried Radar session must never override the Hub-injected
+			// user/groups if an upstream cookie-strip defense regresses.
+			var session *Session
+			if !cloudProxyMode {
+				session = ParseSessionCookie(r, cfg.Secret)
+			}
+			if session != nil {
 				// Check if the session has been revoked (backchannel logout)
 				if cfg.Revoker != nil && cfg.Revoker.IsRevoked(session.SID) {
 					log.Printf("[auth] Revoked session rejected: user=%s sid=%s", session.User.Username, session.SID)
-					http.SetCookie(w, ClearSessionCookie())
+					for _, c := range ClearSessionCookie(r) {
+						http.SetCookie(w, c)
+					}
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusUnauthorized)
 					json.NewEncoder(w).Encode(map[string]string{
 						"error":    "session revoked",
 						"authMode": cfg.Mode,
 					})
+					return
+				}
+
+				// A signed cookie proves Radar issued it, not that its identity
+				// is still one Radar will impersonate; re-check it every request.
+				if !ForwardedIdentityAllowed(session.User.Username, session.User.Groups, false) {
+					for _, c := range ClearSessionCookie(r) {
+						http.SetCookie(w, c)
+					}
+					rejectDisallowedIdentity(w, session.User.Username, false)
 					return
 				}
 
@@ -63,7 +94,10 @@ func Authenticate(cfg Config) func(http.Handler) http.Handler {
 						// Pre-upgrade cookie without sid — mint one on first sliding re-issue
 						sid = NewSessionID()
 					}
-					http.SetCookie(w, CreateSessionCookie(session.User, sid, session.IDToken, cfg.Secret, cfg.CookieTTL, secure))
+					cookies := CreateSessionCookie(session.User, sid, session.IDToken, cfg.Secret, cfg.CookieTTL, secure)
+					for _, c := range cookies {
+						http.SetCookie(w, c)
+					}
 					if remaining > cfg.CookieTTL {
 						log.Printf("[auth] TTL downgrade detected for user %q: cookie remaining %s exceeds configured TTL %s, snapping",
 							session.User.Username, remaining.Round(time.Second), cfg.CookieTTL)
@@ -75,10 +109,17 @@ func Authenticate(cfg Config) func(http.Handler) http.Handler {
 			}
 
 			// Try API key — stateless per-request, no session cookie set.
-			// Works in all auth modes; inherits stored username+groups from key creation time.
-			if cfg.APIKeys != nil {
+			// Inherits stored username+groups from key creation time. Skipped in
+			// Cloud proxy mode, where the Hub-injected identity is authoritative.
+			if cfg.APIKeys != nil && !cloudProxyMode {
 				if raw := extractAPIKey(r); raw != "" {
 					if entry := cfg.APIKeys.Lookup(raw); entry != nil {
+						// Keys minted before reserved-principal enforcement may carry
+						// identities Radar must not impersonate; re-check every request.
+						if !ForwardedIdentityAllowed(entry.Username, entry.Groups, false) {
+							rejectDisallowedIdentity(w, entry.Username, false)
+							return
+						}
 						user := &User{Username: entry.Username, Groups: entry.Groups}
 						ctx := ContextWithUser(r.Context(), user)
 						next.ServeHTTP(w, r.WithContext(ctx))
@@ -87,7 +128,8 @@ func Authenticate(cfg Config) func(http.Handler) http.Handler {
 				}
 			}
 
-			// In proxy mode, extract from headers and create session
+			// In proxy mode, extract identity from headers. Standalone proxy mode
+			// caches it in a session cookie; Cloud proxy mode stays header-only.
 			if cfg.Mode == "proxy" {
 				username := r.Header.Get(cfg.UserHeader)
 				if username != "" {
@@ -100,20 +142,31 @@ func Authenticate(cfg Config) func(http.Handler) http.Handler {
 						}
 					}
 
+					// Never impersonate reserved K8s principals (system:masters etc.);
+					// under Cloud, also require the radar:/cloud: group vocabulary.
+					// Reject the whole request rather than dropping values.
+					if !ForwardedIdentityAllowed(username, groups, cloudProxyMode) {
+						rejectDisallowedIdentity(w, username, cloudProxyMode)
+						return
+					}
+
 					user := &User{Username: username, Groups: groups}
-
-					// Set session cookie so subsequent requests don't need headers
-					// Header-auth creates a fresh session (new sid each time)
-					http.SetCookie(w, CreateSessionCookie(user, NewSessionID(), "", cfg.Secret, cfg.CookieTTL, secure))
-
+					logAcceptedForwardedIdentity(user)
+					if !cloudProxyMode {
+						cookies := CreateSessionCookie(user, NewSessionID(), "", cfg.Secret, cfg.CookieTTL, secure)
+						for _, c := range cookies {
+							http.SetCookie(w, c)
+						}
+					}
 					ctx := ContextWithUser(r.Context(), user)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
 			}
 
-			// Soft-auth paths: pass through without user (handler decides response)
-			if isSoftAuthPath(r.URL.Path) {
+			// Soft-auth paths pass through without a user outside Cloud. Cloud proxy
+			// mode requires the Hub identity headers on every non-exempt request.
+			if !cloudProxyMode && isSoftAuthPath(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -129,25 +182,36 @@ func Authenticate(cfg Config) func(http.Handler) http.Handler {
 	}
 }
 
+func rejectDisallowedIdentity(w http.ResponseWriter, username string, cloud bool) {
+	log.Printf("[auth] rejected identity with disallowed principal (user=%q, cloud=%v)", username, cloud)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	json.NewEncoder(w).Encode(map[string]string{
+		"error": "identity asserts a disallowed principal",
+	})
+}
+
 // isExemptPath returns true for paths that don't require authentication
 func isExemptPath(path string) bool {
-	// Under cloud-mode the listener is only reachable via the Cloud
-	// tunnel, but we still harden against a misconfigured intercept
-	// forwarding debug paths or static-asset requests. Keep the exempt
-	// set minimal: health for kubelet probes, /auth/* for the login/
-	// callback roundtrip. /debug/pprof/* in particular leaks the entire
-	// in-memory K8s cache, so it must pass through auth (and is not
-	// mounted at all under cloud-mode — see server.go).
+	// Under cloud-mode, the full handler is reachable only via the authenticated
+	// tunnel and the ordinary TCP listener is health-only. Keep this auth-layer
+	// check as defense in depth: /debug/pprof/* in particular leaks the entire
+	// in-memory K8s cache, so it must never bypass the Hub identity boundary (and
+	// is not mounted at all under cloud-mode — see server.go).
 	if cloudMode() {
-		if path == "/api/health" || strings.HasPrefix(path, "/auth/") {
-			return true
-		}
-		return false
+		// Cloud owns authentication; Radar's own login/callback endpoints must
+		// not be reachable without the Hub identity boundary. The exact health
+		// path remains public for kubelet probes on the health-only TCP listener.
+		return path == "/api/health"
 	}
 
+	// /api/connection is deliberately NOT exempt: POST /api/connection/retry
+	// is state-changing (kills all exec/port-forward sessions, reinitializes
+	// the informer cache) and GET /api/connection leaks kubeconfig context
+	// names. The terminal re-auth flow chains a retry curl only on no-auth
+	// installs, where this middleware isn't mounted at all.
 	exemptPrefixes := []string{
 		"/api/health",
-		"/api/connection",
 		"/auth/",
 	}
 	for _, prefix := range exemptPrefixes {
@@ -155,8 +219,13 @@ func isExemptPath(path string) bool {
 			return true
 		}
 	}
-	// Static assets don't require auth
-	if !strings.HasPrefix(path, "/api/") && !strings.HasPrefix(path, "/mcp") {
+	// Static assets don't require auth. /debug/* (pprof) is excluded: it's
+	// mounted on every non-cloud build, and the fallthrough would otherwise
+	// expose it unauthenticated whenever auth is enabled — /debug/pprof/heap
+	// leaks the entire in-memory K8s cache (every Secret, ConfigMap, Pod
+	// spec). /metrics stays open by this fallthrough: operational counters
+	// only, scraped by Prometheus.
+	if !strings.HasPrefix(path, "/api/") && !strings.HasPrefix(path, "/mcp") && !strings.HasPrefix(path, "/debug/") {
 		return true
 	}
 	return false
@@ -183,6 +252,30 @@ func AuditLog(r *http.Request, namespace, name string) {
 	if user == nil {
 		return
 	}
-	log.Printf("[audit] user=%s groups=%v %s %s ns=%s name=%s",
+	// %q escapes any control characters (e.g. CR/LF) so a crafted path or name
+	// can't forge or split audit log lines.
+	log.Printf("[audit] user=%q groups=%q %s path=%q ns=%q name=%q",
 		user.Username, user.Groups, r.Method, r.URL.Path, namespace, name)
+}
+
+type AuditActionDetails struct {
+	Action    string
+	Namespace string
+	Name      string
+	Container string
+	Variable  string
+	Source    string
+	Outcome   string
+}
+
+func AuditLogAction(r *http.Request, details AuditActionDetails) {
+	username := "local-kubeconfig"
+	var groups []string
+	if user := UserFromContext(r.Context()); user != nil {
+		username = user.Username
+		groups = user.Groups
+	}
+	log.Printf("[audit] user=%q groups=%q action=%q path=%q ns=%q name=%q container=%q variable=%q source=%q outcome=%q",
+		username, groups, details.Action, r.URL.Path, details.Namespace, details.Name,
+		details.Container, details.Variable, details.Source, details.Outcome)
 }

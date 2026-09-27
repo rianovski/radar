@@ -38,7 +38,19 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	// `ns:` modifier parsed from the query. The result both gates the scan
 	// (so listers don't read namespaces outside the user's RBAC) and
 	// constrains the post-hoc match() filter.
-	allowed := s.parseNamespacesForUser(r)
+	//
+	// globalNs=1 makes search ignore the per-user namespace-switcher pick and
+	// scan the user's full RBAC ceiling — a "global" search whose only scope is
+	// the query's own `ns:` tokens. The omnibar sets it so a deliberately broad
+	// ⌘K lookup isn't silently narrowed to whatever namespace the view filter
+	// happens to be on. Still RBAC-bounded (getUserNamespaces filters by the
+	// caller's identity); it only drops the cosmetic pick, never the ceiling.
+	var allowed []string
+	if r.URL.Query().Get("globalNs") == "1" {
+		allowed = s.getUserNamespaces(r, parseNamespaces(r.URL.Query()))
+	} else {
+		allowed = s.parseNamespacesForUser(r)
+	}
 	if noNamespaceAccess(allowed) {
 		s.writeJSON(w, search.Result{Hits: []search.Hit{}})
 		return
@@ -102,6 +114,23 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			return s.canRead(r, group, resource, "", "list")
 		},
 	}
+	// summaryContext attaches managedBy/health/issueCount per hit. Build
+	// the per-request closure once (one Compose call + cached topology
+	// snapshot) and let the search executor invoke it per kept hit.
+	// ?context=none opts out so legacy callers don't pay for the join.
+	//
+	// Search uses the dual-index variant: hits are mixed-kind in one
+	// response (namespaced Pods alongside cluster-scoped Nodes), so a
+	// single-namespace-scoped issue index would zero issueCount on
+	// cluster-scoped hits (whose issues live at namespace=""). The
+	// builder routes per-hit by scope. SAR gating above
+	// (CanReadClusterScoped) already constrains which cluster-scoped
+	// kinds are reachable.
+	if r.URL.Query().Get("context") != "none" {
+		if builder := s.newSearchSummaryContextBuilder(scanNamespaces); builder != nil {
+			opts.SummaryBuilder = search.SummaryBuilderFunc(builder)
+		}
+	}
 	if expr := r.URL.Query().Get("filter"); expr != "" {
 		f, err := filter.CachedObjectFilter(expr)
 		if err != nil {
@@ -160,6 +189,12 @@ func parseLimit(v string) int {
 	return n
 }
 
+// parseInclude maps search's include values. Default (absent) is summary.
+//
+// NB: search's summary/raw are TRANSFORMED representations from the
+// ai/context layer (LevelSummary micro-shape / Detail-minified body), NOT
+// the same-schema strip that /api/resources/{kind}?include=summary returns.
+// Same word, different shape contract — don't cross-assume.
 func parseInclude(v string) (search.IncludeMode, error) {
 	switch v {
 	case "", "summary":

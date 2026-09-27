@@ -14,9 +14,9 @@ package cloud
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -25,6 +25,13 @@ type Config struct {
 	// URL is the WebSocket URL of the Cloud service's /agent endpoint,
 	// e.g. wss://api.radarhq.io/agent
 	URL string
+
+	// InsecureSkipVerify disables TLS certificate verification on the wss
+	// tunnel. Intended only for trials against a self-hosted hub that serves a
+	// self-signed certificate: the connection stays encrypted but is not
+	// authenticated, so a network attacker could impersonate the hub. Leave
+	// false for any hub with a publicly trusted certificate.
+	InsecureSkipVerify bool
 
 	// Token is the cluster bearer token issued by the Cloud install wizard.
 	// Format: rhc_<random>.
@@ -44,6 +51,39 @@ type Config struct {
 	// error if the field is absent when an upgrade is requested.
 	Namespace string
 
+	// Release is the Helm release name Radar was installed under, from
+	// RADAR_HELM_RELEASE (set by the chart from .Release.Name). Sent to the
+	// hub so the dashboard's token-rotation command targets this release
+	// instead of assuming `radar`. Empty for non-Helm installs; the hub keeps
+	// its last stored value then.
+	Release string
+
+	// APIServerURL is the externally-reachable URL of this cluster's
+	// kube-apiserver, sent to the hub so it can correlate this cluster
+	// with references from other surfaces (most notably Argo CD's
+	// `spec.destination.server`). Populated via DiscoverAPIServerURL
+	// from the kube-public/cluster-info ConfigMap when present; empty
+	// when the ConfigMap isn't there (managed K8s services frequently
+	// omit it) or RBAC denies the read. The hub stores whatever it
+	// receives and falls back to name-based correlation when the field
+	// is empty.
+	APIServerURL string
+
+	// SelfUpgradeAvailable reports whether this installation has the RBAC
+	// Radar's in-cluster self-upgrade endpoint needs. It is advertised
+	// explicitly on every Cloud tunnel handshake so the Hub never has to infer
+	// capability from the Radar version.
+	//
+	// It is a func, not a bool, because the answer can change without
+	// restarting Radar: enabling rbac.selfUpgrade adds a Role and RoleBinding
+	// but leaves the pod template untouched, so a value sampled once at
+	// startup would stay stale for the process lifetime. Re-evaluated per
+	// handshake, and re-checked periodically while a tunnel is up — a stable
+	// change closes the session so the next handshake re-advertises, since a
+	// healthy tunnel might otherwise never hand-shake again. Nil means
+	// unavailable.
+	SelfUpgradeAvailable func() bool
+
 	// Handler is the HTTP handler to serve over tunneled streams — typically
 	// Radar's Server.Handler() (chi router).
 	Handler http.Handler
@@ -53,8 +93,8 @@ func (c Config) validate() error {
 	if c.URL == "" {
 		return errors.New("cloud: URL is required")
 	}
-	if !strings.HasPrefix(c.URL, "ws://") && !strings.HasPrefix(c.URL, "wss://") {
-		return errors.New("cloud: URL must start with ws:// or wss://")
+	if err := ValidateWebSocketURL(c.URL); err != nil {
+		return fmt.Errorf("cloud: %w", err)
 	}
 	if c.Token == "" {
 		return errors.New("cloud: Token is required")
@@ -78,7 +118,6 @@ func Run(ctx context.Context, cfg Config) error {
 
 	backoff := 1 * time.Second
 	const maxBackoff = 30 * time.Second
-	const warnAfterFailures = 5
 
 	failures := 0
 
@@ -88,12 +127,13 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		log.Printf("[cloud] dialing Radar Cloud: %s cluster=%s", cfg.URL, cfg.ClusterID)
-		sess, err := dial(ctx, cfg)
+		advertised := cfg.SelfUpgradeAvailable != nil && cfg.SelfUpgradeAvailable()
+		sess, err := dial(ctx, cfg, advertised)
 		if err != nil {
 			failures++
 			log.Printf("[cloud] dial failed: %v (retry in %s)", err, backoff)
 			if failures == warnAfterFailures {
-				log.Printf("[cloud] WARN: %d consecutive failures — verify --cloud-url, --cloud-token, and --cluster-name", failures)
+				log.Printf("[cloud] WARN: %s", escalationWarning(failures, err))
 			}
 			if !sleep(ctx, backoff) {
 				return ctx.Err()
@@ -106,6 +146,9 @@ func Run(ctx context.Context, cfg Config) error {
 		log.Printf("[cloud] connected to Radar Cloud; serving streams")
 		connectedAt := time.Now()
 
+		if cfg.SelfUpgradeAvailable != nil {
+			go watchSelfUpgradeAdvertisement(ctx, cfg.SelfUpgradeAvailable, advertised, sess, selfUpgradeRecheckInterval)
+		}
 		err = serve(ctx, sess, cfg.Handler)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("[cloud] session ended: %v", err)
@@ -130,6 +173,54 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
+const selfUpgradeRecheckInterval = 3 * time.Minute
+
+// warnAfterFailures is how many consecutive dial failures escalate to a WARN.
+// A var so a test can reach the escalation without sitting through the
+// backoff that separates five real attempts.
+var warnAfterFailures = 5
+
+// advertisementSession is the slice of *yamux.Session the capability watcher
+// needs; an interface so tests can observe the close decision without a
+// real tunnel.
+type advertisementSession interface {
+	CloseChan() <-chan struct{}
+	Close() error
+}
+
+// watchSelfUpgradeAdvertisement closes the session when the self-upgrade
+// capability stops matching what this session's handshake advertised, forcing
+// the reconnect loop to re-dial and re-advertise. Without it, enabling
+// rbac.selfUpgrade — which adds only RBAC objects, restarting nothing — would
+// leave a healthy long-lived tunnel advertising the old answer indefinitely.
+// Two consecutive mismatches are required so one transient probe failure
+// cannot cycle a healthy tunnel.
+func watchSelfUpgradeAdvertisement(ctx context.Context, current func() bool, advertised bool, sess advertisementSession, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	mismatches := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sess.CloseChan():
+			return
+		case <-ticker.C:
+			if current() == advertised {
+				mismatches = 0
+				continue
+			}
+			mismatches++
+			if mismatches < 2 {
+				continue
+			}
+			log.Printf("[cloud] self-upgrade capability changed (advertised %t); reconnecting to re-advertise", advertised)
+			sess.Close()
+			return
+		}
+	}
+}
+
 func sleep(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -147,4 +238,19 @@ func nextBackoff(cur, max time.Duration) time.Duration {
 		n = max
 	}
 	return n
+}
+
+// escalationWarning is what Radar says once a run of dial failures stops
+// looking transient.
+//
+// A handshake that was answered carries its own instruction, and the flag list
+// contradicts it: on a Cloud-side outage it tells the operator to go re-check a
+// token that was never rejected. The list is for the case with no answer at
+// all, where a wrong URL and an unreachable one look identical from here.
+func escalationWarning(failures int, err error) string {
+	var answered *handshakeStatusError
+	if errors.As(err, &answered) {
+		return fmt.Sprintf("%d consecutive failures, still retrying: %v", failures, err)
+	}
+	return fmt.Sprintf("%d consecutive failures: %v. Verify --cloud-url, --cloud-token and --cluster-name", failures, err)
 }

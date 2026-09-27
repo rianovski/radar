@@ -1,10 +1,14 @@
+import type { ReactNode } from 'react'
 import { HardDrive } from 'lucide-react'
 import { clsx } from 'clsx'
-import { Section, PropertyList, Property, ConditionsSection, AlertBanner, ResourceLink } from '../../ui/drawer-components'
+import { Section, PropertyList, Property, ConditionsSection, AlertBanner, ResourceLink, useOperationalIssuesShown, type ConditionTone } from '../../ui/drawer-components'
+import { formatAge } from '../resource-utils'
 
 interface PVCRendererProps {
   data: any
   onNavigate?: (ref: { kind: string; namespace: string; name: string }) => void
+  /** Optional host-provided section, used for a Prometheus-derived usage gauge. */
+  extraSections?: ReactNode
 }
 
 const accessModeShorthand: Record<string, string> = {
@@ -19,27 +23,36 @@ function formatAccessModes(modes: string[] | undefined): string | undefined {
   return modes.map(m => accessModeShorthand[m] || m).join(', ')
 }
 
-export function PVCRenderer({ data, onNavigate }: PVCRendererProps) {
+function pvcConditionTone(condition: any): ConditionTone | undefined {
+  if (condition?.type !== 'Unused') return undefined
+  return condition.status === 'True' ? 'unknown' : condition.status === 'False' ? 'ok' : 'unknown'
+}
+
+export function PVCRenderer({ data, onNavigate, extraSections }: PVCRendererProps) {
   const status = data.status || {}
   const spec = data.spec || {}
   const annotations = data.metadata?.annotations || {}
   const phase = status.phase
 
-  // Problem detection
+  // Lost is a genuine failure (bound volume disappeared). Pending is a normal
+  // lifecycle state (provisioning / WaitForFirstConsumer), surfaced calmly below.
   const isLost = phase === 'Lost'
   const isPending = phase === 'Pending'
-  const hasProblems = isLost || isPending
 
   // Provisioner info from annotations
   const provisioner = annotations['volume.kubernetes.io/storage-provisioner']
   const selectedNode = annotations['volume.kubernetes.io/selected-node']
   const bindCompleted = annotations['pv.kubernetes.io/bind-completed']
   const hasProvisionerInfo = provisioner || selectedNode || bindCompleted
+  const operationalIssuesShown = useOperationalIssuesShown()
+  const unused = Array.isArray(status.conditions)
+    ? status.conditions.find((condition: any) => condition?.type === 'Unused' && condition.status === 'True')
+    : undefined
 
   return (
     <>
       {/* Problem alerts */}
-      {hasProblems && isLost && (
+      {isLost && !operationalIssuesShown && (
         <AlertBanner
           variant="error"
           title="Issues Detected"
@@ -47,11 +60,19 @@ export function PVCRenderer({ data, onNavigate }: PVCRendererProps) {
         />
       )}
 
-      {hasProblems && isPending && (
+      {isPending && (
         <AlertBanner
-          variant="warning"
-          title="Issues Detected"
-          message="PVC is waiting to be bound to a volume"
+          variant="info"
+          title="Pending — not yet bound"
+          message="A PVC stays Pending while its volume is provisioned, or for a WaitForFirstConsumer StorageClass until a Pod that mounts it is scheduled. If it stays Pending, check the StorageClass, its provisioner, and storage quota."
+        />
+      )}
+
+      {unused && (
+        <AlertBanner
+          variant="info"
+          title={unused.lastTransitionTime ? `Unused for about ${formatAge(unused.lastTransitionTime)}` : 'Unused'}
+          message="No non-terminal Pod currently references this claim. Verify its retention policy and data ownership before deleting it."
         />
       )}
 
@@ -92,7 +113,9 @@ export function PVCRenderer({ data, onNavigate }: PVCRendererProps) {
         </Section>
       )}
 
-      <ConditionsSection conditions={status.conditions} />
+      {extraSections}
+
+      <ConditionsSection conditions={status.conditions} getConditionTone={pvcConditionTone} />
     </>
   )
 }

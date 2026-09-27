@@ -73,7 +73,7 @@ func setupFakeCacheForFilterTests(t *testing.T) {
 func withRestrictedUser(t *testing.T, username string, allowed []string) context.Context {
 	t.Helper()
 	ctx := pkgauth.ContextWithUser(context.Background(), &pkgauth.User{Username: username, Groups: nil})
-	getPermCache().Set(username, &pkgauth.UserPermissions{AllowedNamespaces: allowed})
+	getPermCache().Set(username, nil, &pkgauth.UserPermissions{AllowedNamespaces: allowed})
 	return ctx
 }
 
@@ -84,7 +84,7 @@ func withRestrictedUser(t *testing.T, username string, allowed []string) context
 func withClusterAdmin(t *testing.T, username string) context.Context {
 	t.Helper()
 	ctx := pkgauth.ContextWithUser(context.Background(), &pkgauth.User{Username: username, Groups: nil})
-	getPermCache().Set(username, &pkgauth.UserPermissions{AllowedNamespaces: nil})
+	getPermCache().Set(username, nil, &pkgauth.UserPermissions{AllowedNamespaces: nil})
 	return ctx
 }
 
@@ -94,7 +94,7 @@ func withClusterAdmin(t *testing.T, username string) context.Context {
 // Sets both list and get verbs.
 func grantClusterRead(t *testing.T, username string, gvrs ...string) {
 	t.Helper()
-	perms := getPermCache().Get(username)
+	perms := getPermCache().Get(username, nil)
 	if perms == nil {
 		t.Fatalf("user %q not in perm cache; call withRestrictedUser/withClusterAdmin first", username)
 	}
@@ -112,7 +112,7 @@ func grantClusterRead(t *testing.T, username string, gvrs ...string) {
 // scoped reads are gated even when the cache contains the resource.
 func denyClusterRead(t *testing.T, username string, gvrs ...string) {
 	t.Helper()
-	perms := getPermCache().Get(username)
+	perms := getPermCache().Get(username, nil)
 	if perms == nil {
 		t.Fatalf("user %q not in perm cache", username)
 	}
@@ -148,6 +148,46 @@ func containsName(payload, name string) bool {
 	return strings.Contains(payload, `"name":"`+name+`"`)
 }
 
+// TestHandleListResources_GroupRoutesToDynamic pins the group-aware
+// short-circuit on the MCP list_resources path. For kind=services with
+// no group, the typed core Service list returns the seeded fixture. For
+// kind=services&group=serving.knative.dev, the handler must skip the
+// typed cache (which is group-blind — it would silently return core
+// Services and drop the group filter on the floor) and route through
+// listDynamicResources instead. Mirrors the REST-side fix in
+// handleAIListResources and the GET-side fix from PR #721.
+//
+// setupFakeCacheForFilterTests doesn't initialize the dynamic cache, so
+// the dynamic call surfaces an error. listDynamicResources wraps it in
+// "failed to list %s: …" — pin both that the result does NOT contain
+// the core Service AND that the call returned the dynamic-cache error
+// (proving the routing change is in place).
+func TestHandleListResources_GroupRoutesToDynamic(t *testing.T) {
+	setupFakeCacheForFilterTests(t)
+	ctx := withRestrictedUser(t, "alice", []string{"alpha"})
+
+	// With no group: typed cache, but no Services in the fixture so
+	// it's an empty list. Sanity check the baseline.
+	_, _, err := handleListResources(ctx, nil, listResourcesInput{Kind: "services", Namespace: "alpha"})
+	if err != nil {
+		t.Fatalf("baseline (no group): %v", err)
+	}
+
+	// With group=serving.knative.dev: must route to dynamic. The fake
+	// cache has no dynamic discovery wired, so we expect an error
+	// rather than a (wrong) 200 with typed core Services.
+	_, _, err = handleListResources(ctx, nil, listResourcesInput{Kind: "services", Namespace: "alpha", Group: "serving.knative.dev"})
+	if err == nil {
+		t.Fatalf("group=serving.knative.dev: expected dynamic-cache routing error (no discovery in test harness), got nil err — handler may have silently returned typed core Services (pre-fix bug)")
+	}
+	// The wrapped error should reflect the dynamic path, not a typed
+	// cache lookup. Match loosely on shape so future error-text
+	// refactors don't flake the test.
+	if !strings.Contains(err.Error(), "services") {
+		t.Errorf("error should mention services kind: %v", err)
+	}
+}
+
 func TestHandleListResources_RestrictedUser(t *testing.T) {
 	setupFakeCacheForFilterTests(t)
 
@@ -165,6 +205,31 @@ func TestHandleListResources_RestrictedUser(t *testing.T) {
 	}
 	if containsName(body, "beta-pod") || containsName(body, "gamma-pod") {
 		t.Errorf("restricted user leaked other-namespace pods: %s", body)
+	}
+}
+
+func TestHandleListResources_CommonAliases(t *testing.T) {
+	setupFakeCacheForFilterTests(t)
+	ctx := withRestrictedUser(t, "alice", []string{"alpha"})
+
+	result, _, err := handleListResources(ctx, nil, listResourcesInput{Kind: "po"})
+	if err != nil {
+		t.Fatalf("handleListResources po: %v", err)
+	}
+	body := extractText(t, result)
+	if !containsName(body, "alpha-pod") {
+		t.Errorf("expected alpha-pod via po alias; got: %s", body)
+	}
+	if containsName(body, "beta-pod") || containsName(body, "gamma-pod") {
+		t.Errorf("po alias leaked other-namespace pods: %s", body)
+	}
+
+	result, _, err = handleListResources(ctx, nil, listResourcesInput{Kind: "no"})
+	if err != nil {
+		t.Fatalf("handleListResources no: %v", err)
+	}
+	if body := extractText(t, result); body != "[]" {
+		t.Errorf("node alias must still respect cluster-scoped RBAC, got: %s", body)
 	}
 }
 
@@ -399,6 +464,65 @@ func TestHandleGetEvents_RestrictedAggregatesAllowed(t *testing.T) {
 	if !strings.Contains(body, "[]") {
 		t.Errorf("expected empty result for denied namespace, got: %s", body)
 	}
+	// A consumer must be able to tell "nothing recorded" from "not readable":
+	// the denied path carries the marker, an ordinary empty read does not.
+	if !strings.Contains(body, `"accessDenied":true`) {
+		t.Errorf("expected accessDenied marker for denied namespace, got: %s", body)
+	}
+	allowedResult, _, err := handleGetEvents(ctx, nil, eventsInput{Namespace: "alpha"})
+	if err != nil {
+		t.Fatalf("handleGetEvents allowed: %v", err)
+	}
+	if allowedBody := extractText(t, allowedResult); strings.Contains(allowedBody, "accessDenied") {
+		t.Errorf("allowed namespace must not carry the accessDenied marker: %s", allowedBody)
+	}
+}
+
+// A cluster-wide get_events (no namespace) from a namespace-restricted caller
+// answers for the readable namespaces alone. Without a marker the narrowed
+// answer would be filed as a receipt covering the whole cluster, so the
+// response names both the narrowing and the namespaces it actually read.
+func TestHandleGetEvents_ClusterWideMarksPartialScope(t *testing.T) {
+	setupFakeCacheForFilterTests(t)
+
+	restricted := callGetEventsCtx(t, withRestrictedUser(t, "alice", []string{"beta", "alpha"}), eventsInput{})
+	if !restricted.PartialScope {
+		t.Error("a cluster-wide read narrowed to a subset must set partialScope")
+	}
+	if got := strings.Join(restricted.ScopeNamespaces, ","); got != "alpha,beta" {
+		t.Errorf("scopeNamespaces = %q, want the namespaces actually read", got)
+	}
+	if restricted.AccessDenied {
+		t.Error("a partial read is not a denial; accessDenied would make the adapter drop the whole result")
+	}
+
+	// Unrestricted: the read covered everything it asked for, so no marker.
+	everything := callGetEventsCtx(t, withClusterAdmin(t, "root"), eventsInput{})
+	if everything.PartialScope || len(everything.ScopeNamespaces) != 0 {
+		t.Errorf("an unnarrowed cluster-wide read must carry no scope marker, got %+v", everything)
+	}
+
+	// A single namespace the caller cannot read stays a denial, not a partial.
+	denied := callGetEventsCtx(t, withRestrictedUser(t, "bob", []string{"alpha"}), eventsInput{Namespace: "beta"})
+	if !denied.AccessDenied {
+		t.Error("a denied namespace must still set accessDenied")
+	}
+	if denied.PartialScope {
+		t.Error("a denied namespace is not a partial scope")
+	}
+}
+
+func callGetEventsCtx(t *testing.T, ctx context.Context, input eventsInput) getEventsResponseMCP {
+	t.Helper()
+	res, _, err := handleGetEvents(ctx, nil, input)
+	if err != nil {
+		t.Fatalf("handleGetEvents(%+v): %v", input, err)
+	}
+	var resp getEventsResponseMCP
+	if uerr := json.Unmarshal([]byte(extractText(t, res)), &resp); uerr != nil {
+		t.Fatalf("unmarshal: %v", uerr)
+	}
+	return resp
 }
 
 // --- Per-namespace Secret RBAC ---
@@ -425,7 +549,7 @@ func seedSecretGetCanI(t *testing.T, username string, allowedNamespaces []string
 
 func seedSecretCanIVerb(t *testing.T, username, verb string, allowedNamespaces []string, deniedNamespaces []string) {
 	t.Helper()
-	perms := getPermCache().Get(username)
+	perms := getPermCache().Get(username, nil)
 	if perms == nil {
 		t.Fatalf("user %q not in perm cache", username)
 	}
@@ -482,7 +606,7 @@ func TestHandleListResources_Secrets_ClusterWideShape_NoSecretRBAC(t *testing.T)
 	// can't return.
 	setupFakeCacheForFilterTests(t)
 	ctx := withClusterAdmin(t, "broad-reader")
-	perms := getPermCache().Get("broad-reader")
+	perms := getPermCache().Get("broad-reader", nil)
 	if perms == nil {
 		t.Fatalf("broad-reader not in cache")
 	}
@@ -505,7 +629,7 @@ func TestHandleListResources_Secrets_ClusterWideShape_WithSecretRBAC(t *testing.
 	// allowed — user sees every secret in the cache.
 	setupFakeCacheForFilterTests(t)
 	ctx := withClusterAdmin(t, "broad-reader")
-	perms := getPermCache().Get("broad-reader")
+	perms := getPermCache().Get("broad-reader", nil)
 	if perms == nil {
 		t.Fatalf("broad-reader not in cache")
 	}
@@ -583,7 +707,7 @@ func TestHandleSearch_Secrets_PerNamespaceFanout(t *testing.T) {
 	ctx := withRestrictedUser(t, "alice", []string{"alpha", "beta"})
 	seedSecretListCanI(t, "alice", []string{"alpha"}, []string{"beta"})
 
-	result, _, err := handleSearch(ctx, nil, searchInput{Q: "kind:Secret"})
+	result, _, err := handleSearch(ctx, nil, searchInput{Query: "kind:Secret"})
 	if err != nil {
 		t.Fatalf("handleSearch: %v", err)
 	}
@@ -596,6 +720,63 @@ func TestHandleSearch_Secrets_PerNamespaceFanout(t *testing.T) {
 	}
 }
 
+func TestHandleSearch_NamespaceParameter(t *testing.T) {
+	setupFakeCacheForFilterTests(t)
+
+	t.Run("matches inline scope", func(t *testing.T) {
+		structured, _, err := handleSearch(context.Background(), nil, searchInput{Query: "kind:Pod", Namespace: "alpha"})
+		if err != nil {
+			t.Fatalf("structured namespace: %v", err)
+		}
+		inline, _, err := handleSearch(context.Background(), nil, searchInput{Query: "kind:Pod ns:alpha"})
+		if err != nil {
+			t.Fatalf("inline namespace: %v", err)
+		}
+		if got, want := extractText(t, structured), extractText(t, inline); got != want {
+			t.Errorf("structured namespace result differs from inline scope\nstructured: %s\ninline: %s", got, want)
+		}
+	})
+
+	t.Run("omitted remains cluster wide", func(t *testing.T) {
+		result, _, err := handleSearch(context.Background(), nil, searchInput{Query: "kind:Pod"})
+		if err != nil {
+			t.Fatalf("handleSearch: %v", err)
+		}
+		body := extractText(t, result)
+		for _, want := range []string{"alpha-pod", "beta-pod", "gamma-pod"} {
+			if !containsName(body, want) {
+				t.Errorf("cluster-wide search missing %s: %s", want, body)
+			}
+		}
+	})
+
+	t.Run("denied namespace returns no hits", func(t *testing.T) {
+		ctx := withRestrictedUser(t, "namespace-search-user", []string{"alpha"})
+		result, _, err := handleSearch(ctx, nil, searchInput{Query: "kind:Pod", Namespace: "beta"})
+		if err != nil {
+			t.Fatalf("handleSearch: %v", err)
+		}
+		body := extractText(t, result)
+		if containsName(body, "alpha-pod") || containsName(body, "beta-pod") || containsName(body, "gamma-pod") {
+			t.Errorf("denied namespace search returned pod hits: %s", body)
+		}
+	})
+
+	t.Run("top level overrides inline namespace modifiers", func(t *testing.T) {
+		result, _, err := handleSearch(context.Background(), nil, searchInput{Query: "kind:Pod namespace:beta", Namespace: "alpha"})
+		if err != nil {
+			t.Fatalf("handleSearch: %v", err)
+		}
+		body := extractText(t, result)
+		if !containsName(body, "alpha-pod") {
+			t.Errorf("top-level namespace result missing alpha-pod: %s", body)
+		}
+		if containsName(body, "beta-pod") || containsName(body, "gamma-pod") {
+			t.Errorf("inline namespace was not overridden: %s", body)
+		}
+	})
+}
+
 func TestHandleSearch_Secrets_ClusterWideShape_NsFilter(t *testing.T) {
 	// Regression for the bug where AllowedNamespaces==nil (cluster-wide
 	// namespace sentinel) plus a concrete `ns:` filter took the cluster-
@@ -605,7 +786,7 @@ func TestHandleSearch_Secrets_ClusterWideShape_NsFilter(t *testing.T) {
 	// `list secrets` SAR.
 	setupFakeCacheForFilterTests(t)
 	ctx := withClusterAdmin(t, "broad-reader")
-	perms := getPermCache().Get("broad-reader")
+	perms := getPermCache().Get("broad-reader", nil)
 	if perms == nil {
 		t.Fatalf("broad-reader not in cache")
 	}
@@ -614,7 +795,7 @@ func TestHandleSearch_Secrets_ClusterWideShape_NsFilter(t *testing.T) {
 	perms.SetCanI("list", "", "secrets", "alpha", true)
 	perms.SetCanI("list", "", "secrets", "beta", false)
 
-	result, _, err := handleSearch(ctx, nil, searchInput{Q: "kind:Secret ns:alpha"})
+	result, _, err := handleSearch(ctx, nil, searchInput{Query: "kind:Secret ns:alpha"})
 	if err != nil {
 		t.Fatalf("handleSearch: %v", err)
 	}
@@ -624,5 +805,79 @@ func TestHandleSearch_Secrets_ClusterWideShape_NsFilter(t *testing.T) {
 	}
 	if containsName(body, "beta-secret") {
 		t.Errorf("beta-secret leaked despite ns:alpha filter + per-ns RBAC: %s", body)
+	}
+
+	result, _, err = handleSearch(ctx, nil, searchInput{Query: "kind:Secret", Namespace: "alpha"})
+	if err != nil {
+		t.Fatalf("handleSearch with structured namespace: %v", err)
+	}
+	body = extractText(t, result)
+	if !containsName(body, "alpha-secret") {
+		t.Errorf("structured namespace did not reach per-namespace secret RBAC: %s", body)
+	}
+	if containsName(body, "beta-secret") {
+		t.Errorf("beta-secret leaked despite structured namespace + per-ns RBAC: %s", body)
+	}
+}
+
+func TestNormalizeWorkloadLogsKind_DefaultsToDeployment(t *testing.T) {
+	if got := normalizeWorkloadLogsKind(""); got != "deployments" {
+		t.Fatalf("blank workload-log kind = %q, want deployments", got)
+	}
+	if got := normalizeWorkloadLogsKind("statefulset"); got != "statefulsets" {
+		t.Fatalf("statefulset workload-log kind = %q, want statefulsets", got)
+	}
+	if got := normalizeWorkloadLogsKind("job"); got != "jobs" {
+		t.Fatalf("job workload-log kind = %q, want jobs", got)
+	}
+	if got := normalizeWorkloadLogsKind("Workflow"); got != "workflows" {
+		t.Fatalf("Workflow workload-log kind = %q, want workflows", got)
+	}
+}
+
+func TestParseLogsSince(t *testing.T) {
+	tests := []struct {
+		name      string
+		in        string
+		wantSecs  int64
+		wantNil   bool
+		wantError bool
+	}{
+		{name: "empty returns nil", in: "", wantNil: true},
+		{name: "whitespace returns nil", in: "  ", wantNil: true},
+		{name: "30s", in: "30s", wantSecs: 30},
+		{name: "10m", in: "10m", wantSecs: 600},
+		{name: "1h", in: "1h", wantSecs: 3600},
+		{name: "sub-second floors to 1s", in: "500ms", wantSecs: 1},
+		{name: "invalid format", in: "10minutes", wantError: true},
+		{name: "negative duration", in: "-5m", wantError: true},
+		{name: "zero duration", in: "0s", wantError: true},
+		{name: "junk", in: "soon", wantError: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseLogsSince(tc.in)
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("expected error, got nil (result=%v)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.wantNil {
+				if got != nil {
+					t.Fatalf("expected nil, got %d", *got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected %d, got nil", tc.wantSecs)
+			}
+			if *got != tc.wantSecs {
+				t.Fatalf("got %d, want %d", *got, tc.wantSecs)
+			}
+		})
 	}
 }

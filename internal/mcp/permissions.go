@@ -12,8 +12,60 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/internal/timeline"
 	pkgauth "github.com/skyhook-io/radar/pkg/auth"
+	"github.com/skyhook-io/radar/pkg/issuesapi"
+	pkgopencost "github.com/skyhook-io/radar/pkg/opencost"
 )
+
+// mcpChangeAuthorizer returns the per-kind authorizer for the ctx user, for the
+// shared k8s.ChangeReadAllowed gate. canReadInNamespace memoizes on the user's
+// permission cache; nil user (auth off) short-circuits to allow inside it.
+func mcpChangeAuthorizer(ctx context.Context) func(group, resource, namespace string) bool {
+	return func(group, resource, namespace string) bool {
+		return canReadInNamespace(ctx, group, resource, namespace, "list")
+	}
+}
+
+// filterRecentChangesRBAC drops RecentChange rows the ctx user can't read, via
+// the shared per-kind gate (APIVersion disambiguates CRD kind collisions). It is
+// the MCP twin of the server-side filter, applied at every MCP surface that
+// emits change rows (get_changes, dashboard, issues recent_changes, per-issue
+// correlation incl. consumed ConfigMaps, diagnose, get_resource).
+//
+// Helm-package-manager rows are a synthesized kind with no real GVR and their
+// own namespace/helm authorization upstream; pass them through rather than
+// fail-closed on an unresolvable kind (preserves the pre-existing behavior — the
+// prior cluster-scoped-only filter also let them through). Auth off → unchanged.
+func filterRecentChangesRBAC(ctx context.Context, changes []issuesapi.RecentChange) []issuesapi.RecentChange {
+	if pkgauth.UserFromContext(ctx) == nil {
+		return changes
+	}
+	authz := mcpChangeAuthorizer(ctx)
+	out := changes[:0]
+	for _, c := range changes {
+		if c.Source == helmChangeSource || k8s.ChangeReadAllowed(c.Kind, c.APIVersion, c.Namespace, authz) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// filterTimelineEventsRBAC is filterRecentChangesRBAC's twin for raw timeline
+// events (the MCP dashboard queries the store directly). Auth off → unchanged.
+func filterTimelineEventsRBAC(ctx context.Context, events []timeline.TimelineEvent) []timeline.TimelineEvent {
+	if pkgauth.UserFromContext(ctx) == nil {
+		return events
+	}
+	authz := mcpChangeAuthorizer(ctx)
+	out := events[:0]
+	for _, e := range events {
+		if k8s.ChangeReadAllowed(e.Kind, e.APIVersion, e.Namespace, authz) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
 
 // MCP read tools share the cluster-wide resource cache (populated by the pod
 // SA), so per-user namespace filtering must happen at read time. This mirrors
@@ -52,7 +104,7 @@ func resolveUserPerms(ctx context.Context) (*pkgauth.User, *pkgauth.UserPermissi
 		return nil, nil
 	}
 	cache := getPermCache()
-	if perms := cache.Get(user.Username); perms != nil {
+	if perms := cache.Get(user.Username, user.Groups); perms != nil {
 		return user, perms
 	}
 
@@ -63,6 +115,19 @@ func resolveUserPerms(ctx context.Context) (*pkgauth.User, *pkgauth.UserPermissi
 		return user, &pkgauth.UserPermissions{AllowedNamespaces: []string{}}
 	}
 
+	allNamespaces := mcpAllNamespaceNames(ctx)
+	allowed, err := pkgauth.DiscoverNamespaces(ctx, client, user.Username, user.Groups, allNamespaces)
+	if err != nil {
+		log.Printf("[mcp] DiscoverNamespaces failed for %s: %v — denying access (fail-closed)", user.Username, err)
+		return user, &pkgauth.UserPermissions{AllowedNamespaces: []string{}}
+	}
+
+	perms := &pkgauth.UserPermissions{AllowedNamespaces: allowed}
+	cache.Set(user.Username, user.Groups, perms)
+	return user, perms
+}
+
+func mcpAllNamespaceNames(ctx context.Context) []string {
 	var allNamespaces []string
 	if rc := mcpCache(ctx); rc != nil {
 		if nsLister := rc.Namespaces(); nsLister != nil {
@@ -72,24 +137,12 @@ func resolveUserPerms(ctx context.Context) (*pkgauth.User, *pkgauth.UserPermissi
 			}
 		}
 	}
-	// Fallback for namespace-scoped SAs: see internal/server/server.go's
-	// getUserNamespaces for the rationale. Without this, restricted users
-	// in a namespace-scoped Radar deploy get [] instead of their RBAC ceiling.
 	if len(allNamespaces) == 0 {
 		if accessible, _ := k8s.GetAccessibleNamespaces(ctx); len(accessible) > 0 {
 			allNamespaces = accessible
 		}
 	}
-
-	allowed, err := pkgauth.DiscoverNamespaces(ctx, client, user.Username, user.Groups, allNamespaces)
-	if err != nil {
-		log.Printf("[mcp] DiscoverNamespaces failed for %s: %v — denying access (fail-closed)", user.Username, err)
-		return user, &pkgauth.UserPermissions{AllowedNamespaces: []string{}}
-	}
-
-	perms := &pkgauth.UserPermissions{AllowedNamespaces: allowed}
-	cache.Set(user.Username, perms)
-	return user, perms
+	return allNamespaces
 }
 
 // filterNamespacesForUser intersects requested namespaces with the user's
@@ -107,6 +160,69 @@ func filterNamespacesForUser(ctx context.Context, requested []string) []string {
 		return requested
 	}
 	return pkgauth.FilterNamespacesForUser(requested, user, perms)
+}
+
+// scopedNamespacesForUser applies the --namespace pin before the RBAC filter,
+// mirroring Server.openCostRouteScope and parseNamespacesForUser. Prometheus
+// and Kubecost answer cluster-wide no matter which namespace the informer
+// caches are pinned to, so a tool reading them must clamp the scope itself or a
+// namespace-scoped Radar reports spend for namespaces it was told to ignore.
+func scopedNamespacesForUser(ctx context.Context, requested []string) []string {
+	clamped, ok := clampToNamespacePin(requested)
+	if !ok {
+		return []string{}
+	}
+	return filterNamespacesForUser(ctx, clamped)
+}
+
+// namespaceWithinPin reports whether a single namespace survives the --namespace
+// pin, for tools that authorize it with their own exact SubjectAccessReview.
+func namespaceWithinPin(namespace string) bool {
+	_, ok := clampToNamespacePin([]string{namespace})
+	return ok
+}
+
+// deniedScopeReason names why a namespace request resolved to nothing. The pin
+// and an RBAC denial are indistinguishable in the resulting namespace list, so
+// the cause has to be re-derived from configuration: "you cannot read this"
+// and "radar was started with --namespace-scope" need different answers.
+func deniedScopeReason(requested []string) string {
+	if _, ok := clampToNamespacePin(requested); !ok {
+		return ReasonOutsideNamespaceScope
+	}
+	return pkgopencost.ReasonAccessDenied
+}
+
+// ReasonOutsideNamespaceScope marks a request the --namespace pin excluded,
+// rather than one this identity lacks permission for.
+const ReasonOutsideNamespaceScope = "outside_namespace_scope"
+
+// NamespacePinned reports whether informer caches are pinned to one namespace,
+// and which. Callers use it to attribute a narrowed scope: a pin and an RBAC
+// limit produce the same namespace list, and telling a cluster-admin their
+// access is restricted when the operator pinned the process is a wrong answer.
+func NamespacePinned() (string, bool) {
+	if !k8s.ForceNamespaceScope {
+		return "", false
+	}
+	target := k8s.GetNamespaceScopeTarget()
+	return target, target != ""
+}
+
+// clampToNamespacePin applies only the --namespace pin, reporting false when the
+// request falls outside it.
+func clampToNamespacePin(requested []string) ([]string, bool) {
+	if !k8s.ForceNamespaceScope {
+		return requested, true
+	}
+	target := k8s.GetNamespaceScopeTarget()
+	if target == "" {
+		return nil, false
+	}
+	if requested != nil && !slices.Contains(requested, target) {
+		return nil, false
+	}
+	return []string{target}, true
 }
 
 // checkNamespaceAccess reports whether the user can read in this single
@@ -189,46 +305,70 @@ func canReadClusterScopedKind(ctx context.Context, kind, group, verb string) boo
 // Returns true (passthrough) when no user is on context — auth-mode=none
 // applies the SA's RBAC at the cache layer.
 func canReadInNamespace(ctx context.Context, group, resource, namespace, verb string) bool {
+	allowed, _ := canReadInNamespaceDecision(ctx, group, resource, namespace, verb)
+	return allowed
+}
+
+func canReadInNamespaceDecision(ctx context.Context, group, resource, namespace, verb string) (bool, bool) {
 	user, perms := resolveUserPerms(ctx)
 	if user == nil {
-		return true
+		return true, true
 	}
 	if perms != nil {
 		if v, ok := perms.CanI(verb, group, resource, namespace); ok {
-			return v
+			return v, true
 		}
 	}
 	client := k8s.GetClient()
 	if client == nil {
 		log.Printf("[mcp] canReadInNamespace: no K8s client, denying %s on %s/%s in %q for %s", k8s.SanitizeForLog(verb), k8s.SanitizeForLog(group), k8s.SanitizeForLog(resource), k8s.SanitizeForLog(namespace), k8s.SanitizeForLog(user.Username))
-		return false
+		return false, false
 	}
 	allowed, err := subjectCanI(ctx, client, user.Username, user.Groups, namespace, group, resource, verb)
 	if err != nil {
 		log.Printf("[mcp] canReadInNamespace SAR failed for %s on %s/%s in %q: %v", k8s.SanitizeForLog(user.Username), k8s.SanitizeForLog(group), k8s.SanitizeForLog(resource), k8s.SanitizeForLog(namespace), err)
-		return false
+		return false, false
 	}
 	if perms != nil {
 		perms.SetCanI(verb, group, resource, namespace, allowed)
 	}
-	return allowed
+	return allowed, true
 }
 
 // filterNamespacesByCanRead returns the subset of `namespaces` where the
 // calling user passes a per-namespace SAR for (group, resource, verb). The
-// MCP-side mirror of Server.filterNamespacesByCanRead.
+// MCP-side mirror of Server.filterNamespacesByCanRead, with the same bounded
+// parallelism: each canReadInNamespace miss is a SAR round-trip, so a serial
+// loop over a large candidate set (a cluster-wide reader's full namespace
+// list) would block the tool call for N round-trips. Output is sorted so the
+// result is deterministic regardless of goroutine completion order — matching
+// the HTTP helper.
 //
 // nil or empty input is returned unchanged.
 func filterNamespacesByCanRead(ctx context.Context, group, resource, verb string, namespaces []string) []string {
 	if len(namespaces) == 0 {
 		return namespaces
 	}
+	const maxConcurrent = 16
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	out := make([]string, 0, len(namespaces))
 	for _, ns := range namespaces {
-		if canReadInNamespace(ctx, group, resource, ns, verb) {
-			out = append(out, ns)
-		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ns string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if canReadInNamespace(ctx, group, resource, ns, verb) {
+				mu.Lock()
+				out = append(out, ns)
+				mu.Unlock()
+			}
+		}(ns)
 	}
+	wg.Wait()
+	slices.Sort(out)
 	return out
 }
 

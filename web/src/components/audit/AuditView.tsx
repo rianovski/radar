@@ -1,25 +1,50 @@
 import { useState, useCallback } from 'react'
-import { useAudit, useAuditSettings, useUpdateAuditSettings } from '../../api/client'
+import { useLocation } from 'react-router-dom'
+import { useAudit, useAuditSettings, useUpdateAuditSettings, useCloudRole } from '../../api/client'
 import type { SelectedResource } from '../../types'
-import { AuditFindingsTable, PaneLoader } from '@skyhook-io/k8s-ui'
-import { ArrowLeft, ClipboardCheck, Settings } from 'lucide-react'
+import { ChecksView, PaneLoader, PageHeader, FreshnessControl, type CheckResourceRef } from '@skyhook-io/k8s-ui'
+import { ShieldCheck, Settings } from 'lucide-react'
 import { AuditSettingsDialog } from './AuditSettingsDialog'
+import { Tooltip } from '../ui/Tooltip'
+import { useConnection } from '../../context/ConnectionContext'
+import { ChecksViewTabs } from './ChecksViewTabs'
+import { UpgradeReadinessView } from './UpgradeReadinessView'
 
 interface AuditViewProps {
   namespaces: string[]
-  onBack: () => void
   onNavigateToResource: (resource: SelectedResource) => void
 }
 
-export function AuditView({ namespaces, onBack, onNavigateToResource }: AuditViewProps) {
-  const { data, isLoading, error } = useAudit(namespaces)
+// The per-cluster Checks surface. Renders the same shared remediation queue
+// (ChecksView) the Hub fleet view uses — single cluster here, so no cluster
+// label and in-app (client-side) resource navigation. The rollup + priority
+// come pre-computed from radar's /api/audit (pkg/audit.BuildChecks); local
+// ~/.radar settings are this cluster's "policy" and the row hide-menu writes to
+// them.
+export function AuditView({ namespaces, onNavigateToResource }: AuditViewProps) {
+  const { pathname } = useLocation()
+  if (pathname.startsWith('/checks/upgrade')) {
+    return <UpgradeReadinessView namespaces={namespaces} onNavigateToResource={onNavigateToResource} />
+  }
+  return <BestPracticesView namespaces={namespaces} onNavigateToResource={onNavigateToResource} />
+}
+
+function BestPracticesView({ namespaces, onNavigateToResource }: AuditViewProps) {
+  const { data, isLoading, error, dataUpdatedAt, refetch } = useAudit(namespaces)
   const { data: auditSettings } = useAuditSettings()
   const updateSettings = useUpdateAuditSettings()
+  // Audit policy is owner-gated (enforced server-side). Withhold the inline
+  // hide affordances from non-owners so they don't click into a 403 — the
+  // hide menus render only when these callbacks are passed.
+  const { canAtLeast } = useCloudRole()
+  const canEdit = canAtLeast('owner')
   const [showSettings, setShowSettings] = useState(false)
 
   const ignoredCount = auditSettings?.ignoredNamespaces?.length ?? 0
 
-  // Inline hide actions — persist to settings immediately
+  const { connection } = useConnection()
+
+  // Inline hide actions — persist to local settings immediately.
   const hideCheck = useCallback((checkID: string) => {
     if (!auditSettings) return
     const current = auditSettings.disabledChecks || []
@@ -29,31 +54,23 @@ export function AuditView({ namespaces, onBack, onNavigateToResource }: AuditVie
 
   const hideCategory = useCallback((category: string) => {
     if (!auditSettings || !data?.checks) return
-    const checksInCategory = Object.values(data.checks).filter(c => {
-      // Match checks whose findings are in this category
-      return data.findings.some(f => f.checkID === c.id && f.category === category)
-    }).map(c => c.id)
+    const checksInCategory = Object.values(data.checks)
+      .filter((c) => data.findings.some((f) => f.checkID === c.id && f.category === category))
+      .map((c) => c.id)
     const current = auditSettings.disabledChecks || []
-    const toAdd = checksInCategory.filter(id => !current.includes(id))
+    const toAdd = checksInCategory.filter((id) => !current.includes(id))
     if (toAdd.length === 0) return
     updateSettings.mutate({ ...auditSettings, disabledChecks: [...current, ...toAdd] })
   }, [auditSettings, data, updateSettings])
 
-  const hideNamespace = useCallback((ns: string) => {
-    if (!auditSettings) return
-    const current = auditSettings.ignoredNamespaces || []
-    if (current.includes(ns)) return
-    updateSettings.mutate({ ...auditSettings, ignoredNamespaces: [...current, ns] })
-  }, [auditSettings, updateSettings])
-
   if (isLoading) {
-    return <PaneLoader label="Loading audit data…" className="flex-1" />
+    return <PaneLoader label="Loading checks…" className="flex-1" />
   }
 
   if (error) {
     return (
       <div className="flex-1 flex items-center justify-center text-theme-text-secondary">
-        <p>Failed to load audit data</p>
+        <p>Failed to load checks</p>
       </div>
     )
   }
@@ -61,53 +78,57 @@ export function AuditView({ namespaces, onBack, onNavigateToResource }: AuditVie
   if (!data) {
     return (
       <div className="flex-1 flex items-center justify-center text-theme-text-secondary">
-        <p>No audit data available</p>
+        <p>No check data available</p>
       </div>
     )
   }
 
-  return (
-    <div className="flex-1 flex flex-col min-h-0 p-6 gap-6 overflow-auto">
-      {/* Header */}
-      <div className="flex items-center gap-4">
-        <button
-          onClick={onBack}
-          className="p-1.5 rounded-lg hover:bg-theme-hover transition-colors"
-        >
-          <ArrowLeft className="w-5 h-5 text-theme-text-secondary" />
-        </button>
-        <div className="flex-1">
-          <div className="flex items-center gap-2">
-            <ClipboardCheck className="w-5 h-5 text-theme-text-secondary" />
-            <h1 className="text-lg font-semibold text-theme-text-primary">Cluster Audit</h1>
-          </div>
-          <p className="text-sm text-theme-text-tertiary mt-1 ml-7">
-            Security, reliability, and efficiency checks based on Kubernetes best practices from NSA/CISA guidelines, CIS benchmarks, and industry tools like Polaris and Kubescape.
-          </p>
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {ignoredCount > 0 && (
-            <button onClick={() => setShowSettings(true)} className="text-xs text-theme-text-tertiary hover:text-theme-text-secondary transition-colors">{ignoredCount} {ignoredCount === 1 ? 'namespace' : 'namespaces'} hidden</button>
-          )}
-          <button
-            onClick={() => setShowSettings(true)}
-            className="p-2 rounded-lg hover:bg-theme-hover text-theme-text-tertiary hover:text-theme-text-secondary transition-colors"
-            title="Audit settings"
-          >
-            <Settings className="w-4 h-4" />
-          </button>
-        </div>
-      </div>
+  const onResourceClick = (ref: CheckResourceRef) =>
+    onNavigateToResource({ kind: ref.kind, namespace: ref.namespace, name: ref.name, group: ref.group })
 
-      <AuditFindingsTable
-        groups={data.groups}
-        checks={data.checks}
-        onResourceClick={(kind, namespace, name) =>
-          onNavigateToResource({ kind, namespace, name })
+  return (
+    <div className="flex-1 flex flex-col min-h-0 p-4 gap-4 overflow-auto">
+      {/* Tabs above the header: the header describes best practices only, so
+          tabs rendered below it read as part of that page rather than as the
+          switch between the two Checks surfaces. */}
+      <ChecksViewTabs />
+
+      <PageHeader
+        icon={ShieldCheck}
+        title="Best practices"
+        description="Security, reliability, and efficiency best practices (NSA/CISA, CIS, Polaris, Kubescape), grouped into a remediation queue."
+        actions={
+          <>
+            <FreshnessControl
+              mode="auto"
+              dataUpdatedAt={dataUpdatedAt}
+              onRefresh={() => refetch()}
+              connectionState={connection.state}
+            />
+            {ignoredCount > 0 && (
+              <button onClick={() => setShowSettings(true)} className="text-xs text-theme-text-tertiary hover:text-theme-text-secondary transition-colors">{ignoredCount} {ignoredCount === 1 ? 'namespace' : 'namespaces'} hidden</button>
+            )}
+            <Tooltip content="Checks settings">
+            <button
+              onClick={() => setShowSettings(true)}
+              className="p-2 rounded-lg hover:bg-theme-hover text-theme-text-tertiary hover:text-theme-text-secondary transition-colors"
+            >
+              <Settings className="w-4 h-4" />
+            </button>
+            </Tooltip>
+          </>
         }
-        onHideCheck={hideCheck}
-        onHideCategory={hideCategory}
-        onHideNamespace={hideNamespace}
+      />
+
+      <ChecksView
+        checks={data.groupedChecks ?? []}
+        catalog={data.checks ?? {}}
+        anyData
+        evaluated={data.summary.passing + data.summary.warning + data.summary.danger}
+        missingInputs={data.missingInputs}
+        onResourceClick={onResourceClick}
+        onHideCheck={canEdit ? hideCheck : undefined}
+        onHideCategory={canEdit ? hideCategory : undefined}
       />
 
       {showSettings && <AuditSettingsDialog namespaces={namespaces} onClose={() => setShowSettings(false)} />}

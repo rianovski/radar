@@ -1,7 +1,10 @@
 import { useState } from 'react'
-import { Info, CheckCircle, XCircle, AlertCircle, ChevronRight, ChevronDown, FileCode, AlertTriangle, Layers } from 'lucide-react'
+import { Info, CheckCircle, XCircle, AlertCircle, FileCode, AlertTriangle, Layers } from 'lucide-react'
 import { clsx } from 'clsx'
 import { Section, PropertyList, Property } from '../../ui/drawer-components'
+import { Collapse, CollapseChevron, useDisclosure } from '../../ui/Collapse'
+import { getGenericResourceStatus } from '../generic-status'
+import type { HealthLevel } from '../resource-utils'
 
 interface GenericRendererProps {
   data: any
@@ -13,7 +16,7 @@ export function GenericRenderer({ data }: GenericRendererProps) {
   const conditions = status.conditions
 
   // Determine health status from conditions or status fields
-  const healthStatus = getHealthStatus(status, conditions)
+  const healthStatus = getHealthStatus(data)
 
   // Extract important fields from spec and status
   const statusFields = getImportantFields(status, 'status')
@@ -138,89 +141,22 @@ interface HealthStatusResult {
   message?: string
 }
 
-function getHealthStatus(status: any, conditions?: any[]): HealthStatusResult | null {
-  if (!status) return null
+// This renderer's banner has four tones, while the shared derivation speaks the
+// full HealthLevel vocabulary. `alert` folds into unhealthy and `neutral` into
+// unknown — the banner has no distinct treatment for either.
+const BANNER_TYPE: Record<HealthLevel, HealthType> = {
+  healthy: 'healthy',
+  degraded: 'degraded',
+  alert: 'unhealthy',
+  unhealthy: 'unhealthy',
+  neutral: 'unknown',
+  unknown: 'unknown',
+}
 
-  // Check phase first (common pattern)
-  if (status.phase) {
-    const phase = String(status.phase)
-    const healthyPhases = ['Running', 'Active', 'Succeeded', 'Ready', 'Healthy', 'Available', 'Bound', 'Complete']
-    const degradedPhases = ['Pending', 'Progressing', 'Unknown', 'Terminating', 'Waiting']
-    const unhealthyPhases = ['Failed', 'Error', 'CrashLoopBackOff', 'ImagePullBackOff', 'ErrImagePull']
-
-    if (healthyPhases.includes(phase)) {
-      return { type: 'healthy', label: phase }
-    }
-    if (degradedPhases.includes(phase)) {
-      return { type: 'degraded', label: phase, message: status.message || status.reason }
-    }
-    if (unhealthyPhases.includes(phase)) {
-      return { type: 'unhealthy', label: phase, message: status.message || status.reason }
-    }
-  }
-
-  // Check conditions
-  if (conditions && Array.isArray(conditions) && conditions.length > 0) {
-    // Look for Ready or Available condition
-    const readyCondition = conditions.find((c: any) =>
-      c.type === 'Ready' || c.type === 'Available' || c.type === 'Healthy'
-    )
-    if (readyCondition) {
-      if (readyCondition.status === 'True') {
-        return { type: 'healthy', label: 'Ready' }
-      }
-      if (readyCondition.status === 'False') {
-        return {
-          type: 'unhealthy',
-          label: 'Not Ready',
-          message: readyCondition.message || readyCondition.reason
-        }
-      }
-    }
-
-    // Check for any False conditions that indicate problems
-    const problemConditions = conditions.filter((c: any) =>
-      c.status === 'False' && ['Ready', 'Available', 'Healthy', 'Initialized'].includes(c.type)
-    )
-    if (problemConditions.length > 0) {
-      const problem = problemConditions[0]
-      return {
-        type: 'unhealthy',
-        label: `${problem.type}: False`,
-        message: problem.message || problem.reason
-      }
-    }
-
-    // Check for warning conditions
-    const warningConditions = conditions.filter((c: any) =>
-      c.status === 'True' && ['Degraded', 'Warning', 'ScalingLimited'].includes(c.type)
-    )
-    if (warningConditions.length > 0) {
-      const warning = warningConditions[0]
-      return {
-        type: 'degraded',
-        label: warning.type,
-        message: warning.message || warning.reason
-      }
-    }
-  }
-
-  // Check replica-based status
-  if (status.replicas !== undefined) {
-    const desired = status.replicas
-    const ready = status.readyReplicas || status.availableReplicas || 0
-    if (desired > 0 && ready >= desired) {
-      return { type: 'healthy', label: `${ready}/${desired} Ready` }
-    }
-    if (desired > 0 && ready > 0) {
-      return { type: 'degraded', label: `${ready}/${desired} Ready` }
-    }
-    if (desired > 0 && ready === 0) {
-      return { type: 'unhealthy', label: `0/${desired} Ready` }
-    }
-  }
-
-  return null
+function getHealthStatus(resource: any): HealthStatusResult | null {
+  const derived = getGenericResourceStatus(resource)
+  if (!derived) return null
+  return { type: BANNER_TYPE[derived.tone], label: derived.text, message: derived.reason }
 }
 
 // ============================================================================
@@ -309,19 +245,23 @@ interface NestedObjectViewerProps {
 
 function NestedObjectViewer({ name, value, depth = 0 }: NestedObjectViewerProps) {
   const [expanded, setExpanded] = useState(depth < 1)
+  const { panelId, buttonProps } = useDisclosure(expanded)
 
   if (Array.isArray(value)) {
     return (
       <div className="text-sm">
         <button
+          {...buttonProps}
           onClick={() => setExpanded(!expanded)}
           className="flex items-center gap-1 text-theme-text-secondary hover:text-theme-text-primary transition-colors"
         >
-          {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+          <CollapseChevron open={expanded} className="w-3.5 h-3.5" />
           <span className="font-medium">{name}</span>
           <span className="text-xs text-theme-text-tertiary">({value.length} items)</span>
         </button>
-        {expanded && (
+        {/* Recursive and unbounded: closed branches unmount so a deep object
+            costs only the rows the user has actually opened. */}
+        <Collapse open={expanded} unmountOnExit id={panelId}>
           <div className="ml-5 mt-1 space-y-1">
             {value.map((item, i) => {
               if (typeof item === 'object' && item !== null) {
@@ -334,7 +274,7 @@ function NestedObjectViewer({ name, value, depth = 0 }: NestedObjectViewerProps)
               )
             })}
           </div>
-        )}
+        </Collapse>
       </div>
     )
   }
@@ -347,14 +287,15 @@ function NestedObjectViewer({ name, value, depth = 0 }: NestedObjectViewerProps)
     return (
       <div className="text-sm">
         <button
+          {...buttonProps}
           onClick={() => setExpanded(!expanded)}
           className="flex items-center gap-1 text-theme-text-secondary hover:text-theme-text-primary transition-colors"
         >
-          {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+          <CollapseChevron open={expanded} className="w-3.5 h-3.5" />
           <span className="font-medium">{name}</span>
           <span className="text-xs text-theme-text-tertiary">({entries.length} fields)</span>
         </button>
-        {expanded && (
+        <Collapse open={expanded} unmountOnExit id={panelId}>
           <div className="ml-5 mt-1 space-y-1">
             {simpleEntries.map(([k, v]) => (
               <div key={k} className="flex items-start gap-2 text-xs">
@@ -366,7 +307,7 @@ function NestedObjectViewer({ name, value, depth = 0 }: NestedObjectViewerProps)
               <NestedObjectViewer key={k} name={formatFieldName(k)} value={v} depth={depth + 1} />
             ))}
           </div>
-        )}
+        </Collapse>
       </div>
     )
   }
@@ -429,7 +370,7 @@ function GenericConditionsSection({ conditions }: { conditions: any[] }) {
                   <span className="text-theme-text-primary font-medium">{cond.type}</span>
                   <span className={clsx(
                     'badge-sm',
-                    isTrue ? 'bg-theme-elevated text-theme-text-secondary' : 'bg-red-500/20 text-red-400'
+                    isTrue ? 'bg-theme-elevated text-theme-text-secondary' : 'status-red'
                   )}>
                     {cond.status}
                   </span>

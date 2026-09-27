@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"sort"
+	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -91,12 +91,7 @@ func computeDriftFromLastApplied(live *unstructured.Unstructured, ignorePointers
 		// back to the textual explainer.
 		return nil
 	}
-	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
-	truncated := false
-	if len(entries) > driftEntryCap {
-		entries = entries[:driftEntryCap]
-		truncated = true
-	}
+	entries, truncated := sortAndCapDriftEntries(entries)
 	return &Drift{
 		Entries:   entries,
 		Source:    DriftSourceLastApplied,
@@ -378,10 +373,7 @@ func filterIgnoredPaths(entries []DriftEntry, pointers []string) []DriftEntry {
 		if p == "" {
 			continue
 		}
-		// "/spec/replicas" → "spec.replicas"
-		p = strings.TrimPrefix(p, "/")
-		p = strings.ReplaceAll(p, "/", ".")
-		prefixes = append(prefixes, p)
+		prefixes = append(prefixes, pointerToDotPath(p))
 	}
 	// Fresh allocation rather than `entries[:0]` aliasing — the caller may
 	// still hold the original slice (e.g., for a pre-filter count or audit
@@ -397,6 +389,29 @@ func filterIgnoredPaths(entries []DriftEntry, pointers []string) []DriftEntry {
 	return out
 }
 
+// pointerToDotPath converts an RFC 6902 JSON pointer ("/spec/template/spec/
+// containers/0/image") into the dot-path shape diffValues emits ("spec.template.
+// spec.containers.[0].image"). Numeric segments are wrapped in brackets to match
+// joinPath, so an ignoreDifferences rule that points into a specific array index
+// still matches the corresponding drift entry.
+func pointerToDotPath(pointer string) string {
+	out := ""
+	for seg := range strings.SplitSeq(strings.TrimPrefix(pointer, "/"), "/") {
+		out = joinPath(out, decodeJSONPointerSegment(seg))
+	}
+	return out
+}
+
+// decodeJSONPointerSegment unescapes an RFC 6901 reference token: "~1" → "/"
+// and "~0" → "~". Order matters (~1 before ~0) so an escaped tilde isn't
+// re-interpreted. Without this, an ignoreDifferences.jsonPointers entry like
+// "/metadata/annotations/example.com~1checksum" wouldn't match the dotted path
+// carrying a literal "/", and the explicitly-ignored field is reported as drift.
+func decodeJSONPointerSegment(seg string) string {
+	seg = strings.ReplaceAll(seg, "~1", "/")
+	return strings.ReplaceAll(seg, "~0", "~")
+}
+
 func pathMatchesAnyPrefix(path string, prefixes []string) bool {
 	for _, prefix := range prefixes {
 		if path == prefix || strings.HasPrefix(path, prefix+".") || strings.HasPrefix(path, prefix+".[") {
@@ -407,9 +422,9 @@ func pathMatchesAnyPrefix(path string, prefixes []string) bool {
 }
 
 // diffValues recursively walks desired vs live and emits entries where they
-// differ. Maps are descended; arrays and scalars are compared by serialized
-// equality (cheaper than deep-comparing array elements field-by-field, and
-// arrays of structs are typically rewritten wholesale anyway). nil/absent
+// differ. Maps and arrays are both descended (arrays element-by-element by
+// index — see the array branch for the order-alignment assumption); scalars are
+// compared by serialized equality. nil/absent
 // values are normalized so {a: nil} and missing-a are treated as equal.
 //
 // out is passed by reference to avoid allocations per recursion level.
@@ -439,8 +454,32 @@ func diffValues(path string, desired, live any, out []DriftEntry) []DriftEntry {
 		}
 		return out
 	}
-	// At least one side is non-map (scalar, array, or one's a map and one's
-	// a scalar — schema mismatch). Compare by serialized form.
+	dArr, dIsArr := desired.([]any)
+	lArr, lIsArr := live.([]any)
+	if dIsArr && lIsArr {
+		// Descend element-by-element by index rather than dumping the whole
+		// array as one entry. A single field changing inside one list element
+		// (e.g. spec.template.spec.containers.[0].resources.limits.memory) then
+		// reads as that one path, not a wall of serialized JSON. Index
+		// alignment is accurate for our inputs: K8s controllers preserve list
+		// order between apply and observe, and the Argo API normalizes both
+		// sides — neither reorders. A length change surfaces the extra/missing
+		// elements as added/removed at their index.
+		n := max(len(dArr), len(lArr))
+		for i := range n {
+			var dv, lv any
+			if i < len(dArr) {
+				dv = dArr[i]
+			}
+			if i < len(lArr) {
+				lv = lArr[i]
+			}
+			out = diffValues(joinPath(path, strconv.Itoa(i)), dv, lv, out)
+		}
+		return out
+	}
+	// At least one side is a scalar, or the two sides have mismatched shapes
+	// (map vs array vs scalar — a schema change). Compare by serialized form.
 	desiredStr := jsonString(desired)
 	liveStr := jsonString(live)
 	if desiredStr == liveStr {
@@ -451,8 +490,8 @@ func diffValues(path string, desired, live any, out []DriftEntry) []DriftEntry {
 
 // joinPath produces dot-notation paths. If the segment looks like an array
 // index, it's wrapped in brackets ("foo.[0].bar"); otherwise concatenated
-// with a dot. Index detection is naive (all-digit) but sufficient — we
-// don't currently descend into arrays anyway.
+// with a dot. diffValues descends into arrays by index, so this is how those
+// element paths are formed.
 func joinPath(prefix, segment string) string {
 	if prefix == "" {
 		return segment

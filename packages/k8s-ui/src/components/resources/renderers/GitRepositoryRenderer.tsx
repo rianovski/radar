@@ -16,7 +16,10 @@ export function GitRepositoryRenderer({ data }: GitRepositoryRendererProps) {
   const artifact = status.artifact || {}
 
   // Convert to unified GitOps status
-  const gitOpsStatus = fluxConditionsToGitOpsStatus(conditions, spec.suspend === true)
+  const gitOpsStatus = fluxConditionsToGitOpsStatus(conditions, spec.suspend === true, {
+    generation: data.metadata?.generation,
+    observedGeneration: status.observedGeneration,
+  })
 
   // Problem detection
   const problems: Array<{ color: 'red' | 'yellow'; message: string }> = []

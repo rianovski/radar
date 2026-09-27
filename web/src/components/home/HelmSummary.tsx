@@ -88,11 +88,13 @@ export function HelmSummary({ data, onNavigate }: HelmSummaryProps) {
             <span className="text-xs font-medium text-theme-text-secondary">
               {data.errorCode === 'unconfigured' ? 'Helm not configured' : 'Helm unavailable'}
             </span>
-            <span className="text-[11px] mt-1 text-center px-2 truncate max-w-full" title={data.error}>
+            <Tooltip content={data.error} wrapperClassName="!block mt-1 min-w-0 text-center">
+            <span className="text-[11px] text-center px-2 truncate max-w-full">
               {data.errorCode === 'unconfigured'
                 ? 'Set rbac.helm=true in the Radar Helm chart values.'
                 : data.error}
             </span>
+            </Tooltip>
           </div>
         ) : !data.releases || data.releases.length === 0 ? (
           <div className="flex items-center justify-center h-full py-4 text-xs text-theme-text-tertiary">

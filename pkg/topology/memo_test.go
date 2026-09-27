@@ -176,6 +176,58 @@ func TestMemoizer_EvictsStaleEntries(t *testing.T) {
 	}
 }
 
+// TestMemoizer_GetIndex_CachesAlongsideTopology pins that GetIndex returns
+// the same *RelationshipsIndex across calls for the same key, proving the
+// lazy index is cached on the memoEntry (not rebuilt per call). T6/T12
+// hot paths depend on this: they call Get + GetIndex on every per-resource
+// request.
+func TestMemoizer_GetIndex_CachesAlongsideTopology(t *testing.T) {
+	m := NewMemoizer(1 * time.Second)
+	topo := &Topology{
+		Nodes: []Node{{ID: "deployment/demo/web", Kind: KindDeployment, Name: "web"}},
+		Edges: []Edge{},
+	}
+	build := func() (*Topology, error) { return topo, nil }
+	opts := DefaultBuildOptions()
+
+	idx1, err := m.GetIndex(opts, build)
+	if err != nil {
+		t.Fatalf("GetIndex 1: %v", err)
+	}
+	idx2, err := m.GetIndex(opts, build)
+	if err != nil {
+		t.Fatalf("GetIndex 2: %v", err)
+	}
+	if idx1 != idx2 {
+		t.Errorf("expected same *RelationshipsIndex across calls (cached), got two distinct pointers")
+	}
+}
+
+// TestMemoizer_GetIndex_ZeroTTL_BuildsInline mirrors TestMemoizer_ZeroTTLDisables:
+// with caching disabled, every GetIndex call must produce a fresh index.
+// Required for tests that drive Memoizer with ttl=0.
+func TestMemoizer_GetIndex_ZeroTTL_BuildsInline(t *testing.T) {
+	m := NewMemoizer(0)
+	topo := &Topology{
+		Nodes: []Node{{ID: "deployment/demo/web", Kind: KindDeployment, Name: "web"}},
+		Edges: []Edge{},
+	}
+	build := func() (*Topology, error) { return topo, nil }
+	opts := DefaultBuildOptions()
+
+	idx1, err := m.GetIndex(opts, build)
+	if err != nil {
+		t.Fatalf("GetIndex 1: %v", err)
+	}
+	idx2, err := m.GetIndex(opts, build)
+	if err != nil {
+		t.Fatalf("GetIndex 2: %v", err)
+	}
+	if idx1 == idx2 {
+		t.Errorf("ttl=0 should rebuild index inline each call, got identical pointers")
+	}
+}
+
 func TestMemoizer_DoesNotCacheErrors(t *testing.T) {
 	m := NewMemoizer(1 * time.Second)
 	var calls int32

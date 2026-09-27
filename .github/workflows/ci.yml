@@ -14,10 +14,10 @@ jobs:
       run:
         working-directory: pkg
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: '1.26'
 
@@ -26,6 +26,11 @@ jobs:
 
       - name: Run tests
         run: go test ./...
+
+      - name: Evaluate workload PromQL in Prometheus
+        env:
+          RADAR_TEST_PROMTOOL_IMAGE: prom/prometheus:v3.5.0
+        run: go test ./prom -run '^TestWorkload(History)?PromQL$' -count=1
 
       - name: Build
         run: go build ./...
@@ -33,19 +38,51 @@ jobs:
   backend:
     name: Backend
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: radar
+          POSTGRES_PASSWORD: radar
+          POSTGRES_DB: radar
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: '1.26'
 
       - name: Download dependencies
         run: go mod download
 
+      - name: Check gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt -w needed on:"
+            echo "$unformatted"
+            exit 1
+          fi
+
       - name: Run tests
         run: go test ./...
+
+      - name: Run PostgreSQL integration tests
+        env:
+          RADAR_TEST_POSTGRES_DSN: postgres://radar:radar@localhost:5432/radar?sslmode=disable
+          # Turns a missing DSN into a failure instead of a silent skip: without
+          # it, losing the service or the env block above would leave the whole
+          # PostgreSQL backend untested while this job still reported green.
+          RADAR_REQUIRE_POSTGRES_TESTS: "1"
+        run: go test ./internal/timeline
 
       - name: Build
         run: go build -o explorer ./cmd/explorer
@@ -54,7 +91,7 @@ jobs:
     name: Frontend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -70,18 +107,60 @@ jobs:
         run: npm run tsc
         working-directory: web
 
+      - name: Test
+        run: npm run test
+        working-directory: web
+
+      - name: Test metrics evidence capture
+        run: node --test scripts/workload-metrics-demo/capture.test.mjs
+
+      - name: Lint
+        run: npm run lint
+        working-directory: web
+
       - name: Build
         run: npm run build
         working-directory: web
+
+  k8s-ui:
+    name: k8s-ui (shared UI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Radar's own type-check covers k8s-ui source through imports, never its tests.
+      - name: Type-check (including tests)
+        run: npm run tsc
+        working-directory: packages/k8s-ui
+
+      - name: Run tests
+        run: npm test
+        working-directory: packages/k8s-ui
 
   helm:
     name: Helm chart
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Helm
         uses: azure/setup-helm@v5
+        with:
+          # Explicit pin (never `latest` — runner caches made green/red a
+          # lottery). Helm 4 on purpose: it's what new users install with,
+          # and lint/template/negative-tests are the chart's user-facing
+          # surface. The unittest step below stays on Helm 3.
+          version: v4.2.3
 
       - name: Lint
         run: helm lint deploy/helm/radar
@@ -114,3 +193,52 @@ jobs:
             echo "ERROR: helm template should have failed with no token set"
             exit 1
           fi
+
+      - name: Render Argo CD integration with inline token
+        run: |
+          helm template radar deploy/helm/radar \
+            --set argocd.token=argo_deadbeef \
+            --set argocd.url=https://argocd.example.com > /dev/null
+
+      - name: Render Argo CD integration with existingSecret
+        run: |
+          helm template radar deploy/helm/radar \
+            --set argocd.existingSecret=my-argo-token > /dev/null
+
+      - name: Reject Argo CD token and existingSecret together
+        run: |
+          if helm template radar deploy/helm/radar \
+            --set argocd.token=argo_deadbeef \
+            --set argocd.existingSecret=my-argo-token 2>/dev/null; then
+            echo "ERROR: helm template should have failed with both token and existingSecret set"
+            exit 1
+          fi
+
+      - name: Render PostgreSQL timeline storage with existingSecret
+        run: |
+          helm template radar deploy/helm/radar \
+            --set timeline.storage=postgres \
+            --set timeline.postgres.existingSecret=radar-postgres \
+            --set timeline.retention=720h > /dev/null
+
+      - name: Reject PostgreSQL storage without existingSecret
+        run: |
+          if helm template radar deploy/helm/radar \
+            --set timeline.storage=postgres 2>/dev/null; then
+            echo "ERROR: helm template should have failed with no existingSecret set"
+            exit 1
+          fi
+
+      - name: Intall helmfile
+        uses: helmfile/helmfile-action@v2.2.0
+        with:
+          helmfile-auto-init: 'true'
+          # Helm 3 ONLY here: helm-unittest cannot run under Helm 4's plugin
+          # layout (fork/exec untt: no such file) — upstream tracking issue
+          # helm-unittest/helm-unittest#777. Lift to 4 when that closes.
+          helm-version: v3.19.0
+          helm-plugins: >
+            https://github.com/helm-unittest/helm-unittest@v1.1.0
+
+      - name: Run all helmfile unittests
+        run: helmfile -f ./deploy/helm/ unittest

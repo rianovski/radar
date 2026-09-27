@@ -6,18 +6,34 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"maps"
 	"net"
+	neturl "net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/skyhook-io/radar/internal/app"
+	"github.com/skyhook-io/radar/internal/argocd"
 	"github.com/skyhook-io/radar/internal/auth"
 	"github.com/skyhook-io/radar/internal/cloud"
 	"github.com/skyhook-io/radar/internal/config"
+	"github.com/skyhook-io/radar/internal/diagnosecli"
 	"github.com/skyhook-io/radar/internal/k8s"
+	mcppkg "github.com/skyhook-io/radar/internal/mcp"
+	"github.com/skyhook-io/radar/internal/memlimit"
+	"github.com/skyhook-io/radar/internal/reachability"
+	"github.com/skyhook-io/radar/internal/server"
+	versionpkg "github.com/skyhook-io/radar/internal/version"
+	"github.com/skyhook-io/radar/pkg/prom"
+	"golang.org/x/net/http/httpguts"
+	authv1 "k8s.io/api/authorization/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth" // Register all auth provider plugins (OIDC, GCP, Azure, etc.)
 	"k8s.io/klog/v2"
 )
@@ -27,7 +43,23 @@ var (
 )
 
 func main() {
+	// Subcommand dispatch (before flag parsing — subcommands own their flags).
+	// `radar diagnose <kind>/<name>` is a thin client for a RUNNING instance.
+	if len(os.Args) > 1 && os.Args[1] == "diagnose" {
+		os.Exit(diagnosecli.Run(os.Args[2:], func(url string) {
+			app.OpenBrowser(url, "")
+		}))
+	}
+
 	startupStart := time.Now()
+
+	// Subcommand dispatch: `radar probe` runs a one-shot reachability probe and
+	// exits - no server, no cluster client. The in-cluster reachability runner
+	// executes this binary in that mode. Intercept before the server flag
+	// parsing, since "probe" is a positional argument, not a flag.
+	if len(os.Args) > 1 && os.Args[1] == "probe" {
+		os.Exit(runProbeCommand(os.Args[2:]))
+	}
 
 	// Propagate the build-time version to the cloud dialer so the agent
 	// advertises the real version (e.g. "1.5.5") on the tunnel handshake
@@ -36,16 +68,46 @@ func main() {
 	// ldflags target so there's a single source of truth.
 	cloud.Version = version
 
+	// The in-cluster reachability probe Job runs the version-matched published
+	// Radar image by default (overridable via --reachability-image / RADAR_IMAGE).
+	// The flag override is applied just after it is parsed (see below) so BOTH the
+	// REST handler and the MCP diagnose(inCluster) path resolve the same image.
+	reachability.DefaultImageRef = "ghcr.io/skyhook-io/radar:" + version
+	// A dev build's git-describe version ("1.10.3-78-gabc123", "dev") is never a
+	// published image tag, so its version-matched default ImagePullBackOffs on
+	// every in-cluster test. Fall back to the latest published release instead -
+	// only for dev-shaped versions; a released binary keeps its exact match.
+	// The release-only lookup is cached and cheap relative to the probe run it precedes.
+	if !versionpkg.IsReleaseVersion(version) {
+		reachability.LatestReleaseImage = func() string {
+			if u := versionpkg.CheckForUpdateRelease(context.Background()); u != nil && u.LatestVersion != "" {
+				return "ghcr.io/skyhook-io/radar:" + u.LatestVersion
+			}
+			return ""
+		}
+	}
+
+	// `radar cloud <sub>` — the one subcommand family, dispatched before flag
+	// parsing. Supported subcommands handle themselves and exit; the reserved
+	// local-preview command exits with in-cluster installation guidance.
+	if len(os.Args) >= 2 && os.Args[1] == "cloud" {
+		runCloudSubcommand()
+	}
+
 	// Load persistent config (~/.radar/config.json) for flag defaults.
 	// CLI flags override config file values.
 	fileCfg := config.Load()
 
 	// Parse flags (defaults come from config file, falling back to hardcoded values)
-	kubeconfig := flag.String("kubeconfig", fileCfg.Kubeconfig, "Path to kubeconfig file (default: ~/.kube/config)")
-	kubeconfigDir := flag.String("kubeconfig-dir", fileCfg.KubeconfigDirsFlag(), "Comma-separated directories containing kubeconfig files (mutually exclusive with --kubeconfig)")
+	kubeconfig := flag.String("kubeconfig", fileCfg.Kubeconfig, "Path to primary kubeconfig file (default: ~/.kube/config)")
+	kubeconfigDir := flag.String("kubeconfig-dir", fileCfg.KubeconfigDirsFlag(), "Comma-separated directories containing additional kubeconfig files")
 	namespace := flag.String("namespace", fileCfg.Namespace, "Initial namespace filter (empty = all namespaces)")
+	namespaces := flag.String("namespaces", fileCfg.NamespacesFlag(), "Initial namespace filters as a comma-separated list (e.g. ns1,ns2,ns3). Use this when you can list resources in specific namespaces but cannot list namespaces cluster-wide.")
 	port := flag.Int("port", fileCfg.PortOr(9280), "Server port")
+	listenAddress := flag.String("listen-address", server.DefaultListenAddress, "HTTP listen IP address (IPv4 or IPv6), or localhost; loopback is local-only, other addresses (including 0.0.0.0) expose shared access")
+	basePath := flag.String("base-path", "", "URL path prefix to serve Radar under, e.g. /radar (empty = root). Use when an ingress forwards a subpath without stripping it.")
 	noBrowser := flag.Bool("no-browser", fileCfg.NoBrowser, "Don't auto-open browser")
+	browser := flag.String("browser", fileCfg.Browser, "Browser to use when opening the UI (default: OS default browser; macOS app names supported)")
 	devMode := flag.Bool("dev", false, "Development mode (serve frontend from filesystem)")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	historyLimit := flag.Int("history-limit", fileCfg.HistoryLimitOr(10000), "Maximum number of events to retain in timeline")
@@ -53,27 +115,68 @@ func main() {
 	fakeInCluster := flag.Bool("fake-in-cluster", false, "Simulate in-cluster mode for testing (shows kubectl copy buttons instead of port-forward)")
 	disableHelmWrite := flag.Bool("disable-helm-write", false, "Simulate restricted Helm permissions (disables install/upgrade/rollback/uninstall)")
 	disableExec := flag.Bool("disable-exec", false, "Simulate restricted exec permissions (disables terminal, debug shell)")
-	disableLocalTerminal := flag.Bool("disable-local-terminal", false, "Disable local terminal feature")
+	disableLocalTerminal := flag.Bool("disable-local-terminal", false, "Disable the host local terminal")
 	podShellDefault := flag.String("pod-shell-default", "", "Override the default pod exec shell command (runs as 'sh -c <value>'; empty = built-in bash -il → ash → sh cascade)")
+	debugImage := flag.String("debug-image", fileCfg.DebugImage, "Image for ephemeral debug containers and node debug pods (empty = busybox:latest; point at a mirror for air-gapped/private-registry clusters)")
+	reachabilityImage := flag.String("reachability-image", fileCfg.ReachabilityImage, "Image for the in-cluster reachability probe Job (empty = RADAR_IMAGE env, then the version-matched published Radar image; point at a mirror for air-gapped clusters)")
+	listPageSize := flag.Int64("list-page-size", 0, "Paginate the initial LIST of high-cardinality kinds (Pods, ReplicaSets) at this page size on clusters without WatchList streaming. 0 = off (single LIST). Try 2000 if a very large cluster fails to sync.")
+	namespaceScope := flag.Bool("namespace-scope", false, "Scope namespaced informer caches to a single namespace (multiple namespaces are not supported yet). Requires --namespace or a kubeconfig context namespace. Local mode can rescope by switching namespaces; auth/cloud mode locks to the startup namespace.")
 	// Timeline storage options
-	timelineStorage := flag.String("timeline-storage", fileCfg.TimelineStorageOr("memory"), "Timeline storage backend: memory or sqlite")
+	timelineStorage := flag.String("timeline-storage", fileCfg.TimelineStorageOr("memory"), "Timeline storage backend: memory, sqlite, or postgres")
 	timelineDBPath := flag.String("timeline-db", fileCfg.TimelineDBPath, "Path to timeline database file (default: ~/.radar/timeline.db)")
-	timelineRetention := flag.Duration("timeline-retention", fileCfg.TimelineRetentionOr(7*24*time.Hour), "How long to retain timeline events when --timeline-storage=sqlite (e.g. 168h, 720h). 0 disables cleanup (unbounded growth).")
+	timelineRetention := flag.Duration("timeline-retention", fileCfg.TimelineRetentionOr(7*24*time.Hour), "How long to retain timeline events when --timeline-storage=sqlite or postgres (e.g. 168h, 720h). 0 disables age-based cleanup.")
+	timelineMaxSize := flag.String("timeline-max-size", fileCfg.TimelineMaxSizeOr("1Gi"), "Maximum SQLite timeline storage size before pruning oldest events (e.g. 800Mi, 8Gi). 0 disables size-based pruning.")
+	// AI investigation history
+	aiHistory := flag.Bool("ai-history", fileCfg.AIHistoryOr(true), "Persist AI investigations (transcripts + conclusions) to ~/.radar/ai-runs.db so they survive restarts")
 	// Traffic/metrics options
 	prometheusURL := flag.String("prometheus-url", fileCfg.PrometheusURL, "Manual Prometheus/VictoriaMetrics URL (skips auto-discovery)")
+	workloadSingleCluster := flag.Bool("prometheus-single-cluster", false, "Optional workload-metrics scope override: assert that the backend contains only this Kubernetes cluster. Replaces automatic matching; not saved, and cleared when the cluster, backend or credentials change. Does not scope other metrics features.")
+	workloadClusterLabels := map[string]string{}
+	flag.Func("prometheus-cluster-label", "Optional workload-metrics scope override: exact label=value identifying this cluster, e.g. cluster=production (repeatable, ANDed). Alternative to --prometheus-single-cluster, with the same lifetime and workload-only scope; leave both unset for automatic matching.", func(raw string) error {
+		key, value, ok := strings.Cut(raw, "=")
+		if !ok {
+			return fmt.Errorf("expected label=value")
+		}
+		if _, err := (prom.WorkloadMetricsScope{ClusterLabels: map[string]string{key: value}}).Matchers(); err != nil {
+			return err
+		}
+		if _, exists := workloadClusterLabels[key]; exists {
+			return fmt.Errorf("duplicate cluster label %q", key)
+		}
+		workloadClusterLabels[key] = value
+		return nil
+	})
+	openCostCurrency := flag.String("opencost-currency", fileCfg.OpenCostCurrency, "Override the ISO 4217 currency label for OpenCost values (empty: auto-detect, then USD)")
+	// --prometheus-header Key=Value, repeatable. Defaults populated from
+	// config file; any --prometheus-header flag replaces the file value rather
+	// than merging — matches kubectl semantics (file is the default, CLI wins).
+	promHeaders := newHeaderFlag(fileCfg.PrometheusHeaders)
+	flag.Var(promHeaders, "prometheus-header", "HTTP header to send with Prometheus requests, e.g. 'Authorization=Bearer <token>' (repeatable). Required for auth-protected backends.")
+	promHeadersFromEnv := newHeaderFromEnvFlag(fileCfg.PrometheusHeadersFromEnv)
+	flag.Var(promHeadersFromEnv, "prometheus-header-from-env", "HTTP header to send with Prometheus requests, sourced from an env var, e.g. 'Authorization=PROMETHEUS_TOKEN' (repeatable).")
+	beylaJobSelector := flag.String("beyla-job-selector", "", `PromQL matcher fragment for Beyla Live Traffic, e.g. 'job=~"my-beyla.*"' (empty = *beyla* or *alloy* jobs). Workload charts use this override only with an explicit Prometheus scope flag and accept one job equality or regex matcher; automatic workload matching discovers custom jobs without it.`)
 	// MCP server
 	noMCP := flag.Bool("no-mcp", !fileCfg.MCPEnabledOr(true), "Disable MCP (Model Context Protocol) server for AI tools")
+	mcpCatalogStdio := flag.Bool("mcp-catalog-stdio", false, "Start only the MCP catalog over stdio for registry/inspector introspection; skips Kubernetes initialization")
+	mcpCatalogOnly := flag.Bool("mcp-catalog-only", false, "Start only the MCP endpoint for registry/inspector catalog introspection; skips Kubernetes initialization")
 	// Auth flags
 	authMode := flag.String("auth-mode", "none", "Authentication mode: none, proxy, or oidc")
 	authSecret := flag.String("auth-secret", "", "HMAC secret key for session cookies (auto-generated if empty)")
 	authCookieTTL := flag.Duration("auth-cookie-ttl", 4*time.Hour, "Session cookie TTL (sliding — extends on activity)")
 	authUserHeader := flag.String("auth-user-header", "X-Forwarded-User", "Header for username (proxy mode)")
 	authGroupsHeader := flag.String("auth-groups-header", "X-Forwarded-Groups", "Header for groups (proxy mode)")
+	authProxyLogoutURL := flag.String("auth-proxy-logout-url", "", "URL the logout button redirects to in proxy mode, to tear down the upstream proxy session (e.g. oauth2-proxy's /oauth2/sign_out). The proxy must actually invalidate the session at this URL — Radar only clears its own cookie (Basic Auth has no logout). Empty = clear Radar's cookie only.")
 	authOIDCIssuer := flag.String("auth-oidc-issuer", "", "OIDC issuer URL")
+	authOIDCInternalIssuer := flag.String("auth-oidc-internal-issuer", "", "Internal OIDC issuer base URL used by Radar for discovery and derived server-side endpoints; tokens are still validated against --auth-oidc-issuer")
+	authOIDCAuthorizationURL := flag.String("auth-oidc-authorization-url", "", "Browser-facing OIDC authorization endpoint URL (overrides discovery)")
+	authOIDCTokenURL := flag.String("auth-oidc-token-url", "", "Server-side OIDC token endpoint URL (overrides discovery)")
+	authOIDCUserInfoURL := flag.String("auth-oidc-userinfo-url", "", "Server-side OIDC userinfo endpoint URL (overrides discovery)")
+	authOIDCJWKSURL := flag.String("auth-oidc-jwks-url", "", "Server-side OIDC JWKS endpoint URL (overrides discovery)")
 	authOIDCClientID := flag.String("auth-oidc-client-id", "", "OIDC client ID")
 	authOIDCClientSecret := flag.String("auth-oidc-client-secret", "", "OIDC client secret")
 	authOIDCRedirectURL := flag.String("auth-oidc-redirect-url", "", "OIDC redirect URL")
 	authOIDCGroupsClaim := flag.String("auth-oidc-groups-claim", "groups", "JWT claim for groups")
+	authOIDCScopes := flag.String("auth-oidc-scopes", "openid,profile,email,groups", "Comma-separated OAuth2 scopes requested at OIDC authorization (e.g. 'openid,profile,email,groups,offline_access')")
 	authOIDCPostLogoutRedirectURL := flag.String("auth-oidc-post-logout-redirect-url", "", "URL to redirect after OIDC provider logout (must be registered with IdP)")
 	authOIDCUsernamePrefix := flag.String("auth-oidc-username-prefix", "", "Prefix added to OIDC username for K8s impersonation (must match kube-apiserver --oidc-username-prefix)")
 	authOIDCGroupsPrefix := flag.String("auth-oidc-groups-prefix", "", "Prefix added to OIDC groups for K8s impersonation (must match kube-apiserver --oidc-groups-prefix)")
@@ -81,26 +184,53 @@ func main() {
 	authOIDCCACert := flag.String("auth-oidc-ca-cert", "", "Path to CA certificate file for OIDC provider TLS verification")
 	authOIDCBackchannelLogout := flag.Bool("auth-oidc-backchannel-logout", false, "Enable OIDC Back-Channel Logout endpoint (single-replica only)")
 	authAPIKeysFile := flag.String("auth-api-keys-file", "", "Path to API keys JSON file (default: ~/.config/radar/api-keys.json when auth is enabled)")
-	// Radar Cloud flags — enable hosted mode when --cloud-url is set.
+	authOIDCEnablePKCE := flag.Bool("auth-oidc-enable-pkce", false, "Enable PKCE (S256) for the OIDC authorization-code flow (opt-in)")
+	// Radar Hub flags — enable connected mode when --cloud-url is set.
 	// Local-binary behavior is unchanged when these flags are empty. Each
 	// flag falls back to an env var so Kubernetes deployments can source
 	// the token from a Secret without exposing it in `ps` output.
-	cloudURL := flag.String("cloud-url", os.Getenv("RADAR_CLOUD_URL"), "Radar Cloud WebSocket URL (e.g. wss://api.radarhq.io/agent) — empty = local-only. Env: RADAR_CLOUD_URL")
-	cloudToken := flag.String("cloud-token", os.Getenv("RADAR_CLOUD_TOKEN"), "Cluster token from the Radar Cloud install wizard (rhc_<random>). Env: RADAR_CLOUD_TOKEN")
-	cloudClusterName := flag.String("cluster-name", os.Getenv("RADAR_CLOUD_CLUSTER_NAME"), "Human-readable cluster name for Radar Cloud (required with --cloud-url). Env: RADAR_CLOUD_CLUSTER_NAME")
+	cloudURL := flag.String("cloud-url", os.Getenv("RADAR_CLOUD_URL"), "Radar Hub WebSocket URL (e.g. wss://api.radarhq.io/agent) — empty = local-only. Env: RADAR_CLOUD_URL")
+	cloudToken := flag.String("cloud-token", os.Getenv("RADAR_CLOUD_TOKEN"), "Connection token from the Radar install flow (rhc_<random>). Env: RADAR_CLOUD_TOKEN")
+	cloudClusterName := flag.String("cluster-name", os.Getenv("RADAR_CLOUD_CLUSTER_NAME"), "Human-readable cluster name shown in Radar (required with --cloud-url). Env: RADAR_CLOUD_CLUSTER_NAME")
+	cloudInsecureSkipVerify := flag.Bool("cloud-insecure-skip-verify", os.Getenv("RADAR_CLOUD_INSECURE_SKIP_VERIFY") == "true", "Skip TLS verification on the Radar Hub tunnel — for trials against a Radar Cloud Self-Managed control plane with a self-signed cert (insecure: encrypted but not authenticated). Env: RADAR_CLOUD_INSECURE_SKIP_VERIFY")
+	// Tunable deadlines for slow / high-latency / SSH-tunneled clusters.
+	// Defaults preserve the original behavior. Each flag falls back to an
+	// environment variable so Kubernetes deployments can source values from
+	// a ConfigMap without exposing them in `ps`. Precedence: CLI flag wins
+	// when explicitly set; otherwise env var; otherwise the default.
+	contextSwitchTimeout := flag.Duration("context-switch-timeout", k8s.EnvDurationOr("RADAR_CONTEXT_SWITCH_TIMEOUT", 30*time.Second), "Maximum time a kubeconfig context switch may take (default: 30s). Widen to 120s or more for clusters reached over high-latency tunnels. Env: RADAR_CONTEXT_SWITCH_TIMEOUT")
+	firstPaintBackstop := flag.Duration("first-paint-backstop", k8s.EnvDurationOr("RADAR_FIRST_PAINT_BACKSTOP", 5*time.Minute), "Hard upper bound on the initial critical-cache sync wait before Radar falls through to partial-data render (default: 5m). Env: RADAR_FIRST_PAINT_BACKSTOP")
+	namespaceListTimeout := flag.Duration("namespace-list-timeout", k8s.EnvDurationOr("RADAR_NAMESPACE_LIST_TIMEOUT", 5*time.Second), "Timeout for the cluster-wide namespace LIST used to decide if the user is RBAC-namespace-restricted (default: 5s). Widen to 30s or more on slow control planes — a timeout here is misreported in the UI as 'Limited list — RBAC'. Env: RADAR_NAMESPACE_LIST_TIMEOUT")
+	maxScopeCandidates := flag.Int("max-scope-candidates", k8s.EnvIntOr("RADAR_MAX_SCOPE_CANDIDATES", 20), "Cap on the namespace-fallback probe fanout for users who can list namespaces cluster-wide but not list a specific kind cluster-wide (default: 20). Raise for clusters with more than 20 namespaces to avoid silently marking kinds as denied in dropped namespaces. Env: RADAR_MAX_SCOPE_CANDIDATES")
 	flag.Parse()
+	if *workloadSingleCluster || len(workloadClusterLabels) > 0 {
+		if _, err := (prom.WorkloadMetricsScope{SingleCluster: *workloadSingleCluster, ClusterLabels: workloadClusterLabels}).Matchers(); err != nil {
+			log.Fatalf("Invalid workload metrics scope: %v", err)
+		}
+	}
 
-	// Cloud-mode: Radar runs inside a customer cluster and fronts Radar
-	// Cloud. Under cloud-mode the tunnel is the only path to this listener
-	// and it delivers Cloud-authenticated identity headers on every request.
+	// An explicit --reachability-image override applies to BOTH probe paths. It must
+	// win over the in-cluster self-read, so record it as the configured override
+	// (checked ABOVE self-read), not as DefaultImageRef (the last-resort fallback,
+	// below self-read - which would let radar's own pod image beat the operator's
+	// explicit choice on the MCP path). REST passes the config as the override arg;
+	// MCP has no server config, so it relies on this. Air-gapped mirrors work on both.
+	if *reachabilityImage != "" {
+		reachability.SetConfiguredImage(*reachabilityImage)
+	}
+
+	// Cloud-mode: Radar runs inside a customer cluster and connects to Radar Hub.
+	// The ordinary TCP listener is health-only; the full handler is served over
+	// the authenticated tunnel, which marks requests in-process before proxy
+	// identity headers are accepted.
 	// Force --auth-mode=proxy so Radar impersonates the Cloud user against
 	// the K8s API instead of falling back to the ServiceAccount (which would
 	// give every Cloud user full SA permissions).
 	// Read once via the cloud package so we use the same normalized
 	// parser (strconv.ParseBool — accepts true/1/T/TRUE etc.) as every
-	// other site that reads RADAR_CLOUD_MODE. cloud.LogStartupMode
-	// emits the resolved value below regardless of true/false so the
-	// deployment topology is obvious in startup logs.
+	// other site that reads RADAR_CLOUD_MODE. The resolved mode is included
+	// in both the preflight line (so early failures retain it) and the startup
+	// summary after the HTTP listener binds.
 	cloudMode := cloud.Mode()
 	if cloudMode {
 		if *authMode != "none" && *authMode != "proxy" {
@@ -113,11 +243,6 @@ func main() {
 		*authGroupsHeader = "X-Forwarded-Groups"
 		log.Printf("[cloud] RADAR_CLOUD_MODE=true: auth-mode forced to proxy, trusting tunnel-supplied identity headers")
 	}
-	// Always log the resolved cloud mode (true OR false) so deployment
-	// topology is visible in chart-install logs even when an operator
-	// expected Cloud mode but typo'd the env var.
-	cloud.LogStartupMode()
-
 	if *showVersion {
 		fmt.Printf("radar %s\n", version)
 		os.Exit(0)
@@ -130,7 +255,12 @@ func main() {
 	_ = flag.Set("alsologtostderr", "false")
 	klog.SetOutput(os.Stderr)
 
-	log.Printf("Radar %s starting...", version)
+	startupMode := "local"
+	if cloudMode {
+		startupMode = "Radar Cloud"
+	}
+	log.Printf("Radar %s starting (mode=%s, auth=%s)...", version, startupMode, *authMode)
+	memlimit.Apply()
 
 	// Default API keys file path when auth is enabled
 	if *authAPIKeysFile == "" && *authMode != "none" {
@@ -146,8 +276,99 @@ func main() {
 	default:
 		log.Fatalf("Invalid --auth-mode %q: must be none, proxy, or oidc", *authMode)
 	}
-	if *kubeconfig != "" && *kubeconfigDir != "" {
-		log.Fatalf("--kubeconfig and --kubeconfig-dir are mutually exclusive")
+	normalizedListenAddress, err := server.NormalizeListenAddress(*listenAddress)
+	if err != nil {
+		log.Fatalf("Invalid --listen-address %q: %v", *listenAddress, err)
+	}
+	normalizedBasePath, err := server.NormalizeBasePath(*basePath)
+	if err != nil {
+		log.Fatalf("Invalid --base-path %q: %v", *basePath, err)
+	}
+	// Radar Hub forwards root-relative paths over the tunnel and the ordinary
+	// listener is health-only at the literal /api/health, so a prefixed router
+	// would 404 both. Fail loudly instead of coming up broken. Both Cloud
+	// signals are checked because the chart sets them together but they are
+	// independent inputs, and either one alone is enough to break the prefix.
+	if normalizedBasePath != "" && (*cloudURL != "" || cloud.Mode()) {
+		log.Fatalf("--base-path is not supported in Radar Cloud mode (--cloud-url / RADAR_CLOUD_MODE): Radar Cloud owns the URL path")
+	}
+	timelineMaxSizeBytes, err := config.ParseByteSize(*timelineMaxSize)
+	if err != nil {
+		log.Fatalf("Invalid --timeline-max-size %q: %v", *timelineMaxSize, err)
+	}
+	normalizedOpenCostCurrency, err := config.NormalizeOpenCostCurrency(*openCostCurrency)
+	if err != nil {
+		log.Fatalf("Invalid --opencost-currency %q: %v", *openCostCurrency, err)
+	}
+	noMCPFlagSet := false
+	kubeconfigFlagSet := false
+	kubeconfigDirsFlagSet := false
+	namespaceFlagSet := false
+	namespacesFlagSet := false
+	openCostCurrencyFlagSet := false
+	prometheusURLFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "no-mcp":
+			noMCPFlagSet = true
+		case "kubeconfig":
+			kubeconfigFlagSet = true
+		case "kubeconfig-dir":
+			kubeconfigDirsFlagSet = true
+		case "namespace":
+			namespaceFlagSet = true
+		case "namespaces":
+			namespacesFlagSet = true
+		case "opencost-currency":
+			openCostCurrencyFlagSet = true
+		case "prometheus-url":
+			prometheusURLFlagSet = true
+		}
+	})
+	if *mcpCatalogOnly && noMCPFlagSet && *noMCP {
+		log.Fatalf("--mcp-catalog-only cannot be combined with --no-mcp")
+	}
+	if *mcpCatalogStdio && noMCPFlagSet && *noMCP {
+		log.Fatalf("--mcp-catalog-stdio cannot be combined with --no-mcp")
+	}
+	inheritsPrometheusHeaders := !promHeaders.overrides && len(fileCfg.PrometheusHeaders) > 0 ||
+		!promHeadersFromEnv.overrides && len(fileCfg.PrometheusHeadersFromEnv) > 0
+	if err := app.ValidatePrometheusHeaderDestination(fileCfg.PrometheusURL, *prometheusURL, inheritsPrometheusHeaders); err != nil {
+		log.Fatalf("Invalid Prometheus header configuration: %v", err)
+	}
+	resolvedPrometheusHeaders, err := app.ResolvePrometheusHeaders(promHeaders.value(), promHeadersFromEnv.value())
+	if err != nil {
+		log.Fatalf("Invalid Prometheus header configuration: %v", err)
+	}
+	resolvedNamespace, resolvedNamespaces, err := app.ResolveNamespaceSelection(*namespace, *namespaces, namespaceFlagSet, namespacesFlagSet)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	if *namespaceScope && len(resolvedNamespaces) > 1 {
+		log.Fatalf("--namespace-scope supports a single namespace; use --namespace instead of --namespaces with multiple values")
+	}
+	if *namespaceScope && len(resolvedNamespaces) == 1 {
+		resolvedNamespace = resolvedNamespaces[0]
+		resolvedNamespaces = nil
+	}
+	if len(resolvedNamespaces) > *maxScopeCandidates {
+		log.Fatalf("--namespaces lists %d namespaces but the RBAC probe fanout cap is %d; raise --max-scope-candidates (or RADAR_MAX_SCOPE_CANDIDATES) to cover all of them", len(resolvedNamespaces), *maxScopeCandidates)
+	}
+	resolvedKubeconfig, resolvedKubeconfigDirs := app.ResolveKubeconfigSelection(
+		*kubeconfig, *kubeconfigDir, kubeconfigFlagSet, kubeconfigDirsFlagSet,
+	)
+	mcpEnabled := !*noMCP
+	if *mcpCatalogOnly || *mcpCatalogStdio {
+		mcpEnabled = true
+	}
+
+	// Hub origin overrides for self-hosted control planes. When only the API
+	// origin is set, the frontend origin defaults to the same host — the
+	// self-hosted stack serves web + API from one origin; the hosted pair
+	// (api./app.radarhq.io) stays the default otherwise.
+	hubAPIURL, hubAppURL, err := cloud.ResolveHubOriginsFromEnv()
+	if err != nil {
+		log.Fatalf("%v", err)
 	}
 
 	var apiKeyStore *auth.APIKeyStore
@@ -161,36 +382,73 @@ func main() {
 	}
 
 	cfg := app.AppConfig{
-		Kubeconfig:           *kubeconfig,
-		KubeconfigDirs:       app.ParseKubeconfigDirs(*kubeconfigDir),
-		Namespace:            *namespace,
-		Port:                 *port,
-		NoBrowser:            *noBrowser,
-		DevMode:              *devMode,
-		HistoryLimit:         *historyLimit,
-		DebugEvents:          *debugEvents,
-		FakeInCluster:        *fakeInCluster,
-		DisableHelmWrite:     *disableHelmWrite,
-		DisableExec:          *disableExec,
-		DisableLocalTerminal: *disableLocalTerminal,
-		PodShellDefault:      *podShellDefault,
-		TimelineStorage:      *timelineStorage,
-		TimelineDBPath:       *timelineDBPath,
-		TimelineRetention:    *timelineRetention,
-		PrometheusURL:        *prometheusURL,
-		MCPEnabled:           !*noMCP,
-		Version:              version,
+		Kubeconfig:               resolvedKubeconfig,
+		KubeconfigDirs:           resolvedKubeconfigDirs,
+		Namespace:                resolvedNamespace,
+		Namespaces:               resolvedNamespaces,
+		Port:                     *port,
+		ListenAddress:            normalizedListenAddress,
+		ShowRemoteAccessHint:     true,
+		BasePath:                 normalizedBasePath,
+		NoBrowser:                *noBrowser,
+		Browser:                  *browser,
+		DevMode:                  *devMode,
+		HistoryLimit:             *historyLimit,
+		DebugEvents:              *debugEvents,
+		FakeInCluster:            *fakeInCluster,
+		DisableHelmWrite:         *disableHelmWrite,
+		DisableExec:              *disableExec,
+		DisableLocalTerminal:     *disableLocalTerminal,
+		PodShellDefault:          *podShellDefault,
+		DebugImage:               *debugImage,
+		ReachabilityImage:        *reachabilityImage,
+		ListPageSize:             *listPageSize,
+		NamespaceScope:           *namespaceScope,
+		TimelineStorage:          *timelineStorage,
+		TimelineDBPath:           *timelineDBPath,
+		TimelinePostgresDSN:      os.Getenv("RADAR_TIMELINE_POSTGRES_DSN"),
+		TimelineRetention:        *timelineRetention,
+		TimelineMaxSizeBytes:     timelineMaxSizeBytes,
+		PrometheusURL:            *prometheusURL,
+		OpenCostCurrency:         normalizedOpenCostCurrency,
+		OpenCostFlagSet:          openCostCurrencyFlagSet,
+		CostSource:               fileCfg.CostSource,
+		KubecostURL:              fileCfg.KubecostURL,
+		KubecostAPIKey:           fileCfg.KubecostAPIKey,
+		KubecostAPIKeyContext:    fileCfg.KubecostAPIKeyContext,
+		KubecostClusterID:        fileCfg.KubecostClusterID,
+		KubecostClusterIDContext: fileCfg.KubecostClusterIDContext,
+		PrometheusHeaders:        resolvedPrometheusHeaders,
+		PrometheusHeadersFromEnv: promHeadersFromEnv.value(),
+		PrometheusURLFlag:        prometheusURLFlagSet,
+		PrometheusHeaderFlags:    promHeaders.overrides || promHeadersFromEnv.overrides,
+		BeylaJobSelector:         *beylaJobSelector,
+		WorkloadMetricsScope:     prom.WorkloadMetricsScope{SingleCluster: *workloadSingleCluster, ClusterLabels: workloadClusterLabels},
+		MCPEnabled:               mcpEnabled,
+		AIHistory:                *aiHistory,
+		AIHistoryDBPath:          fileCfg.AIHistoryDBPath,
+		Version:                  version,
+		HubAPIURL:                hubAPIURL,
+		HubAppURL:                hubAppURL,
+		CloudTunnelConfigured:    *cloudURL != "",
 		AuthConfig: auth.Config{
 			Mode:                      *authMode,
 			Secret:                    *authSecret,
 			CookieTTL:                 *authCookieTTL,
 			UserHeader:                *authUserHeader,
 			GroupsHeader:              *authGroupsHeader,
+			ProxyLogoutURL:            *authProxyLogoutURL,
 			OIDCIssuer:                *authOIDCIssuer,
+			OIDCInternalIssuer:        *authOIDCInternalIssuer,
+			OIDCAuthorizationURL:      *authOIDCAuthorizationURL,
+			OIDCTokenURL:              *authOIDCTokenURL,
+			OIDCUserInfoURL:           *authOIDCUserInfoURL,
+			OIDCJWKSURL:               *authOIDCJWKSURL,
 			OIDCClientID:              *authOIDCClientID,
 			OIDCClientSecret:          *authOIDCClientSecret,
 			OIDCRedirectURL:           *authOIDCRedirectURL,
 			OIDCGroupsClaim:           *authOIDCGroupsClaim,
+			OIDCScopes:                parseCSV(*authOIDCScopes),
 			OIDCPostLogoutRedirectURL: *authOIDCPostLogoutRedirectURL,
 			OIDCUsernamePrefix:        *authOIDCUsernamePrefix,
 			OIDCGroupsPrefix:          *authOIDCGroupsPrefix,
@@ -198,11 +456,43 @@ func main() {
 			OIDCCACert:                *authOIDCCACert,
 			OIDCBackchannelLogout:     *authOIDCBackchannelLogout,
 			APIKeys:                   apiKeyStore,
+			OIDCEnablePKCE:            *authOIDCEnablePKCE,
 		},
 	}
 
 	// Set global flags
 	app.SetGlobals(cfg)
+
+	if *mcpCatalogStdio {
+		log.Printf("MCP catalog stdio mode enabled: skipping Kubernetes initialization")
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := mcppkg.RunStdio(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Fatalf("MCP stdio server failed: %v", err)
+		}
+		return
+	}
+
+	if *mcpCatalogOnly {
+		log.Printf("MCP catalog-only mode enabled: skipping Kubernetes initialization")
+		cfg.NoBrowser = true
+		srv := app.CreateServer(cfg)
+		_, rootCancel := startServer(srv, startupStart)
+		defer rootCancel()
+		select {}
+	}
+
+	// Apply tunable k8s deadlines BEFORE any goroutine reads them. The
+	// setter is a no-op for zero values (preserves the default); each non-
+	// zero entry mutates the corresponding exported variable in the k8s
+	// package. Must run before InitializeK8s so the first connect attempt
+	// already observes the operator-chosen bounds.
+	k8s.ConfigureDeadlines(k8s.DeadlineOptions{
+		ContextSwitchTimeout: *contextSwitchTimeout,
+		FirstPaintBackstop:   *firstPaintBackstop,
+		NamespaceListTimeout: *namespaceListTimeout,
+		MaxScopeCandidates:   *maxScopeCandidates,
+	})
 
 	// Initialize K8s client (local only — parses kubeconfig, no network)
 	t := time.Now()
@@ -211,9 +501,25 @@ func main() {
 	}
 	k8s.LogTiming(" K8s client init: %v", time.Since(t))
 
+	// Provision the Argo CD integration from the environment (RADAR_ARGOCD_TOKEN
+	// or RADAR_ARGOCD_TOKEN_FILE) when set — for headless / in-cluster / Cloud
+	// deployments with no interactive Settings session. Runs before the server
+	// serves; inert when no token env is present (the local/UI path is unchanged).
+	// A misconfigured env credential is logged and skipped (fail-closed: no token
+	// is seeded, so the deep diff just falls back to annotation drift) rather than
+	// crashing Radar's core cluster-visibility over an optional integration.
+	if seeded, err := argocd.SeedFromEnvVars(); err != nil {
+		log.Printf("[argocd] ERROR: ignoring the environment Argo CD config: %v", err)
+	} else if seeded {
+		log.Printf("[argocd] integration provisioned from the environment (read-only in Settings)")
+	}
+
 	// Build timeline config and register callbacks
 	t = time.Now()
-	timelineStoreCfg := app.BuildTimelineStoreConfig(cfg)
+	timelineStoreCfg, err := app.BuildTimelineStoreConfig(cfg)
+	if err != nil {
+		log.Fatalf("Invalid timeline configuration: %v", err)
+	}
 	app.RegisterCallbacks(cfg, timelineStoreCfg)
 	k8s.LogTiming(" Callbacks registered: %v", time.Since(t))
 
@@ -222,11 +528,88 @@ func main() {
 	srv := app.CreateServer(cfg)
 	k8s.LogTiming(" Server created: %v", time.Since(t))
 
+	rootCtx, rootCancel := startServer(srv, startupStart)
+	defer rootCancel()
+
+	// Open browser — server is confirmed ready to accept connections
+	if !cfg.NoBrowser {
+		targetURL := "http://" + srv.ActualAddr() + cfg.BasePath
+		if cfg.BasePath != "" {
+			targetURL += "/"
+		}
+		if len(cfg.Namespaces) > 0 {
+			targetURL += "?namespaces=" + neturl.QueryEscape(strings.Join(cfg.Namespaces, ","))
+		} else if cfg.Namespace != "" {
+			targetURL += "?namespace=" + neturl.QueryEscape(cfg.Namespace)
+		}
+		go app.OpenBrowser(targetURL, cfg.Browser)
+	}
+
+	// Now initialize cluster connection and caches (browser will see progress via SSE)
+	app.InitializeCluster()
+	k8s.LogTiming(" Total startup (to connected): %v", time.Since(startupStart))
+
+	// When --cloud-url is set, dial out to Radar Hub and serve the
+	// existing router over yamux-tunneled streams. No behavior change
+	// when empty.
+	if *cloudURL != "" {
+		if *cloudToken == "" || *cloudClusterName == "" {
+			log.Fatalf("--cloud-url requires --cloud-token and --cluster-name")
+		}
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[cloud] panic in cloud tunnel: %v — local Radar continues to serve", r)
+				}
+			}()
+			// Try to discover the external API server URL from
+			// kube-public/cluster-info so the hub can correlate this
+			// cluster against Argo CD's destination references. Best-
+			// effort: empty when the ConfigMap is absent (managed K8s)
+			// or RBAC denies the read. 3s timeout — the connect path
+			// shouldn't block on a single ConfigMap GET.
+			discoverCtx, cancel := context.WithTimeout(rootCtx, 3*time.Second)
+			apiServerURL := cloud.DiscoverAPIServerURL(discoverCtx, k8s.GetClient())
+			cancel()
+			namespace := os.Getenv("MY_POD_NAMESPACE")
+			deploymentName := os.Getenv("MY_DEPLOYMENT_NAME")
+			helmRelease := os.Getenv("RADAR_HELM_RELEASE")
+			runErr := cloud.Run(rootCtx, cloud.Config{
+				URL:                *cloudURL,
+				Token:              *cloudToken,
+				ClusterID:          *cloudClusterName,
+				ClusterName:        *cloudClusterName,
+				Namespace:          namespace,
+				Release:            helmRelease,
+				APIServerURL:       apiServerURL,
+				InsecureSkipVerify: *cloudInsecureSkipVerify,
+				// Ask the apiserver whether this ServiceAccount may actually
+				// patch its own Deployment. Env presence is NOT the signal:
+				// identity ships on every install for read-only
+				// self-description, and a chart-set marker would go stale on
+				// exactly the path that matters — Hub's self-upgrade patches
+				// only the image, leaving an older pod template in place.
+				SelfUpgradeAvailable: func() bool { return canSelfUpgrade(rootCtx, k8s.GetClient(), namespace, deploymentName) },
+				Handler:              srv.Handler(),
+			})
+			if runErr != nil && !errors.Is(runErr, context.Canceled) {
+				log.Printf("[cloud] tunnel exited: %v", runErr)
+			}
+		}()
+	}
+
+	// Track opens and maybe prompt to star the repo on GitHub (non-blocking)
+	app.MaybePromptGitHubStar()
+
+	// Block forever (server is running in background)
+	select {}
+}
+
+func startServer(srv *server.Server, startupStart time.Time) (context.Context, context.CancelFunc) {
 	// Root context cancelled on SIGINT/SIGTERM. Long-running background
 	// workers (cloud tunnel, etc.) observe this to shut down cleanly before
 	// the process exits.
 	rootCtx, rootCancel := context.WithCancel(context.Background())
-	defer rootCancel()
 
 	// Handle shutdown signals
 	sigCh := make(chan os.Signal, 1)
@@ -254,51 +637,211 @@ func main() {
 	k8s.LogTiming(" Server listening: %v (since start)", time.Since(startupStart))
 
 	// Write port file so MCP clients can discover the running server
-	app.WriteMCPPortFile(srv.ActualPort())
+	app.WriteMCPPortFile(srv.ActualAddr(), srv.BasePath())
 
-	// Open browser — server is confirmed ready to accept connections
-	if !cfg.NoBrowser {
-		url := fmt.Sprintf("http://localhost:%d", cfg.Port)
-		if cfg.Namespace != "" {
-			url += fmt.Sprintf("?namespace=%s", cfg.Namespace)
+	return rootCtx, rootCancel
+}
+
+func parseCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
 		}
-		go app.OpenBrowser(url)
 	}
+	return out
+}
 
-	// Now initialize cluster connection and caches (browser will see progress via SSE)
-	app.InitializeCluster()
-	k8s.LogTiming(" Total startup (to connected): %v", time.Since(startupStart))
+// headerFlag is a flag.Value that accumulates repeated --prometheus-header
+// Key=Value pairs into a map. The first Set call after construction wipes any
+// defaults populated from the config file (kubectl-style: file = default, CLI
+// wins outright instead of merging).
+type headerFlag struct {
+	m         map[string]string
+	overrides bool
+}
 
-	// When --cloud-url is set, dial out to Radar Cloud and serve the
-	// existing router over yamux-tunneled streams. No behavior change
-	// when empty.
-	if *cloudURL != "" {
-		if *cloudToken == "" || *cloudClusterName == "" {
-			log.Fatalf("--cloud-url requires --cloud-token and --cluster-name")
+func newHeaderFlag(defaults map[string]string) *headerFlag {
+	out := make(map[string]string, len(defaults))
+	for k, v := range defaults {
+		if !httpguts.ValidHeaderFieldName(k) {
+			log.Printf("[config] Dropping invalid prometheus header name %q (must be RFC 7230 tokens)", k)
+			continue
 		}
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("[cloud] panic in cloud tunnel: %v — local Radar continues to serve", r)
-				}
-			}()
-			runErr := cloud.Run(rootCtx, cloud.Config{
-				URL:         *cloudURL,
-				Token:       *cloudToken,
-				ClusterID:   *cloudClusterName,
-				ClusterName: *cloudClusterName,
-				Namespace:   os.Getenv("MY_POD_NAMESPACE"),
-				Handler:     srv.Handler(),
-			})
-			if runErr != nil && !errors.Is(runErr, context.Canceled) {
-				log.Printf("[cloud] tunnel exited: %v", runErr)
-			}
-		}()
+		if !httpguts.ValidHeaderFieldValue(v) {
+			log.Printf("[config] Dropping prometheus header %q: value contains control characters", k)
+			continue
+		}
+		out[k] = v
 	}
+	return &headerFlag{m: out}
+}
 
-	// Track opens and maybe prompt to star the repo on GitHub (non-blocking)
-	app.MaybePromptGitHubStar()
+// value returns a defensive copy of the accumulated headers (nil if empty).
+func (h *headerFlag) value() map[string]string {
+	if len(h.m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(h.m))
+	maps.Copy(out, h.m)
+	return out
+}
 
-	// Block forever (server is running in background)
-	select {}
+func (h *headerFlag) String() string {
+	if len(h.m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(h.m))
+	for k := range h.m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+h.m[k])
+	}
+	return strings.Join(parts, ",")
+}
+
+func (h *headerFlag) Set(raw string) error {
+	idx := strings.IndexByte(raw, '=')
+	if idx <= 0 {
+		return fmt.Errorf("expected Key=Value, got %q", raw)
+	}
+	key := strings.TrimSpace(raw[:idx])
+	val := raw[idx+1:]
+	if key == "" {
+		return fmt.Errorf("empty header key in %q", raw)
+	}
+	// Reject anything net/http would silently corrupt or refuse at send time
+	// (control bytes, separators in the key, CR/LF in the value — the classic
+	// CRLF-injection vector for header smuggling).
+	if !httpguts.ValidHeaderFieldName(key) {
+		return fmt.Errorf("invalid header name %q (must be RFC 7230 tokens)", key)
+	}
+	if !httpguts.ValidHeaderFieldValue(val) {
+		return fmt.Errorf("invalid header value for %q (control characters not allowed)", key)
+	}
+	if !h.overrides {
+		// First CLI flag wipes file defaults — all-or-nothing replacement.
+		h.m = make(map[string]string)
+		h.overrides = true
+	}
+	h.m[key] = val
+	return nil
+}
+
+type headerFromEnvFlag struct {
+	m         map[string]string
+	overrides bool
+}
+
+func newHeaderFromEnvFlag(defaults map[string]string) *headerFromEnvFlag {
+	out := make(map[string]string, len(defaults))
+	for k, v := range defaults {
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if !httpguts.ValidHeaderFieldName(k) {
+			log.Printf("[config] Dropping invalid prometheus header-from-env name %q (must be RFC 7230 tokens)", k)
+			continue
+		}
+		if !app.ValidEnvVarName(v) {
+			log.Printf("[config] Dropping prometheus header-from-env %q: invalid env var name %q", k, v)
+			continue
+		}
+		out[k] = v
+	}
+	return &headerFromEnvFlag{m: out}
+}
+
+func (h *headerFromEnvFlag) value() map[string]string {
+	if len(h.m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(h.m))
+	maps.Copy(out, h.m)
+	return out
+}
+
+func (h *headerFromEnvFlag) String() string {
+	if len(h.m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(h.m))
+	for k := range h.m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+h.m[k])
+	}
+	return strings.Join(parts, ",")
+}
+
+func (h *headerFromEnvFlag) Set(raw string) error {
+	idx := strings.IndexByte(raw, '=')
+	if idx <= 0 {
+		return fmt.Errorf("expected Key=ENV_VAR, got %q", raw)
+	}
+	key := strings.TrimSpace(raw[:idx])
+	envName := strings.TrimSpace(raw[idx+1:])
+	if key == "" {
+		return fmt.Errorf("empty header key in %q", raw)
+	}
+	if !httpguts.ValidHeaderFieldName(key) {
+		return fmt.Errorf("invalid header name %q (must be RFC 7230 tokens)", key)
+	}
+	if !app.ValidEnvVarName(envName) {
+		return fmt.Errorf("invalid env var name %q for header %q", envName, key)
+	}
+	if !h.overrides {
+		h.m = make(map[string]string)
+		h.overrides = true
+	}
+	h.m[key] = envName
+	return nil
+}
+
+// canSelfUpgrade reports whether Radar's ServiceAccount may patch its own
+// Deployment, which is what rbac.selfUpgrade's Role grants. Advertising this
+// to Hub from anything other than the apiserver's own answer produces an
+// upgrade button that 403s: a chart-set env marker is invisible to an
+// image-only self-upgrade, and identity env vars ship unconditionally.
+func canSelfUpgrade(ctx context.Context, client kubernetes.Interface, namespace, deploymentName string) bool {
+	if namespace == "" || deploymentName == "" {
+		return false
+	}
+	if client == nil {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	// Every operation the endpoint performs, not just the mutation: it gets the
+	// Deployment, reads the Helm release manifest out of the storage Secrets,
+	// then patches. A stock chart grants these together, but a BYO-RBAC install
+	// can pass a patch-only probe and still fail mid-upgrade.
+	//
+	// The Deployment reviews MUST name it: rbac.selfUpgrade's Role is scoped
+	// with resourceNames, so an unnamed "can I patch deployments here" review
+	// answers no even where self-upgrade is correctly enabled.
+	for _, probe := range []authv1.ResourceAttributes{
+		{Namespace: namespace, Group: "apps", Resource: "deployments", Name: deploymentName, Verb: "get"},
+		{Namespace: namespace, Group: "apps", Resource: "deployments", Name: deploymentName, Verb: "patch"},
+		{Namespace: namespace, Resource: "secrets", Verb: "list"},
+	} {
+		review := &authv1.SelfSubjectAccessReview{
+			Spec: authv1.SelfSubjectAccessReviewSpec{ResourceAttributes: &probe},
+		}
+		result, err := client.AuthorizationV1().SelfSubjectAccessReviews().Create(probeCtx, review, metav1.CreateOptions{})
+		if err != nil {
+			log.Printf("[cloud] self-upgrade capability probe failed, advertising unavailable: %v", err)
+			return false
+		}
+		if !result.Status.Allowed {
+			return false
+		}
+	}
+	return true
 }

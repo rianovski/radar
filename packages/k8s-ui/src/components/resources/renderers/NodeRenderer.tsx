@@ -3,14 +3,17 @@ import { clsx } from 'clsx'
 import { Section, PropertyList, Property, ConditionsSection, AlertBanner } from '../../ui/drawer-components'
 import { MetricsChart } from '../../ui/MetricsChart'
 import { formatMemoryString } from '../../../utils/format'
+import { getExtendedCapacityRows } from '../../../utils/extended-resources'
 import type { MetricsDataPoint } from '../../../types/core'
+import { MetricsUnavailableNotice } from './MetricsUnavailableNotice'
 
 interface NodeRendererProps {
   data: any
   relationships?: { pods?: any[] }
   onViewPods?: () => void
   metrics?: { usage?: { cpu: string; memory: string }; timestamp?: string }
-  metricsHistory?: { dataPoints?: MetricsDataPoint[]; collectionError?: string }
+  metricsHistory?: { dataPoints?: MetricsDataPoint[]; collectionError?: string; metricsUnavailableReason?: string; metricsUnavailableDiagnosis?: string }
+  metricsUnavailable?: boolean
   hideMetricsServer?: boolean
 }
 
@@ -25,16 +28,12 @@ function formatStorage(value: string | undefined): string {
   return formatMemory(value)
 }
 
-// Extract problems from node status and spec
+// Extract genuine problems from node status. Cordoned (unschedulable) is
+// deliberately NOT included here — it's an intentional operator action
+// (cordon/drain), surfaced separately as a calm advisory, not a red error.
 function getNodeProblems(data: any): string[] {
   const problems: string[] = []
   const conditions = data.status?.conditions || []
-  const spec = data.spec || {}
-
-  // Check if unschedulable
-  if (spec.unschedulable) {
-    problems.push('Node is cordoned (unschedulable)')
-  }
 
   for (const cond of conditions) {
     // NotReady is a problem when status is not True
@@ -62,7 +61,7 @@ function getNodeProblems(data: any): string[] {
   return problems
 }
 
-export function NodeRenderer({ data, relationships, onViewPods, metrics, metricsHistory, hideMetricsServer }: NodeRendererProps) {
+export function NodeRenderer({ data, relationships, onViewPods, metrics, metricsHistory, metricsUnavailable, hideMetricsServer }: NodeRendererProps) {
   const status = data.status || {}
   const spec = data.spec || {}
   const metadata = data.metadata || {}
@@ -76,6 +75,10 @@ export function NodeRenderer({ data, relationships, onViewPods, metrics, metrics
   // Check for problems
   const problems = getNodeProblems(data)
   const hasProblems = problems.length > 0
+  const isCordoned = !!spec.unschedulable
+  const showMetricsUnavailable = !!metricsUnavailable && !metricsHistory?.collectionError
+  const hasMetricsHistory = !!metricsHistory?.dataPoints?.length
+  const currentMetrics = metricsUnavailable ? undefined : metrics
 
   // Extract platform info from labels
   const instanceType = labels['node.kubernetes.io/instance-type']
@@ -87,9 +90,21 @@ export function NodeRenderer({ data, relationships, onViewPods, metrics, metrics
 
   return (
     <>
-      {/* Problems alert - shown at top when there are issues */}
+      {/* Problems alert - shown at top when there are genuine issues */}
       {hasProblems && (
         <AlertBanner variant="error" title="Issues Detected" items={problems} />
+      )}
+
+      {/* Cordoned is intentional but consequential — it removes scheduling
+          capacity and a forgotten cordon strands a node. So it's a warning (amber),
+          matching the node table badge + the Cordoned audit check — NOT the calm
+          sky of a no-op intentional state (suspended/idle), and not a red error. */}
+      {isCordoned && (
+        <AlertBanner
+          variant="warning"
+          title="Cordoned (unschedulable)"
+          message="New pods won't be scheduled here. Uncordon to resume scheduling."
+        />
       )}
 
       {/* Node Info */}
@@ -112,13 +127,13 @@ export function NodeRenderer({ data, relationships, onViewPods, metrics, metrics
               label: 'CPU',
               capacity: capacity.cpu,
               allocatable: allocatable.cpu,
-              inUse: metrics?.usage?.cpu,
+              inUse: currentMetrics?.usage?.cpu,
             },
             {
               label: 'Memory',
               capacity: formatMemory(capacity.memory),
               allocatable: formatMemory(allocatable.memory),
-              inUse: metrics?.usage?.memory ? formatMemory(metrics.usage.memory) : undefined,
+              inUse: currentMetrics?.usage?.memory ? formatMemory(currentMetrics.usage.memory) : undefined,
             },
             {
               label: 'Pods',
@@ -132,6 +147,12 @@ export function NodeRenderer({ data, relationships, onViewPods, metrics, metrics
               allocatable: formatStorage(allocatable['ephemeral-storage']),
               inUse: undefined,
             },
+            ...getExtendedCapacityRows(capacity, allocatable).map((row) => ({
+              label: row.key,
+              capacity: row.capacity,
+              allocatable: row.allocatable,
+              inUse: undefined,
+            })),
           ].map((row) => (
             <div key={row.label} className="card-inner">
               <div className="text-xs font-medium text-theme-text-secondary mb-1">{row.label}</div>
@@ -166,15 +187,18 @@ export function NodeRenderer({ data, relationships, onViewPods, metrics, metrics
       </Section>
 
       {/* Resource Usage (from metrics-server) — hidden when Prometheus has CPU/memory data */}
-      {!hideMetricsServer && (metrics?.usage || metricsHistory?.dataPoints?.length || metricsHistory?.collectionError) && (
+      {!hideMetricsServer && (currentMetrics?.usage || hasMetricsHistory || metricsHistory?.collectionError || showMetricsUnavailable) && (
         <Section title="Resource Usage" icon={Activity} defaultExpanded>
-          {metricsHistory?.collectionError && !metricsHistory?.dataPoints?.length && (
+          {showMetricsUnavailable && (
+            <MetricsUnavailableNotice rawError={metricsHistory?.metricsUnavailableReason} diagnosis={metricsHistory?.metricsUnavailableDiagnosis} />
+          )}
+          {metricsHistory?.collectionError && (
             <div className="mb-3 rounded-lg border border-yellow-500/30 bg-yellow-500/5 px-3 py-2 text-xs text-yellow-400">
               <span className="font-medium">Metrics collection error:</span>{' '}
               <span className="break-all">{metricsHistory.collectionError}</span>
             </div>
           )}
-          {metricsHistory?.dataPoints && metricsHistory.dataPoints.length > 0 ? (
+          {hasMetricsHistory && metricsHistory?.dataPoints ? (
             <div className="space-y-4">
               {/* CPU Usage with Chart */}
               <div className="card-inner-lg">
@@ -208,7 +232,7 @@ export function NodeRenderer({ data, relationships, onViewPods, metrics, metrics
                 />
               </div>
             </div>
-          ) : metrics?.usage ? (
+          ) : showMetricsUnavailable ? null : currentMetrics?.usage ? (
             /* Fallback to simple display if no history yet */
             <div className="space-y-3">
               <div className="card-inner-lg">
@@ -216,7 +240,7 @@ export function NodeRenderer({ data, relationships, onViewPods, metrics, metrics
                   <span className="text-sm font-medium text-theme-text-primary">CPU</span>
                 </div>
                 <div className="flex items-baseline gap-2">
-                  <span className="text-lg font-medium text-blue-400">{metrics.usage.cpu}</span>
+                  <span className="text-lg font-medium text-blue-400">{currentMetrics.usage.cpu}</span>
                   <span className="text-sm text-theme-text-tertiary">
                     / {allocatable.cpu || capacity.cpu || '?'} allocatable
                   </span>
@@ -227,7 +251,7 @@ export function NodeRenderer({ data, relationships, onViewPods, metrics, metrics
                   <span className="text-sm font-medium text-theme-text-primary">Memory</span>
                 </div>
                 <div className="flex items-baseline gap-2">
-                  <span className="text-lg font-medium text-purple-400">{formatMemory(metrics.usage.memory)}</span>
+                  <span className="text-lg font-medium text-purple-400">{formatMemory(currentMetrics.usage.memory)}</span>
                   <span className="text-sm text-theme-text-tertiary">
                     / {formatMemory(allocatable.memory) || formatMemory(capacity.memory) || '?'} allocatable
                   </span>
@@ -237,9 +261,9 @@ export function NodeRenderer({ data, relationships, onViewPods, metrics, metrics
           ) : (
             <div className="text-xs text-theme-text-tertiary">Collecting metrics data...</div>
           )}
-          {metrics?.timestamp && (
+          {!showMetricsUnavailable && currentMetrics?.timestamp && (
             <div className="mt-2 text-xs text-theme-text-tertiary">
-              Last updated: {new Date(metrics.timestamp).toLocaleTimeString()}
+              Last updated: {new Date(currentMetrics.timestamp).toLocaleTimeString()}
             </div>
           )}
         </Section>
@@ -277,9 +301,9 @@ export function NodeRenderer({ data, relationships, onViewPods, metrics, metrics
               <div key={`${taint.key}-${taint.effect}-${i}`} className="text-sm">
                 <span className={clsx(
                   'badge',
-                  taint.effect === 'NoSchedule' ? 'bg-yellow-500/20 text-yellow-400' :
-                  taint.effect === 'NoExecute' ? 'bg-red-500/20 text-red-400' :
-                  'bg-blue-500/20 text-blue-400'
+                  taint.effect === 'NoSchedule' ? 'status-amber' :
+                  taint.effect === 'NoExecute' ? 'status-red' :
+                  'status-blue'
                 )}>
                   {taint.key}{taint.value ? `=${taint.value}` : ''}:{taint.effect}
                 </span>

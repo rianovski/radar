@@ -1,0 +1,215 @@
+# One Backup per phase in the v1.18 enum - all 13.
+#
+# Six raise nothing on the strength of the phase alone: Completed, New, Queued,
+# ReadyToStart, InProgress, Deleting. A phase here raising an issue BECAUSE OF
+# THE PHASE is the regression this file exists to catch.
+#
+# One exception, and it is about age rather than phase: InProgress,
+# WaitingForPluginOperations and Finalizing raise VeleroRunStalled once they have
+# sat longer than Velero allows a single operation. phase-inprogress here starts
+# ~31h ago and is expected to raise it — that is the surface working, not a
+# regression. Deleting is deliberately not in that set: its startTimestamp
+# belongs to the original run, so it can never be timed.
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-completed
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  completionTimestamp: "@now-1864m"
+  phase: Completed
+  progress:
+    itemsBackedUp: 841
+    totalItems: 841
+  startTimestamp: "@now-1870m"
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-deleting
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  phase: Deleting
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-failed
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  completionTimestamp: "@now-1864m"
+  errors: 12
+  failureReason: "error uploading backup tarball: RequestError: send request failed"
+  phase: Failed
+  startTimestamp: "@now-1870m"
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-failedvalidation
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  phase: FailedValidation
+  validationErrors:
+    - a BackupStorageLocation CRD for the location nonexistent was not found
+    - include-resources and exclude-resources overlap
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-finalizing
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  phase: Finalizing
+  startTimestamp: "@now-1870m"
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-finalizing-partial
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  errors: 1
+  phase: FinalizingPartiallyFailed
+  startTimestamp: "@now-1870m"
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-inprogress
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  phase: InProgress
+  progress:
+    itemsBackedUp: 412
+    totalItems: 841
+  startTimestamp: "@now-1870m"
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-new
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  phase: New
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-partiallyfailed
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  completionTimestamp: "@now-1864m"
+  errors: 9
+  phase: PartiallyFailed
+  startTimestamp: "@now-1870m"
+  warnings: 3
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-queued
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  phase: Queued
+  queuePosition: 3
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-readytostart
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  phase: ReadyToStart
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-waitingforpluginoperations
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  phase: WaitingForPluginOperations
+  progress:
+    itemsBackedUp: 100
+    totalItems: 100
+  startTimestamp: "@now-1870m"
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: phase-waitingforpluginoperations-partial
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  errors: 2
+  phase: WaitingForPluginOperationsPartiallyFailed
+  progress:
+    itemsBackedUp: 118
+    totalItems: 120
+  startTimestamp: "@now-1870m"
+  warnings: 5

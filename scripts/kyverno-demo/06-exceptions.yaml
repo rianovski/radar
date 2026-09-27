@@ -1,0 +1,45 @@
+# PolicyException in BOTH API families.
+#
+# This is the sharpest collision in the integration: same Kind, same plural
+# (`policyexceptions`), served by kyverno.io/v2 AND policies.kyverno.io/v1,
+# with genuinely different spec shapes. One renderer handles both via
+# group-qualified accessors — reading spec.exceptions off a modern object
+# yields nothing, which on this surface would read as "no policies are
+# excepted" for an object whose entire purpose is to except them.
+#
+# Requires features.policyExceptions.enabled=true, which the bootstrap script
+# sets. Kyverno disables exceptions by default.
+---
+# Modern shape: policyRefs (with a Kind, since a ref can point at
+# ValidatingPolicy or ImageValidatingPolicy) + CEL matchConditions.
+apiVersion: policies.kyverno.io/v1
+kind: PolicyException
+metadata:
+  name: modern-exempt-monitoring
+  namespace: policy-demo
+spec:
+  policyRefs:
+    - name: require-run-as-nonroot
+      kind: ValidatingPolicy
+  matchConditions:
+    - name: only-monitoring-pods
+      expression: "object.metadata.name.startsWith('prometheus-')"
+---
+# Legacy shape: exceptions[].policyName + ruleNames (CEL policies have no
+# named rules, which is why the modern shape drops them) + an any/all match
+# block instead of CEL conditions.
+apiVersion: kyverno.io/v2
+kind: PolicyException
+metadata:
+  name: legacy-exempt-latest-tag
+  namespace: policy-demo
+spec:
+  exceptions:
+    - policyName: legacy-disallow-latest-tag
+      ruleNames:
+        - validate-image-tag
+  match:
+    any:
+      - resources:
+          kinds: [Pod]
+          namespaces: [policy-demo]

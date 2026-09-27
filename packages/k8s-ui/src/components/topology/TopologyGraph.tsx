@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ReactFlow,
   ReactFlowProvider,
   Background,
-  Controls,
+  Panel,
   useNodesState,
   useEdgesState,
   useReactFlow,
@@ -14,23 +14,31 @@ import {
   type NodeTypes,
   type NodeChange,
   type Viewport,
+  type FitViewOptions,
   BackgroundVariant,
   MarkerType,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { toCanvas } from 'html-to-image'
 
-import { AlertTriangle, Download, LayoutGrid, Loader2, Maximize, Minus, Pause, Play, Plus, RotateCw, Shield, Workflow } from 'lucide-react'
+import { AlertTriangle, ChevronsDownUp, ChevronsUpDown, Download, Info, Layers, LayoutGrid, Loader2, Maximize, Minus, Pause, Play, Plus, RotateCw, Shield } from 'lucide-react'
 import { PaneLoader } from '../ui/PaneLoader'
+import { Collapse, CollapseChevron, useDisclosure } from '../ui/Collapse'
+import { TopologyOverlayBar } from './TopologyOverlayBar'
+import { Input } from '../ui/Input'
 import { Tooltip } from '../ui/Tooltip'
 import { useToast } from '../ui/Toast'
 import { useRegisterShortcuts } from '../../hooks/useKeyboardShortcuts'
 
 import { K8sResourceNode } from './K8sResourceNode'
 import { GroupNode } from './GroupNode'
-import { buildHierarchicalElkGraph, applyHierarchicalLayout, getGroupKey, type GroupDisplayLevel } from './layout'
-import type { Topology, TopologyNode, TopologyEdge, ViewMode, GroupingMode } from '../../types'
+import { NEUTRAL_OWNER, type WorkloadFocus } from '../../utils/workload-colors'
+import { ownershipOf } from '../../utils/topology-neighborhood'
+import { buildHierarchicalElkGraph, applyHierarchicalLayout, getGroupKey, isGroupEffectivelyCollapsed, type GroupDisplayLevel } from './layout'
+import type { Topology, TopologyNode, TopologyEdge, ViewMode, GroupingMode, HealthStatus } from '../../types'
 import { pluralize } from '../../utils/pluralize'
+import { foldHash } from '../../utils/structure-hash'
+import { recordLayoutDuration, recordLayoutSkipped, recordStructureKeyDuration } from '../../perf'
 
 // Edge colors by type
 const EDGE_COLORS = {
@@ -49,22 +57,67 @@ function getEdgeColor(type: string, isTrafficView: boolean): string {
   return EDGE_COLORS[type as keyof typeof EDGE_COLORS] || '#64748b'
 }
 
+// Human-readable edge legend for the resources view (traffic view is all-green).
+const EDGE_LEGEND: { label: string; color: string }[] = [
+  { label: 'owns', color: EDGE_COLORS['manages'] },
+  { label: 'exposes', color: EDGE_COLORS['exposes'] },
+  { label: 'configures', color: EDGE_COLORS['configures'] },
+  { label: 'scales', color: EDGE_COLORS['uses'] },
+  { label: 'routes to', color: EDGE_COLORS['routes-to'] },
+]
+
 // Memoized edge style cache to avoid creating new objects on every render
 const edgeStyleCache = new Map<string, React.CSSProperties>()
 
-function getEdgeStyle(type: string, isTrafficView: boolean, isTrafficEdge: boolean, animated: boolean): React.CSSProperties {
-  const cacheKey = `${type}-${isTrafficView}-${isTrafficEdge}-${animated}`
+function getEdgeStyle(type: string, isTrafficView: boolean, isTrafficEdge: boolean, animated: boolean, partial: boolean, isRolloutTrafficEdge: boolean): React.CSSProperties {
+  const cacheKey = `${type}-${isTrafficView}-${isTrafficEdge}-${animated}-${partial}-${isRolloutTrafficEdge}`
   let style = edgeStyleCache.get(cacheKey)
   if (!style) {
     const edgeColor = getEdgeColor(type, isTrafficView)
+    const dashed = (isTrafficView && isTrafficEdge && animated) || (isRolloutTrafficEdge && animated)
     style = {
       stroke: edgeColor,
       strokeWidth: isTrafficView ? 2 : 1.5,
-      strokeDasharray: isTrafficView && isTrafficEdge && animated ? '5 5' : undefined,
+      strokeDasharray: partial ? '6 3' : dashed ? '5 5' : undefined,
     }
     edgeStyleCache.set(cacheKey, style)
   }
   return style
+}
+
+// A Rollout canary/stable (weighted) or blue-green active/preview Service
+// edge — set server-side via a fixed label vocabulary (pkg/topology
+// builder.go's "Check Rollouts" block). These carry a live traffic split
+// worth animating even outside the separate Network Flow view, since that
+// view doesn't build Rollout nodes/edges at all — this is the only place
+// they render.
+function isRolloutTrafficEdgeLabel(label: TopologyEdge['label']): boolean {
+  return typeof label === 'string' && (label === 'Active' || label === 'Preview' || label.startsWith('Canary') || label.startsWith('Stable'))
+}
+
+// Reachability outcome → edge color/dash, set by the Reachability view via
+// TopologyEdge.reachOutcome (distinct from policyEffect, a NetworkPolicy concept).
+// Honest + DISTINCT: "blocked" (a CONSEQUENCE - downstream of a real break) is a gray
+// DASH; "not-tested" (ABSENCE of probe data) is a lighter DOTTED line. Neither is ever
+// a flowing/green edge that implies traffic crosses a break.
+const REACH_COLORS: Record<string, string> = {
+  verified: '#22c55e',
+  reached: '#22c55e',
+  unreachable: '#ef4444',
+  blocked: '#94a3b8',
+  'not-tested': '#cbd5e1',
+}
+const REACH_DASH: Record<string, string | undefined> = {
+  reached: '5 4', // dashed green - reached, but only via the proxy (not real-traffic verified)
+  blocked: '6 3', // dashed gray - a consequence of an upstream break
+  'not-tested': '2 4', // dotted - we have no probe data, not a failure
+}
+function reachEdgeStyle(o: string): React.CSSProperties {
+  return {
+    stroke: REACH_COLORS[o] || '#94a3b8',
+    strokeWidth: 2,
+    strokeDasharray: REACH_DASH[o],
+  }
 }
 
 // Threshold for disabling edge animations (performance optimization)
@@ -81,7 +134,10 @@ function buildEdges(
   groupingMode: GroupingMode,
   isTrafficView: boolean,
   nodeToGroup?: Map<string, string>,
-  nodeCount?: number
+  nodeCount?: number,
+  groupLevels?: Map<string, GroupDisplayLevel>,
+  smartDefaultActive = false,
+  nodes?: TopologyNode[],
 ): Edge[] {
   const edges: Edge[] = []
   const seenEdgeIds = new Set<string>() // O(1) duplicate detection
@@ -100,33 +156,69 @@ function buildEdges(
     }
   }
 
+  // nodeId -> trafficRole, so a Rollout->ReplicaSet or ReplicaSet/Rollout->Pod
+  // ownership edge can animate too when it leads to a canary/stable/active/
+  // preview node - the "active DAG" should read as a continuous path from the
+  // Service all the way down to the pods actually serving that role, not stop
+  // at the Rollout.
+  const nodeTrafficRoleById = new Map<string, string>()
+  if (nodes) {
+    for (const n of nodes) {
+      const role = (n.data as Record<string, unknown> | undefined)?.trafficRole
+      if (typeof role === 'string' && role) {
+        nodeTrafficRoleById.set(n.id, role)
+      }
+    }
+  }
+
   for (const edge of topologyEdges) {
     let source = edge.source
     let target = edge.target
 
-    // If source is in a collapsed group, point to the group instead
+    // If source is in a collapsed group, point to the group instead. Same
+    // predicate as ELK node placement (isGroupEffectivelyCollapsed) so a
+    // rendered edge never references a member hidden inside a chip.
     const sourceGroup = nodeGroupMap.get(source)
-    if (sourceGroup && collapsedGroups.has(sourceGroup)) {
+    if (sourceGroup && isGroupEffectivelyCollapsed(sourceGroup, collapsedGroups, groupLevels, smartDefaultActive)) {
       source = sourceGroup
     }
 
     // If target is in a collapsed group, point to the group instead
     const targetGroup = nodeGroupMap.get(target)
-    if (targetGroup && collapsedGroups.has(targetGroup)) {
+    if (targetGroup && isGroupEffectivelyCollapsed(targetGroup, collapsedGroups, groupLevels, smartDefaultActive)) {
       target = targetGroup
     }
 
     // Skip self-loops (both ends in same collapsed group)
     if (source === target) continue
 
-    // Skip duplicate edges (O(1) with Set)
-    const edgeId = `${source}-${target}-${edge.type}`
+    // Skip duplicate edges (O(1) with Set). Include the reachability outcome and
+    // label in the key: two route edges between the same source/target/type but
+    // with different outcomes (one verified, one unreachable) are DISTINCT routes -
+    // collapsing them would drop the failing route from the diagram.
+    const edgeId = `${source}-${target}-${edge.type}${edge.partial ? '-partial' : ''}${edge.reachOutcome ? `-${edge.reachOutcome}` : ''}${edge.label ? `-${edge.label}` : ''}`
     if (seenEdgeIds.has(edgeId)) continue
     seenEdgeIds.add(edgeId)
 
-    const edgeColor = getEdgeColor(edge.type, isTrafficView)
+    const reach = edge.reachOutcome
+    const edgeColor = reach ? (REACH_COLORS[reach] || '#94a3b8') : getEdgeColor(edge.type, isTrafficView)
     const isTrafficEdge = edge.type === 'routes-to' || edge.type === 'exposes'
-    const animated = enableAnimations && isTrafficView && isTrafficEdge
+    // Exposes: detected via the fixed label vocabulary (Canary/Stable/Active/
+    // Preview) set server-side on Service->Rollout edges. Manages: the SAME
+    // path continued down through Rollout->ReplicaSet and ReplicaSet/Rollout->
+    // Pod ownership edges, detected via the target node's own trafficRole
+    // (also set server-side) rather than a label, since an ownership edge
+    // carries no label today and doesn't need one just for this.
+    const isRolloutTrafficEdge =
+      (edge.type === 'exposes' && isRolloutTrafficEdgeLabel(edge.label)) ||
+      (edge.type === 'manages' && nodeTrafficRoleById.has(edge.target))
+    // A reachability edge never animates (a dashed "blocked" must not look like flow).
+    // Rollout canary/stable/active/preview edges animate regardless of view mode —
+    // they only exist in the resources-view topology, so gating on isTrafficView
+    // (the separate Network Flow view) would mean they never animate at all.
+    const animated = enableAnimations && !reach && !edge.partial && (
+      (isTrafficView && isTrafficEdge) || isRolloutTrafficEdge
+    )
 
     edges.push({
       id: edgeId,
@@ -134,13 +226,19 @@ function buildEdges(
       target,
       type: 'smoothstep',
       animated,
+      // labelTitle (declared route when the label shows an overridden tested
+      // path) renders as a native SVG <title> tooltip inside React Flow's edge
+      // text - keeps the declared path available without overwriting the label.
+      label: edge.labelTitle
+        ? (<>{edge.label}<title>{edge.labelTitle}</title></>)
+        : (edge.label || undefined),
       markerEnd: {
         type: MarkerType.ArrowClosed,
         color: edgeColor,
         width: 12,
         height: 12,
       },
-      style: getEdgeStyle(edge.type, isTrafficView, isTrafficEdge, animated),
+      style: reach ? reachEdgeStyle(reach) : getEdgeStyle(edge.type, isTrafficView, isTrafficEdge, animated, edge.partial === true, isRolloutTrafficEdge),
     })
   }
 
@@ -167,12 +265,43 @@ interface TopologyGraphProps {
   onTogglePause?: () => void
   /** Called when user clicks "maximize" on a namespace group — sets namespace filter to just that namespace */
   onMaximizeNamespace?: (namespace: string) => void
-  /** Shown as a breadcrumb label when viewing a single namespace */
-  namespaceBreadcrumb?: string
-  /** Called when breadcrumb "back" is clicked to return to all-namespace view */
-  onClearNamespace?: () => void
   /** Serialized namespace filter — when this changes, reset groupLevels for fresh smart default */
   namespacesKey?: string
+  /** Node to pan/zoom the canvas to. Bump focusNonce to re-trigger for the same id. */
+  focusNodeId?: string
+  /** Increment to request a focus on focusNodeId (lets the same node be re-focused). */
+  focusNonce?: number
+  /** Application graph hover-focus (see WorkloadFocus): when set, nodes outside
+   *  the focused workload's neighborhood dim. Cheap node-data toggle — never
+   *  re-layouts. */
+  focusedOwnerId?: WorkloadFocus
+  /** Hover a node → reports its TopologyNode (null on leave). Drives the rail's
+   *  reciprocal highlight. */
+  onNodeHover?: (node: TopologyNode | null) => void
+  /** Toggle a stable Deployment's normally-collapsed ReplicaSet tier. */
+  onToggleReplicaSets?: (ownerID: string) => void
+  /** Padding reserved around fit-to-view operations for overlaid UI. */
+  fitViewPadding?: FitViewOptions['padding']
+  /** Host overlay content (e.g. a search + controls row), stacked above the
+   *  topology's own status banners in the overlay bar. */
+  children?: ReactNode
+}
+
+// A pod group's children normally carry the health the server computed. Without
+// it, the phase is honest for every state except Running: a crash-looping pod
+// sits at Phase=Running with its container restarting, so that one case says
+// unknown rather than repeating the bug this fallback exists behind.
+export function phaseOnlyHealth(phase: string | undefined): HealthStatus {
+  switch (phase) {
+    case 'Failed':
+      return 'unhealthy'
+    case 'Pending':
+      return 'degraded'
+    case 'Succeeded':
+      return 'neutral'
+    default:
+      return 'unknown'
+  }
 }
 
 export function TopologyGraph({
@@ -186,13 +315,21 @@ export function TopologyGraph({
   paused = false,
   onTogglePause,
   onMaximizeNamespace,
-  namespaceBreadcrumb,
-  onClearNamespace,
   namespacesKey = '',
+  focusNodeId,
+  focusNonce,
+  focusedOwnerId,
+  onNodeHover,
+  onToggleReplicaSets,
+  fitViewPadding = 0.15,
+  children,
 }: TopologyGraphProps) {
   const isTrafficView = viewMode === 'traffic'
   const [nodes, setNodes, onNodesChangeBase] = useNodesState([] as Node[])
   const [edges, setEdges, onEdgesChange] = useEdgesState([] as Edge[])
+  // Bumped each time an ELK layout lands; the visual-sync effect depends on it so a
+  // probe that arrives mid-layout still gets its fresh styles re-applied afterward.
+  const [layoutEpoch, setLayoutEpoch] = useState(0)
 
   // Wrap onNodesChange to track user-dragged positions so they survive re-layouts.
   const onNodesChange = useCallback((changes: NodeChange<Node>[]) => {
@@ -219,6 +356,9 @@ export function TopologyGraph({
   const [layoutRetryCount, setLayoutRetryCount] = useState(0)
   const [fitViewCounter, setFitViewCounter] = useState(0)
   const [isExporting, setIsExporting] = useState(false)
+  const [showLegend, setShowLegend] = useState(false)
+  const [warningsOpen, setWarningsOpen] = useState(false)
+  const warningsDisclosure = useDisclosure(warningsOpen)
   const prevStructureRef = useRef<string>('')
   const layoutVersionRef = useRef(0) // Used to invalidate stale layout results
   // Saved node positions for preservation across topology updates.
@@ -232,6 +372,11 @@ export function TopologyGraph({
   // After layout completes for a single-group change, stores the group ID so
   // ViewportController can fitView to it (with correct timing — after setNodes)
   const fitToGroupAfterLayoutRef = useRef<string | null>(null)
+  // Set by the bulk level controls (collapse/cards/expand all); fits the whole
+  // graph once the relayout lands. A flag (not a counter) so the fit is keyed
+  // to the post-relayout nodes update, not the click — the click fires before
+  // the async ELK relayout, which would frame the pre-change layout.
+  const fitAllAfterLayoutRef = useRef(false)
 
   // Reset group display levels when namespace filter changes (instant switching)
   const prevNamespacesKeyRef = useRef(namespacesKey)
@@ -244,6 +389,21 @@ export function TopologyGraph({
       setFitViewCounter(c => c + 1)
     }
   }, [namespacesKey])
+
+  // Changing grouping (By Namespace / By App / No Grouping) reorganizes the
+  // whole graph, so re-frame it. Skip when a namespace change drove it — that
+  // path already fits via the effect above (avoids a double fit).
+  const prevGroupingModeRef = useRef(groupingMode)
+  const prevNsKeyForGroupingRef = useRef(namespacesKey)
+  useEffect(() => {
+    const groupingChanged = groupingMode !== prevGroupingModeRef.current
+    const nsChanged = namespacesKey !== prevNsKeyForGroupingRef.current
+    prevGroupingModeRef.current = groupingMode
+    prevNsKeyForGroupingRef.current = namespacesKey
+    if (groupingChanged && !nsChanged) {
+      fitAllAfterLayoutRef.current = true
+    }
+  }, [groupingMode, namespacesKey])
 
   // Set display level for a single group
   const handleSetLevel = useCallback((groupId: string, level: GroupDisplayLevel) => {
@@ -265,21 +425,31 @@ export function TopologyGraph({
     }
     setGroupLevels(next)
     savedPositionsRef.current.clear()
-    setFitViewCounter(c => c + 1)
+    // Re-frame the whole graph after the relayout — collapse/expand changes the
+    // content bounds enough that the old viewport no longer fits it.
+    fitAllAfterLayoutRef.current = true
   }, [groupingMode])
 
-  // Expand pod group to show individual pods
+  // Expand pod group to show individual pods. Clear saved positions so ELK
+  // re-lays out the whole graph from scratch — otherwise existing nodes snap
+  // back to their saved spots while the newly-added pods get fresh ELK
+  // coordinates, and the two coordinate spaces collide (overlapping nodes).
+  // Re-fit afterwards since the expanded pods enlarge the content bounds.
   const handleExpandPodGroup = useCallback((podGroupId: string) => {
     setExpandedPodGroups(prev => new Set(prev).add(podGroupId))
+    savedPositionsRef.current.clear()
+    fitAllAfterLayoutRef.current = true
   }, [])
 
-  // Collapse pod group back
+  // Collapse pod group back — same full relayout + re-fit (the graph shrinks).
   const handleCollapsePodGroup = useCallback((podGroupId: string) => {
     setExpandedPodGroups(prev => {
       const next = new Set(prev)
       next.delete(podGroupId)
       return next
     })
+    savedPositionsRef.current.clear()
+    fitAllAfterLayoutRef.current = true
   }, [])
 
   // Expand PodGroup to individual pods
@@ -299,11 +469,26 @@ export function TopologyGraph({
       phase: string
       restarts: number
       containers: number
+      status?: HealthStatus
+      // Present only when the group spans more than one owner (e.g. a
+      // Rollout's canary + stable ReplicaSets) — the specific edge
+      // source(s) that actually own this pod, from the backend's own
+      // per-pod owner resolution. See pkg/topology/builder.go's
+      // ownerKeyToSourceIDs.
+      ownerIds?: string[]
+      // The group's own trafficRole (podGroupNode.data.trafficRole) is only
+      // set when every pod agrees — this is each pod's OWN role, so a mixed
+      // canary/stable group still badges correctly once expanded.
+      trafficRole?: string
     }>
 
     // Find edges pointing to this pod group
     const edgesToGroup = topoEdges.filter(e => e.target === podGroupId)
     const sourceIds = edgesToGroup.map(e => e.source)
+    // Homogeneous per build — resources-view feeds `manages` ownership
+    // edges, traffic-view feeds `routes-to` Service edges — so any surviving
+    // edge's type applies to the whole group.
+    const edgeType = edgesToGroup[0]?.type ?? 'routes-to'
 
     // Remove the PodGroup node and its edges
     const newNodes = topoNodes.filter(n => n.id !== podGroupId)
@@ -316,23 +501,44 @@ export function TopologyGraph({
         id: podId,
         kind: 'Pod',
         name: pod.name,
-        status: pod.phase === 'Running' ? 'healthy' : pod.phase === 'Pending' ? 'degraded' : 'unhealthy',
+        // The server computes pod health; pkg/health tracks a crash loop across
+        // the kubelet's Waiting->Running oscillation, which the phase alone
+        // hides — a crash-looping pod sits at Phase=Running. Deriving it here
+        // again would rebuild that logic in a second place and get it wrong.
+        status: pod.status ?? phaseOnlyHealth(pod.phase),
         data: {
+          ...podGroupNode.data,
           namespace: pod.namespace,
           phase: pod.phase,
           restarts: pod.restarts,
           containers: pod.containers,
+          trafficRole: pod.trafficRole,
           expandedFromGroup: podGroupId, // Track which group this came from
         },
       })
 
-      // Add edges from all sources to this pod
-      for (const sourceId of sourceIds) {
+      // A group with a single owner has every source apply to every pod —
+      // the common case. A mixed-owner group (pod.ownerIds present) instead
+      // connects each pod only to the source(s) that are actually its own
+      // owner, so e.g. a canary pod doesn't end up drawn as owned by the
+      // stable ReplicaSet too.
+      const podSourceIds = pod.ownerIds?.filter(id => sourceIds.includes(id)) ?? sourceIds
+      // A mixed-owner group's shared sources (e.g. a Rollout, reached via
+      // both a canary and a stable edge) can't be told apart by source id
+      // alone once collapsed — both edges point at the same node id, just
+      // with different labels. The pod's own trafficRole is unambiguous, so
+      // an ownership edge derives its label from that directly rather than
+      // trying to match back to one specific original edge.
+      const label = edgeType === 'manages' && pod.trafficRole
+        ? pod.trafficRole[0].toUpperCase() + pod.trafficRole.slice(1)
+        : undefined
+      for (const sourceId of podSourceIds) {
         newEdges.push({
           id: `${sourceId}-to-${podId}`,
           source: sourceId,
           target: podId,
-          type: 'routes-to' as const,
+          type: edgeType,
+          ...(label ? { label } : {}),
         })
       }
     }
@@ -442,13 +648,53 @@ export function TopologyGraph({
     if (topoNode) onNodeClick(topoNode)
   }, [topology, workingNodes, onNodeClick])
 
-  // Structure key for change detection — includes groupLevels so chip↔cardGrid triggers relayout
+  // Expand the group containing a searched-but-collapsed node, then fit the
+  // viewport to that group once the relayout lands. We fit to the GROUP (via
+  // the existing fitToGroupAfterLayoutRef path) rather than centering on the
+  // node directly: the node's absolute position isn't settled until ELK
+  // finishes the async relayout, so a per-node center races it and lands on
+  // stale coords. The node still carries data.selected, so it glows inside the
+  // framed group.
+  const expandGroupForNode = useCallback((nodeId: string) => {
+    if (groupingMode === 'none') return
+    const target = workingNodes.find(n => n.id === nodeId)
+    if (!target) return
+    const groupKey = getGroupKey(target, groupingMode)
+    if (!groupKey) return
+    const groupId = `group-${groupingMode}-${groupKey}`
+    fitToGroupAfterLayoutRef.current = groupId
+    savedPositionsRef.current.clear()
+    setGroupLevels(prev => {
+      if (prev.get(groupId) === 'topology') return prev
+      const next = new Map(prev)
+      next.set(groupId, 'topology')
+      return next
+    })
+  }, [groupingMode, workingNodes])
+
+  // Structure key for change detection — includes groupLevels so chip↔cardGrid triggers relayout.
+  //
+  // Uses an order-independent fold of per-ID hashes (see foldHash) instead of
+  // sort+join. At thousands of nodes the join allocated tens of KB of string
+  // every render (and the sort dominated for short ID arrays); the fold is
+  // O(n) with constant memory and detects the same structural changes
+  // (add/remove/rename) — combined with the element count in the key. Pure
+  // reorders no longer trigger a layout, which is correct: ELK relayouts on
+  // reorder were wasted work.
   const structureKey = useMemo(() => {
-    const nodeIds = workingNodes.map(n => n.id).sort().join(',')
-    const edgeIds = workingEdges.map(e => `${e.source}->${e.target}:${e.type}`).sort().join(',')
-    const levels = Array.from(groupLevels.entries()).sort().map(([k, v]) => `${k}:${v}`).join(',')
-    const expanded = Array.from(expandedPodGroups).sort().join(',')
-    return `${viewMode}|${nodeIds}|${edgeIds}|${levels}|${expanded}|${groupingMode}|${layoutRetryCount}`
+    const t0 = performance.now()
+    const nodeHash = foldHash(workingNodes, n => n.id)
+    const edgeHash = foldHash(workingEdges, e => `${e.source}->${e.target}:${e.type}`)
+    const levelsHash = foldHash(Array.from(groupLevels.entries()), ([k, v]) => `${k}:${v}`)
+    const expandedHash = foldHash(Array.from(expandedPodGroups), s => s)
+    const key =
+      `${viewMode}|${groupingMode}|${layoutRetryCount}` +
+      `|n${workingNodes.length}:${nodeHash}` +
+      `|e${workingEdges.length}:${edgeHash}` +
+      `|l${groupLevels.size}:${levelsHash}` +
+      `|x${expandedPodGroups.size}:${expandedHash}`
+    recordStructureKeyDuration((performance.now() - t0) * 1000)
+    return key
   }, [viewMode, workingNodes, workingEdges, groupLevels, expandedPodGroups, groupingMode, layoutRetryCount])
 
   // Layout when structure changes - use hierarchical ELK layout
@@ -465,6 +711,7 @@ export function TopologyGraph({
     const structureChanged = structureKey !== prevStructureRef.current
 
     if (!structureChanged) {
+      recordLayoutSkipped()
       return
     }
 
@@ -506,17 +753,25 @@ export function TopologyGraph({
     // Increment version to invalidate any previous in-flight layout
     const thisLayoutVersion = ++layoutVersionRef.current
 
+    // The smart-default chip pass only ever materializes namespace groups, so its
+    // "no-entry group defaults to collapsed" semantics apply only in namespace
+    // mode. Outside it (small clusters, app grouping) a no-entry group stays
+    // expanded — see isGroupEffectivelyCollapsed.
+    const smartDefaultActive = hasAppliedSmartDefaultRef.current && groupingMode === 'namespace'
+
     // Build hierarchical ELK graph
     const { elkGraph, groupMap, nodeToGroup } = buildHierarchicalElkGraph(
       workingNodes,
       workingEdges,
       groupingMode,
       collapsedGroups,
-      groupLevels
+      groupLevels,
+      smartDefaultActive
     )
     groupMapRef.current = groupMap
 
     // Apply layout and get positioned nodes
+    const layoutStartMs = performance.now()
     applyHierarchicalLayout(
       elkGraph,
       workingNodes,
@@ -540,6 +795,7 @@ export function TopologyGraph({
         return
       }
       setLayoutError(null)
+      recordLayoutDuration(performance.now() - layoutStartMs, workingNodes.length, workingEdges.length)
 
       // Preserve positions for nodes that already have a saved position (i.e. were
       // present in a previous layout). New nodes use the ELK-computed position.
@@ -552,6 +808,12 @@ export function TopologyGraph({
             return saved ? { ...node, position: saved } : node
           })
 
+      // The ReactFlow fitView prop fires against the pre-layout canvas; once
+      // the first ELK layout lands the content can sit off-center. Re-frame it.
+      if (isInitialLayout) {
+        fitAllAfterLayoutRef.current = true
+      }
+
       // Update saved positions: add/overwrite with positions from this layout run.
       // Remove stale entries for nodes no longer in the topology.
       const currentIds = new Set(positionedNodes.map(n => n.id))
@@ -562,19 +824,26 @@ export function TopologyGraph({
         savedPositionsRef.current.set(node.id, node.position)
       }
 
-      // Add expand/collapse handlers to pod-related nodes
+      // Add expand/collapse handlers to pod-related nodes. Only PodGroups that
+      // actually carry a per-pod array are expandable — summary-only orphan
+      // nodes (summary mode) hold counts only, so they get no expand affordance.
       const nodesWithHandlers = positionedNodes.map(node => {
         const isPodGroup = node.data?.kind === 'PodGroup'
         const nodeData = node.data?.nodeData as Record<string, unknown> | undefined
+        // The per-pod array lives on the backend node data (nodeData.pods).
+        // Summary-only orphan nodes omit it, so they get no expand affordance.
+        const podsArray = nodeData?.pods
+        const isExpandablePodGroup = isPodGroup && Array.isArray(podsArray) && podsArray.length > 0
         const expandedFromGroup = nodeData?.expandedFromGroup as string | undefined
 
         return {
           ...node,
           data: {
             ...node.data,
-            onExpand: isPodGroup ? handleExpandPodGroup : undefined,
+            onExpand: isExpandablePodGroup ? handleExpandPodGroup : undefined,
             onCollapse: expandedFromGroup ? handleCollapsePodGroup : undefined,
-            isExpanded: isPodGroup ? expandedPodGroups.has(node.id) : undefined,
+            isExpanded: isExpandablePodGroup ? expandedPodGroups.has(node.id) : undefined,
+            onToggleReplicaSets: nodeData?.replicaSetsExpandable ? onToggleReplicaSets : undefined,
           },
         }
       })
@@ -596,10 +865,14 @@ export function TopologyGraph({
           groupingMode,
           isTrafficView,
           nodeToGroup,
-          nodesWithHandlers.length
+          nodesWithHandlers.length,
+          groupLevels,
+          smartDefaultActive,
+          workingNodes
         )
         setEdges(builtEdges)
       }
+      if (groupingMode === 'none') setLayoutEpoch(e => e + 1)
     }).catch((err) => {
       console.error('[TopologyGraph] Layout post-processing error:', err)
       setLayoutError(err instanceof Error ? err.message : String(err))
@@ -608,7 +881,53 @@ export function TopologyGraph({
     // No cleanup function - we use version-based invalidation instead
     // This prevents React's effect re-runs from canceling in-flight layouts
     // when the actual structure hasn't changed
-  }, [workingNodes, workingEdges, structureKey, groupingMode, hideGroupHeader, collapsedGroups, groupLevels, handleSetLevel, handleCardClick, onMaximizeNamespace, isTrafficView, expandedPodGroups, handleExpandPodGroup, handleCollapsePodGroup, setNodes, setEdges, layoutRetryCount])
+  }, [workingNodes, workingEdges, structureKey, groupingMode, hideGroupHeader, collapsedGroups, groupLevels, handleSetLevel, handleCardClick, onMaximizeNamespace, isTrafficView, expandedPodGroups, handleExpandPodGroup, handleCollapsePodGroup, onToggleReplicaSets, setNodes, setEdges, layoutRetryCount])
+
+  // Visual-only sync - no relayout. The layout effect above is guarded by
+  // structureKey, which DELIBERATELY ignores node status + edge reachOutcome (a
+  // recolor shouldn't pay for an ELK pass). But the Reachability diagram mutates
+  // exactly those: clicking Run recolors an edge (e.g. not-tested → verified)
+  // WITHOUT changing structure, so the layout effect skips and the new outcome
+  // never reaches the canvas. Re-apply the visual attributes here, in place,
+  // preserving ELK positions. Scoped to groupingMode 'none' (the reachability
+  // view) - the grouped app topology rebuilds structure on each data refresh and
+  // never relies on in-place restyle, so it stays untouched.
+  const visualKey = useMemo(() => {
+    if (groupingMode !== 'none') return ''
+    const nodeStatus = foldHash(workingNodes, n => `${n.id}:${n.status}:${(n.data as { subtitleOverride?: unknown })?.subtitleOverride ?? ''}`)
+    const edgeReach = foldHash(workingEdges, e => `${e.source}->${e.target}:${e.reachOutcome ?? ''}:${e.label ?? ''}`)
+    return `${nodeStatus}|${edgeReach}`
+  }, [groupingMode, workingNodes, workingEdges])
+
+  useEffect(() => {
+    if (groupingMode !== 'none' || prevStructureRef.current === '') return
+    const byId = new Map(workingNodes.map(n => [n.id, n]))
+    setNodes(prev => {
+      let changed = false
+      const next = prev.map(node => {
+        const wn = byId.get(node.id)
+        if (!wn) return node
+        // Re-apply BOTH the status AND the latest node payload (nodeData) so a probe
+        // updates the on-canvas subtitle (e.g. "not reached - break upstream") too,
+        // not just the dot color. The detail panel reads the topology node directly,
+        // but the rendered card reads node.data.nodeData - keep it fresh.
+        if (node.data?.status === wn.status && node.data?.nodeData === wn.data) return node
+        changed = true
+        return { ...node, data: { ...node.data, status: wn.status, nodeData: wn.data } }
+      })
+      return changed ? next : prev
+    })
+    // nodeCount must be a real NODE count (buildEdges gates animations on it
+    // for the large-graph performance safeguard) — workingNodes.length, not
+    // the previous EDGES array's length. A tree-shaped graph commonly has
+    // fewer edges than nodes, so using edge count here could report "under
+    // the threshold" and re-enable animations on a graph that's actually
+    // over it.
+    setEdges(prev => (prev.length === 0 ? prev : buildEdges(workingEdges, collapsedGroups, groupMapRef.current ?? new Map(), groupingMode, isTrafficView, undefined, workingNodes.length, groupLevels, false, workingNodes)))
+    // layoutEpoch is a dep so this re-applies AFTER any in-flight ELK layout lands -
+    // a stale layout closure can't leave the canvas painted with pre-probe styles.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visualKey, layoutEpoch])
 
   // Handle node click
   const handleNodeClick = useCallback(
@@ -631,6 +950,17 @@ export function TopologyGraph({
     [topology, workingNodes, onNodeClick]
   )
 
+  const handleNodeMouseEnter = useCallback(
+    (_e: React.MouseEvent, node: Node) => {
+      if (!onNodeHover || node.type === 'group') return
+      const topologyNode =
+        topology?.nodes.find(n => n.id === node.id) ?? workingNodes.find(n => n.id === node.id)
+      if (topologyNode) onNodeHover(topologyNode)
+    },
+    [topology, workingNodes, onNodeHover]
+  )
+  const handleNodeMouseLeave = useCallback(() => onNodeHover?.(null), [onNodeHover])
+
   // Update selected state - only update nodes that actually changed
   useEffect(() => {
     setNodes(nds => {
@@ -638,10 +968,17 @@ export function TopologyGraph({
       const updated = nds.map(node => {
         const shouldBeSelected = node.id === selectedNodeId
         const isCurrentlySelected = node.data?.selected ?? false
+        // Only act on the select/deselect transition. Don't touch zIndex
+        // otherwise — a blanket compare would fight the layout's group zIndex
+        // (-1) every render and loop (React #185). Groups are never selectable,
+        // so they never enter here and keep their layout zIndex.
         if (shouldBeSelected !== isCurrentlySelected) {
           changed = true
           return {
             ...node,
+            // Lift the selected leaf above its siblings (default z 0) so its
+            // outline+glow isn't painted over; restore default on deselect.
+            zIndex: shouldBeSelected ? 10 : undefined,
             data: {
               ...node.data,
               selected: shouldBeSelected,
@@ -652,7 +989,85 @@ export function TopologyGraph({
       })
       return changed ? updated : nds // Return same array if nothing changed
     })
-  }, [selectedNodeId, setNodes])
+    // `nodes` is a dep so selection re-applies after a relayout introduces the
+    // target node (e.g. search expands a collapsed group). Safe from loops: the
+    // functional update returns the same array ref when nothing changed.
+  }, [selectedNodeId, setNodes, nodes])
+
+  // Hover-focus dim (application graph): when a workload is focused, dim every
+  // resource node not owned by it. A pure data toggle on the existing nodes —
+  // positions are untouched, so it never re-runs the (expensive) ELK layout.
+  useEffect(() => {
+    setNodes(nds => {
+      let changed = false
+      const updated = nds.map(node => {
+        if (node.type === 'group') return node
+        const stamp = ownershipOf(node.data?.nodeData as Record<string, unknown> | undefined)
+        // A focused workload lights its whole neighborhood (focusWorkloadIds);
+        // the "Shared / unscoped" focus lights every neutral node.
+        const inFocus =
+          focusedOwnerId == null
+            ? true
+            : focusedOwnerId === NEUTRAL_OWNER
+              ? stamp.ownerWorkloadId == null
+              : stamp.focusWorkloadIds.includes(focusedOwnerId)
+        const shouldDim = focusedOwnerId != null && !inFocus
+        if (!!node.data?.dimmed === shouldDim) return node
+        changed = true
+        return { ...node, data: { ...node.data, dimmed: shouldDim } }
+      })
+      return changed ? updated : nds
+    })
+  }, [focusedOwnerId, setNodes, nodes])
+
+  // Data-only topology updates must repaint existing nodes without forcing an
+  // ELK relayout. Structure hashing deliberately ignores status and metadata;
+  // keep the React Flow node payload in sync on that fast path.
+  useEffect(() => {
+    const topologyById = new Map(workingNodes.map(node => [node.id, node]))
+    setNodes(nds => {
+      let changed = false
+      const updated = nds.map(node => {
+        if (node.type === 'group') return node
+        const topologyNode = topologyById.get(node.id)
+        if (!topologyNode) return node
+        const nodeData = topologyNode.data as Record<string, unknown>
+        const pods = nodeData.pods
+        const isExpandablePodGroup = topologyNode.kind === 'PodGroup' && Array.isArray(pods) && pods.length > 0
+        const expandedFromGroup = nodeData.expandedFromGroup as string | undefined
+        const onExpand = isExpandablePodGroup ? handleExpandPodGroup : undefined
+        const onCollapse = expandedFromGroup ? handleCollapsePodGroup : undefined
+        const isExpanded = isExpandablePodGroup ? expandedPodGroups.has(node.id) : undefined
+        const toggleReplicaSets = nodeData.replicaSetsExpandable ? onToggleReplicaSets : undefined
+        if (
+          node.data?.kind === topologyNode.kind &&
+          node.data?.name === topologyNode.name &&
+          node.data?.status === topologyNode.status &&
+          node.data?.nodeData === topologyNode.data &&
+          node.data?.onExpand === onExpand &&
+          node.data?.onCollapse === onCollapse &&
+          node.data?.isExpanded === isExpanded &&
+          node.data?.onToggleReplicaSets === toggleReplicaSets
+        ) return node
+        changed = true
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            kind: topologyNode.kind,
+            name: topologyNode.name,
+            status: topologyNode.status,
+            nodeData: topologyNode.data,
+            onExpand,
+            onCollapse,
+            isExpanded,
+            onToggleReplicaSets: toggleReplicaSets,
+          },
+        }
+      })
+      return changed ? updated : nds
+    })
+  }, [workingNodes, expandedPodGroups, handleExpandPodGroup, handleCollapsePodGroup, onToggleReplicaSets, setNodes])
 
   if (!topology) {
     return <PaneLoader label="Loading topology…" className="absolute inset-0" />
@@ -700,84 +1115,96 @@ export function TopologyGraph({
 
   return (
     <ReactFlowProvider>
-      {/* Namespace breadcrumb — shown when viewing a single namespace */}
-      {namespaceBreadcrumb && (
-        <div className="absolute top-3 left-3 z-10 flex items-center gap-1.5">
-          {onClearNamespace && (
-            <button
-              onClick={onClearNamespace}
-              className="text-xs text-theme-text-tertiary hover:text-theme-text-secondary transition-colors"
-            >
-              All Namespaces
-            </button>
-          )}
-          {onClearNamespace && (
-            <span className="text-xs text-theme-text-tertiary">/</span>
-          )}
-          <span className="text-xs font-medium text-theme-text-secondary bg-theme-surface/80 backdrop-blur-sm border border-theme-border/50 rounded-md px-2 py-0.5">
-            {namespaceBreadcrumb}
-          </span>
-        </div>
-      )}
-      {/* Warning banner for partial topology data */}
-      {topology?.warnings && topology.warnings.length > 0 && (() => {
-        const rbacWarnings = topology.warnings.filter(w => w.includes('RBAC not granted'))
-        const otherWarnings = topology.warnings.filter(w => !w.includes('RBAC not granted'))
-        const isAllRbac = otherWarnings.length === 0
-        return (
-          <div className={`absolute top-2 left-2 right-2 z-10 ${isAllRbac ? 'bg-amber-500/10 border-amber-500/20' : 'bg-amber-500/10 border-amber-500/30'} border rounded-lg p-2 backdrop-blur-sm`}>
-            <div className="flex items-start gap-2">
-              {isAllRbac ? (
-                <Shield className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-              ) : (
-                <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
-              )}
-              <div className="text-sm">
-                <span className="font-medium text-amber-400">
-                  {isAllRbac ? 'Limited Access:' : 'Warning:'}
-                </span>
-                <span className="text-theme-text-secondary ml-1">
-                  {isAllRbac
-                    ? `${pluralize(rbacWarnings.length, 'resource type')} not accessible due to RBAC restrictions.`
-                    : 'Some resources failed to load. Data may be incomplete.'}
-                </span>
-                <details className="mt-1">
-                  <summary className="text-xs text-amber-400/80 hover:text-amber-400">
+      {/* Overlay bar: status banners lead (a partial-data/RBAC warning must read
+          before the user trusts the graph), host children stack below. Flex
+          column so nothing overlaps. Banners de-absoluted — the bar owns position/z. */}
+      <TopologyOverlayBar>
+        {/* Warning banner for partial topology data */}
+        {topology?.warnings && topology.warnings.length > 0 && (() => {
+          const rbacWarnings = topology.warnings.filter(w => w.includes('RBAC not granted'))
+          const viewWarnings = topology.warnings.filter(w => w.startsWith('Topology view:'))
+          const otherWarnings = topology.warnings.filter(w => !w.includes('RBAC not granted') && !w.startsWith('Topology view:'))
+          const isAllRbac = otherWarnings.length === 0 && viewWarnings.length === 0
+          const isViewLimited = otherWarnings.length === 0 && rbacWarnings.length === 0 && viewWarnings.length > 0
+          return (
+            <div className={`pointer-events-auto ${isViewLimited ? 'max-w-xl' : 'w-full'} ${isAllRbac ? 'bg-amber-500/10 border-amber-500/20' : 'bg-amber-500/10 border-amber-500/30'} border rounded-lg p-2 backdrop-blur-sm`}>
+              <div className="flex items-start gap-2">
+                {isAllRbac ? (
+                  <Shield className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                ) : (
+                  <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+                )}
+                <div className="text-sm">
+                  <span className="font-medium text-amber-400">
+                    {isAllRbac ? 'Limited Access:' : isViewLimited ? 'View limited:' : 'Warning:'}
+                  </span>
+                  <span className="text-theme-text-secondary ml-1">
+                    {isAllRbac
+                      ? `${pluralize(rbacWarnings.length, 'resource type')} not accessible due to RBAC restrictions.`
+                      : isViewLimited
+                        ? 'Large retained run history is summarized to keep the graph readable.'
+                        : 'Some resources failed to load. Data may be incomplete.'}
+                  </span>
+                  <button
+                    {...warningsDisclosure.buttonProps}
+                    type="button"
+                    onClick={() => setWarningsOpen((v) => !v)}
+                    className="mt-1 flex items-center gap-1 text-xs text-amber-400/80 hover:text-amber-400"
+                  >
+                    <CollapseChevron open={warningsOpen} inheritColor className="h-3 w-3" />
                     Show details ({topology.warnings.length})
-                  </summary>
-                  <ul className="mt-1 text-xs text-theme-text-tertiary space-y-0.5">
-                    {rbacWarnings.length > 0 && otherWarnings.length > 0 && (
-                      <li className="text-amber-400/60 font-medium mt-1">RBAC restrictions:</li>
-                    )}
-                    {rbacWarnings.map((w, i) => (
-                      <li key={`rbac-${i}`} className="font-mono">{w}</li>
-                    ))}
-                    {otherWarnings.length > 0 && rbacWarnings.length > 0 && (
-                      <li className="text-amber-400/60 font-medium mt-1">Other warnings:</li>
-                    )}
-                    {otherWarnings.map((w, i) => (
-                      <li key={`other-${i}`} className="font-mono">{w}</li>
-                    ))}
-                  </ul>
-                </details>
+                  </button>
+                  <Collapse open={warningsOpen} id={warningsDisclosure.panelId}>
+                    <ul className="mt-1 text-xs text-theme-text-tertiary space-y-0.5">
+                      {rbacWarnings.length > 0 && otherWarnings.length > 0 && (
+                        <li className="text-amber-400/60 font-medium mt-1">RBAC restrictions:</li>
+                      )}
+                      {rbacWarnings.map((w, i) => (
+                        <li key={`rbac-${i}`} className="font-mono">{w}</li>
+                      ))}
+                      {viewWarnings.length > 0 && (rbacWarnings.length > 0 || otherWarnings.length > 0) && (
+                        <li className="text-amber-400/60 font-medium mt-1">View limits:</li>
+                      )}
+                      {viewWarnings.map((w, i) => (
+                        <li key={`view-${i}`} className="font-mono">{w}</li>
+                      ))}
+                      {otherWarnings.length > 0 && (rbacWarnings.length > 0 || viewWarnings.length > 0) && (
+                        <li className="text-amber-400/60 font-medium mt-1">Other warnings:</li>
+                      )}
+                      {otherWarnings.map((w, i) => (
+                        <li key={`other-${i}`} className="font-mono">{w}</li>
+                      ))}
+                    </ul>
+                  </Collapse>
+                </div>
+              </div>
+            </div>
+          )
+        })()}
+        {/* Layout error banner - shown even when stale nodes exist */}
+        {layoutError && nodes.length > 0 && (
+          <div className="w-full pointer-events-auto bg-red-500/10 border border-red-500/30 rounded-lg p-2 backdrop-blur-sm">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+              <div className="text-sm">
+                <span className="font-medium text-red-400">Layout Error:</span>
+                <span className="text-theme-text-secondary ml-1">
+                  Failed to update layout. Showing previous view.
+                </span>
+                <p className="mt-1 text-xs text-theme-text-tertiary font-mono">{layoutError}</p>
               </div>
             </div>
           </div>
-        )
-      })()}
-      {/* Layout error banner - shown even when stale nodes exist */}
-      {layoutError && nodes.length > 0 && (
-        <div className="absolute top-2 left-2 right-2 z-10 bg-red-500/10 border border-red-500/30 rounded-lg p-2 backdrop-blur-sm">
-          <div className="flex items-start gap-2">
-            <AlertTriangle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
-            <div className="text-sm">
-              <span className="font-medium text-red-400">Layout Error:</span>
-              <span className="text-theme-text-secondary ml-1">
-                Failed to update layout. Showing previous view.
-              </span>
-              <p className="mt-1 text-xs text-theme-text-tertiary font-mono">{layoutError}</p>
-            </div>
-          </div>
+        )}
+        {children}
+      </TopologyOverlayBar>
+      {/* Summary-mode pill — pod tier collapsed to per-workload/service counts */}
+      {topology?.summaryMode && (
+        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 bg-blue-500/10 border border-blue-500/30 rounded-full px-3 py-1 backdrop-blur-sm">
+          <Layers className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+          <span className="text-xs text-theme-text-secondary">
+            Summary view — pods collapsed to counts. Filter to a smaller namespace to see individual pods.
+          </span>
         </div>
       )}
       <ReactFlow
@@ -786,64 +1213,95 @@ export function TopologyGraph({
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onNodeClick={handleNodeClick}
+        onNodeMouseEnter={handleNodeMouseEnter}
+        onNodeMouseLeave={handleNodeMouseLeave}
         nodeTypes={nodeTypes}
         fitView
-        fitViewOptions={{ padding: 0.2 }}
+        fitViewOptions={{ padding: fitViewPadding }}
         minZoom={0.1}
         maxZoom={2}
         proOptions={{ hideAttribution: true }}
         onlyRenderVisibleElements={!isExporting}
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#334155" />
-        <Controls
-          className="bg-theme-surface border border-theme-border rounded-lg"
-          showInteractive={false}
-          showZoom={false}
-          showFitView={false}
-        >
-          <CustomControlButtons
-            showExportButton={showExportButton}
-            paused={paused}
-            onTogglePause={onTogglePause}
-            onExportingChange={setIsExporting}
-          />
-        </Controls>
-        {/* Level controls — separate group matching per-node icons */}
-        {groupingMode !== 'none' && (
-          <div className="react-flow__panel react-flow__controls bottom-left bg-theme-surface border border-theme-border rounded-lg" style={{ marginBottom: 0, left: 10, bottom: 'auto', top: namespaceBreadcrumb ? 40 : 10 }}>
-            {!hideGroupHeader && (
-              <Tooltip content="Collapse all" delay={100} position="right">
+        {/* Bottom-left controls. Two distinct pills with a gap rather than one
+            long strip: a viewport group (zoom/fit/export/pause) and, only when
+            grouping is active, a level-of-detail group. */}
+        <Panel position="bottom-left" className="flex flex-col items-start gap-2">
+          {groupingMode !== 'none' && (
+            <div className="react-flow__controls overflow-hidden" style={{ position: 'static', margin: 0 }}>
+              {!hideGroupHeader && (
+                <Tooltip content="Collapse all groups" delay={100} position="right">
+                  <button
+                    className="react-flow__controls-button"
+                    onClick={() => setAllLevels('chip')}
+                  >
+                    <ChevronsDownUp className="w-3.5 h-3.5" />
+                  </button>
+                </Tooltip>
+              )}
+              <Tooltip content="All workload cards" delay={100} position="right">
                 <button
                   className="react-flow__controls-button"
-                  onClick={() => setAllLevels('chip')}
+                  onClick={() => setAllLevels('cardGrid')}
                 >
-                  <Minus className="w-3.5 h-3.5" />
+                  <LayoutGrid className="w-3.5 h-3.5" />
                 </button>
               </Tooltip>
-            )}
-            <Tooltip content="All workload cards" delay={100} position="right">
-              <button
-                className="react-flow__controls-button"
-                onClick={() => setAllLevels('cardGrid')}
-              >
-                <LayoutGrid className="w-3.5 h-3.5" />
-              </button>
-            </Tooltip>
-            <Tooltip content="Expand all" delay={100} position="right">
-              <button
-                className="react-flow__controls-button"
-                onClick={() => setAllLevels('topology')}
-              >
-                <Workflow className="w-3.5 h-3.5" />
-              </button>
-            </Tooltip>
+              <Tooltip content="Expand all groups" delay={100} position="right">
+                <button
+                  className="react-flow__controls-button"
+                  onClick={() => setAllLevels('topology')}
+                >
+                  <ChevronsUpDown className="w-3.5 h-3.5" />
+                </button>
+              </Tooltip>
+            </div>
+          )}
+          <div className="react-flow__controls overflow-hidden" style={{ position: 'static', margin: 0 }}>
+            <CustomControlButtons
+              showExportButton={showExportButton}
+              paused={paused}
+              onTogglePause={onTogglePause}
+              onExportingChange={setIsExporting}
+              fitViewPadding={fitViewPadding}
+            />
           </div>
-        )}
+          {!isTrafficView && (
+            <>
+              {showLegend && (
+                <div className="rounded-md border border-theme-border bg-theme-surface/95 px-3 py-2 shadow-theme-md backdrop-blur">
+                  <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-theme-text-tertiary">Edge colors</div>
+                  <div className="flex flex-col gap-1">
+                    {EDGE_LEGEND.map((e) => (
+                      <div key={e.label} className="flex items-center gap-2 text-[11px] text-theme-text-secondary">
+                        <span className="inline-block h-0.5 w-5 rounded-full" style={{ background: e.color }} />
+                        {e.label}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div className="react-flow__controls overflow-hidden" style={{ position: 'static', margin: 0 }}>
+                <Tooltip content="Edge color legend" delay={100} position="right">
+                  <button className="react-flow__controls-button" onClick={() => setShowLegend((v) => !v)}>
+                    <Info className="w-3.5 h-3.5" />
+                  </button>
+                </Tooltip>
+              </div>
+            </>
+          )}
+        </Panel>
         <ViewportController
           viewMode={viewMode}
           layoutRetryCount={layoutRetryCount}
           fitViewCounter={fitViewCounter}
           fitToGroupAfterLayoutRef={fitToGroupAfterLayoutRef}
+          fitAllAfterLayoutRef={fitAllAfterLayoutRef}
+          focusNodeId={focusNodeId}
+          focusNonce={focusNonce}
+          onRequestExpandForNode={expandGroupForNode}
+          fitViewPadding={fitViewPadding}
         />
       </ReactFlow>
     </ReactFlowProvider>
@@ -1027,9 +1485,8 @@ function ExportImageButton({ onExportingChange }: { onExportingChange: (v: boole
         >
           <div className="text-sm font-medium text-theme-text-primary mb-3">Export topology</div>
           <label className="block text-xs text-theme-text-secondary mb-1">Filename</label>
-          <input
+          <Input
             ref={inputRef}
-            type="text"
             value={filename}
             onChange={(e) => setFilename(e.target.value)}
             className="w-full px-2 py-1.5 text-sm bg-theme-base border border-theme-border rounded text-theme-text-primary outline-none focus:border-blue-500 mb-3"
@@ -1127,11 +1584,13 @@ function CustomControlButtons({
   paused,
   onTogglePause,
   onExportingChange,
+  fitViewPadding,
 }: {
   showExportButton: boolean
   paused: boolean
   onTogglePause?: () => void
   onExportingChange: (v: boolean) => void
+  fitViewPadding: FitViewOptions['padding']
 }) {
   const { zoomIn, zoomOut, fitView } = useReactFlow()
   const TIP = 100
@@ -1148,7 +1607,7 @@ function CustomControlButtons({
         </button>
       </Tooltip>
       <Tooltip content="Fit view" delay={TIP} position="right">
-        <button className="react-flow__controls-button" onClick={() => fitView({ padding: 0.15, duration: 400 })}>
+        <button className="react-flow__controls-button" onClick={() => fitView({ padding: fitViewPadding, duration: 400 })}>
           <Maximize className="w-3 h-3" />
         </button>
       </Tooltip>
@@ -1177,17 +1636,39 @@ function ViewportController({
   layoutRetryCount,
   fitViewCounter = 0,
   fitToGroupAfterLayoutRef,
+  fitAllAfterLayoutRef,
+  focusNodeId,
+  focusNonce = 0,
+  onRequestExpandForNode,
+  fitViewPadding,
 }: {
   viewMode: string
   layoutRetryCount: number
   fitViewCounter?: number
   fitToGroupAfterLayoutRef?: React.MutableRefObject<string | null>
+  fitAllAfterLayoutRef?: React.MutableRefObject<boolean>
+  focusNodeId?: string
+  focusNonce?: number
+  onRequestExpandForNode?: (nodeId: string) => void
+  fitViewPadding: FitViewOptions['padding']
 }) {
-  const { fitView, zoomIn, zoomOut, setViewport, getViewport } = useReactFlow()
+  const { fitView, zoomIn, zoomOut, setViewport, getViewport, getInternalNode, setCenter } = useReactFlow()
   const nodes = useNodes() // Reactive hook to watch node changes
+
+  // Pan/zoom the viewport so a single node is centered.
+  const centerOnNode = useCallback((nodeId: string): boolean => {
+    const node = getInternalNode(nodeId)
+    if (!node) return false
+    const { x, y } = node.internals.positionAbsolute
+    const w = node.measured?.width ?? 0
+    const h = node.measured?.height ?? 0
+    setCenter(x + w / 2, y + h / 2, { zoom: 1.2, duration: VIEWPORT_ANIMATION_DURATION })
+    return true
+  }, [getInternalNode, setCenter])
   const prevViewModeRef = useRef<string>(viewMode)
   const prevRetryCountRef = useRef(layoutRetryCount)
   const prevFitViewCounterRef = useRef(fitViewCounter)
+  const prevFocusNonceRef = useRef(focusNonce)
   const prevNodesLengthRef = useRef(0)
 
   // Topology keyboard shortcuts
@@ -1198,7 +1679,7 @@ function ViewportController({
       description: 'Fit graph to screen',
       category: 'Topology',
       scope: 'topology',
-      handler: () => fitView({ padding: 0.15, duration: VIEWPORT_ANIMATION_DURATION }),
+      handler: () => fitView({ padding: fitViewPadding, duration: VIEWPORT_ANIMATION_DURATION }),
     },
     {
       id: 'topology-zoom-in',
@@ -1275,34 +1756,65 @@ function ViewportController({
     if (nodesJustPopulated || viewModeChanged || retryRequested || fitViewRequested) {
       const timeoutId = setTimeout(() => {
         fitView({
-          padding: 0.15,
+          padding: fitViewPadding,
           duration: nodesJustPopulated ? 0 : VIEWPORT_ANIMATION_DURATION,
         })
       }, 10)
 
       return () => clearTimeout(timeoutId)
     }
-  }, [viewMode, layoutRetryCount, fitViewCounter, nodes.length, fitView])
+  }, [viewMode, layoutRetryCount, fitViewCounter, nodes.length, fitView, fitViewPadding])
 
-  // After a single-group expand/collapse, fit the viewport to that group.
-  // This effect fires when nodes update (triggered by setNodes after async layout).
+  // Pan/zoom to a single searched node. Gated on focusNonce so the same
+  // node can be re-focused, and so this never fires on background updates.
+  // If the node is already on the canvas, center now. If it isn't (it's
+  // collapsed inside a group chip), ask the parent to expand that group
+  // (onRequestExpandForNode); the fit-to-group effect then frames the group
+  // once the relayout lands, and the node glows inside it via data.selected.
+  useEffect(() => {
+    if (focusNonce === prevFocusNonceRef.current) return
+    prevFocusNonceRef.current = focusNonce
+    if (!focusNodeId) return
+    if (!centerOnNode(focusNodeId)) {
+      onRequestExpandForNode?.(focusNodeId)
+    }
+  }, [focusNonce, focusNodeId, centerOnNode, onRequestExpandForNode])
+
+  // After a single-group expand/collapse, fit the viewport to that group, once
+  // the relayout has SETTLED. Debounced (reschedules on each nodes update) so
+  // it frames the final positions, not an intermediate layout — and so the
+  // group's nodes are measured when fitView reads their bounds.
   useEffect(() => {
     if (!fitToGroupAfterLayoutRef?.current) return
     const targetGroupId = fitToGroupAfterLayoutRef.current
-    fitToGroupAfterLayoutRef.current = null
-    // Find the group and its children to fit to
-    const targetNodes = nodes.filter(n => n.id === targetGroupId || n.parentId === targetGroupId)
-    if (targetNodes.length > 0) {
-      setTimeout(() => {
+    const id = setTimeout(() => {
+      fitToGroupAfterLayoutRef.current = null
+      const targetNodes = nodes.filter(n => n.id === targetGroupId || n.parentId === targetGroupId)
+      if (targetNodes.length > 0) {
         fitView({
           nodes: targetNodes.map(n => ({ id: n.id })),
           padding: 0.2,
           duration: VIEWPORT_ANIMATION_DURATION,
           maxZoom: 1.5,
         })
-      }, 10)
-    }
+      }
+    }, 250)
+    return () => clearTimeout(id)
   }, [nodes, fitView, fitToGroupAfterLayoutRef])
+
+  // After a bulk level change (collapse/cards/expand all), fit the whole graph
+  // once the relayout has SETTLED. The expand relayout lands in phases, so a
+  // fit on the first nodes update frames an intermediate (compact) layout.
+  // Debounce instead: each nodes update reschedules, so the fit fires only
+  // after nodes stop changing, then clears the flag.
+  useEffect(() => {
+    if (!fitAllAfterLayoutRef?.current) return
+    const id = setTimeout(() => {
+      fitAllAfterLayoutRef.current = false
+      fitView({ padding: fitViewPadding, duration: VIEWPORT_ANIMATION_DURATION })
+    }, 250)
+    return () => clearTimeout(id)
+  }, [nodes, fitView, fitAllAfterLayoutRef, fitViewPadding])
 
   return null
 }

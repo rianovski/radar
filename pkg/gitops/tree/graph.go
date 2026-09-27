@@ -6,11 +6,20 @@ import (
 	"strings"
 	"time"
 
-	"github.com/skyhook-io/radar/pkg/topology"
+	"github.com/skyhook-io/radar/pkg/resourceid"
+
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	"github.com/skyhook-io/radar/pkg/topology"
 )
 
-func nodeFromTopology(n topology.Node, ref ResourceRef, role NodeRole, tool Tool, sync, health string) Node {
+// nodeFromTopology builds a node for a managed resource Radar's topology
+// knows. A controller-supplied health wins and sets the node's tone; without
+// one, Radar's own topology status fills in as HealthSourceRadar. Either way
+// TopologyStatus is the tone of the resolved health, so the graph never
+// paints a controller-Degraded node green because Radar's live read
+// disagrees.
+func nodeFromTopology(n topology.Node, ref ResourceRef, role NodeRole, tool Tool, sync, health string, source HealthSource) Node {
 	data := map[string]any{}
 	for k, v := range n.Data {
 		data[k] = v
@@ -20,6 +29,11 @@ func nodeFromTopology(n topology.Node, ref ResourceRef, role NodeRole, tool Tool
 	info := infoFromTopology(n)
 	if health == "" {
 		health = healthFromTopology(n.Status)
+		source = HealthSourceRadar
+	}
+	status := string(n.Status)
+	if health != "" {
+		status = healthToTopology(health)
 	}
 	return Node{
 		ID:             nodeID(ref),
@@ -28,13 +42,14 @@ func nodeFromTopology(n topology.Node, ref ResourceRef, role NodeRole, tool Tool
 		Tool:           tool,
 		Sync:           sync,
 		Health:         health,
-		TopologyStatus: string(n.Status),
+		HealthSource:   healthSourceFor(health, source),
+		TopologyStatus: status,
 		Info:           info,
 		Data:           data,
 	}
 }
 
-func syntheticNode(ref ResourceRef, role NodeRole, tool Tool, sync, health string) Node {
+func syntheticNode(ref ResourceRef, role NodeRole, tool Tool, sync, health string, source HealthSource) Node {
 	return Node{
 		ID:             nodeID(ref),
 		Ref:            ref,
@@ -42,9 +57,23 @@ func syntheticNode(ref ResourceRef, role NodeRole, tool Tool, sync, health strin
 		Tool:           tool,
 		Sync:           sync,
 		Health:         health,
+		HealthSource:   healthSourceFor(health, source),
 		TopologyStatus: healthToTopology(health),
 		Data:           map[string]any{"namespace": ref.Namespace, "group": ref.Group},
 	}
+}
+
+// healthSourceFor keeps HealthSource and Health consistent: no health, no
+// source; a health with no stated source is the controller's, which is what
+// every pre-provenance caller meant.
+func healthSourceFor(health string, source HealthSource) HealthSource {
+	if health == "" {
+		return ""
+	}
+	if source == "" {
+		return HealthSourceController
+	}
+	return source
 }
 
 func enrichNodeFromObject(node Node, obj *unstructured.Unstructured) Node {
@@ -128,7 +157,7 @@ func refFromTopologyNode(n topology.Node) ResourceRef {
 
 func infoFromTopology(n topology.Node) []InfoItem {
 	switch string(n.Kind) {
-	case "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet":
+	case "Deployment", "Rollout", "StatefulSet", "DaemonSet", "ReplicaSet":
 		if summary, ok := n.Data["statusSummary"].(string); ok && summary != "" {
 			return []InfoItem{{Name: "Status", Value: summary}}
 		}
@@ -139,8 +168,12 @@ func infoFromTopology(n topology.Node) []InfoItem {
 		}
 	case "Service":
 		if typ, ok := n.Data["type"].(string); ok && typ != "" {
-			if port, ok := n.Data["port"]; ok {
-				return []InfoItem{{Name: "Service", Value: fmt.Sprintf("%s :%v", typ, port)}}
+			if ports, ok := n.Data["ports"].([]map[string]any); ok && len(ports) > 0 {
+				value := fmt.Sprintf("%s :%v", typ, ports[0]["port"])
+				if len(ports) > 1 {
+					value = fmt.Sprintf("%s +%d more", value, len(ports)-1)
+				}
+				return []InfoItem{{Name: "Service", Value: value}}
 			}
 			return []InfoItem{{Name: "Service", Value: typ}}
 		}
@@ -190,12 +223,12 @@ func mergeData(node Node, data map[string]any) Node {
 }
 
 func apiGroup(obj *unstructured.Unstructured) string {
-	apiVersion := obj.GetAPIVersion()
-	if strings.Contains(apiVersion, "/") {
-		return strings.SplitN(apiVersion, "/", 2)[0]
-	}
-	return ""
+	return resourceid.GroupFromAPIVersion(obj.GetAPIVersion())
 }
+
+// HealthToTopology maps a controller health vocabulary value to the graph's
+// tone (healthy / degraded / unhealthy / unknown).
+func HealthToTopology(health string) string { return healthToTopology(health) }
 
 func healthToTopology(health string) string {
 	switch health {
@@ -258,7 +291,7 @@ func kindPriority(kind string) int {
 		"CustomResourceDefinition": 5,
 		"ClusterRole":              6, "ClusterRoleBinding": 7, "Role": 8, "RoleBinding": 9,
 		"Service":    10,
-		"Deployment": 11, "StatefulSet": 11, "DaemonSet": 11,
+		"Deployment": 11, "Rollout": 11, "StatefulSet": 11, "DaemonSet": 11,
 		"ReplicaSet": 12, "Pod": 13,
 		"Ingress": 14, "Gateway": 14, "HTTPRoute": 15,
 	}
@@ -268,7 +301,10 @@ func kindPriority(kind string) int {
 	return 20
 }
 
-func summarize(nodes []Node) Summary {
+// Summarize tallies the tree's managed resources. Hosts that drop nodes
+// (per-user RBAC filtering) or overlay health after the build must call it
+// again on the final node list so the counts describe what is served.
+func Summarize(nodes []Node) Summary {
 	var s Summary
 	for _, n := range nodes {
 		switch n.Role {
@@ -278,6 +314,14 @@ func summarize(nodes []Node) Summary {
 			s.Generated++
 		case RoleGroup:
 			s.Grouped += n.Count
+		}
+		// The root (the Application itself, whose health is a roll-up of its
+		// children) and synthetic group buckets are NOT managed resources, so
+		// they must not inflate the degraded/out-of-sync tallies that drive
+		// "N managed resources are degraded". The app's own health is shown
+		// separately in the header.
+		if n.Role == RoleRoot || n.Role == RoleGroup {
+			continue
 		}
 		if n.Health == "Degraded" || n.Health == "Missing" {
 			s.Degraded++

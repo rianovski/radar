@@ -12,8 +12,8 @@ import (
 // InitAllSubsystems initializes all subsystems in the correct order.
 // Used for both initial boot and after context switch.
 //
-// Returns an error if a critical subsystem (resource cache) fails to
-// initialize. All other subsystems log warnings and continue in degraded mode.
+// Returns an error if a critical subsystem (timeline or resource cache) fails
+// to initialize. All other subsystems log warnings and continue in degraded mode.
 //
 // External subsystem callbacks (timeline, helm, traffic, prometheus) must be
 // registered via the Register*Funcs methods before calling this function.
@@ -31,7 +31,7 @@ func InitAllSubsystems(ctx context.Context, progress func(string)) error {
 		progress("Initializing timeline...")
 		t := time.Now()
 		if err := tlReinitFn(); err != nil {
-			log.Printf("Warning: timeline init failed: %v", err)
+			return fmt.Errorf("timeline init failed: %w", err)
 		}
 		logTiming("   Timeline init: %v", time.Since(t))
 	}
@@ -114,25 +114,42 @@ func InitAllSubsystems(ctx context.Context, progress func(string)) error {
 		}
 
 		// CRD warmup and full discovery run in background.
+		// Do NOT use InitAllSubsystems' ctx: callers cancel it as soon as
+		// critical sync returns (InitializeCluster defer cancel /
+		// ContextSwitchTimeout). Deferred typed LISTs can still take minutes
+		// on large clusters — that cancel would abort CRD work entirely.
+		// OperationContext survives until CancelOngoingOperations (context
+		// switch / retry / auth-loss), which is the right lifetime.
 		if dc := GetDynamicResourceCache(); dc != nil {
 			go func() {
 				crdStart := time.Now()
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							buf := make([]byte, 4096)
-							n := runtime.Stack(buf, false)
-							log.Printf("PANIC in CRD warmup: %v\n%s", r, buf[:n])
-						}
-					}()
-					wt := time.Now()
-					RegisterSupportedCRDFallbacks()
-					WarmupCommonCRDs()
-					logTiming("   CRD warmup: %v (background)", time.Since(wt))
-				}()
-				dt := time.Now()
-				dc.DiscoverAllCRDs()
-				logTiming("   CRD full discovery: %v (background)", time.Since(dt))
+				lifecycleCtx := OperationContext()
+				deferredDone := cache.DeferredDone()
+				stillCurrent := func() bool {
+					return GetDynamicResourceCache() == dc && GetResourceCache() == cache
+				}
+				runCRDWarmupSequence(lifecycleCtx, deferredDone, stillCurrent,
+					func() {
+						wt := time.Now()
+						RegisterSupportedCRDFallbacks()
+						WarmupCommonCRDs()
+						logTiming("   CRD warmup: %v (background)", time.Since(wt))
+					},
+					func() {
+						dt := time.Now()
+						dc.DiscoverAllCRDs()
+						logTiming("   CRD full discovery: %v (background)", time.Since(dt))
+					},
+					func() {
+						// Conditional Kyverno warmup runs after discovery so the
+						// IsKyvernoInstalled() signal sees every CRD that landed
+						// during WarmupCommonCRDs or DiscoverAllCRDs (admin may
+						// have installed Kyverno after Radar started).
+						pt := time.Now()
+						WarmupKyvernoPolicyReports()
+						logTiming("   Kyverno PolicyReport warmup: %v (background)", time.Since(pt))
+					},
+				)
 				logTiming("   CRD total (warmup+discovery): %v (background)", time.Since(crdStart))
 			}()
 		}
@@ -201,6 +218,55 @@ func InitAllSubsystems(ctx context.Context, progress func(string)) error {
 	return nil
 }
 
+// runCRDWarmupSequence runs the background CRD warmup/discovery steps in
+// order, after the deferred typed informers finish their initial sync. The CRD
+// probes and LISTs share the apiserver connection and rate-limit budget with
+// the deferred LISTs — ReplicaSets and Secrets, the heaviest kinds on large
+// clusters — so letting them race starves the sync that resource views block
+// on. deferredDone always closes, even when deferred sync fails or no kinds
+// are deferred, so the gate cannot wedge; ctx cancellation (context switch /
+// CancelOngoingOperations) abandons the wait and any remaining steps.
+//
+// stillCurrent, when non-nil, is checked after the gate and between steps so a
+// sequence that outlives a context switch does not run against a replaced
+// cache. Pass nil in tests that drive the helper directly.
+func runCRDWarmupSequence(ctx context.Context, deferredDone <-chan struct{}, stillCurrent func() bool, steps ...func()) {
+	if deferredDone != nil {
+		gateStart := time.Now()
+		select {
+		case <-deferredDone:
+			logTiming("   CRD warmup gate: deferred informers done after %v (background)", time.Since(gateStart))
+		case <-ctx.Done():
+			log.Printf("CRD warmup abandoned during deferred gate after %v: %v", time.Since(gateStart), ctx.Err())
+			return
+		}
+	}
+	if stillCurrent != nil && !stillCurrent() {
+		log.Printf("CRD warmup abandoned: cluster caches replaced during deferred gate")
+		return
+	}
+	for _, step := range steps {
+		if ctx.Err() != nil {
+			log.Printf("CRD warmup abandoned between steps: %v", ctx.Err())
+			return
+		}
+		if stillCurrent != nil && !stillCurrent() {
+			log.Printf("CRD warmup abandoned: cluster caches replaced between steps")
+			return
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					buf := make([]byte, 4096)
+					n := runtime.Stack(buf, false)
+					log.Printf("PANIC in CRD warmup step: %v\n%s", r, buf[:n])
+				}
+			}()
+			step()
+		}()
+	}
+}
+
 // ResetAllSubsystems tears down all subsystems in reverse order of init.
 // Init order: 1) timeline, 2) resource cache + API discovery, 3) dynamic cache,
 // 4) remaining (metrics history, helm, traffic, prometheus).
@@ -209,6 +275,13 @@ func InitAllSubsystems(ctx context.Context, progress func(string)) error {
 // does not prevent remaining subsystems from being torn down.
 func ResetAllSubsystems() {
 	// Step 4 subsystems (reverse): prometheus, traffic, helm, metrics history
+	contextSwitchMu.RLock()
+	costResetFn := costResetFunc
+	contextSwitchMu.RUnlock()
+	if costResetFn != nil {
+		safeReset("cost source", costResetFn)
+	}
+
 	contextSwitchMu.RLock()
 	promResetFn := prometheusResetFunc
 	contextSwitchMu.RUnlock()
@@ -232,7 +305,11 @@ func ResetAllSubsystems() {
 
 	safeReset("metrics history", ResetMetricsHistory)
 
-	// Step 3: dynamic cache
+	// Step 3: dynamic cache. Reset the PolicyReport index first because
+	// it holds references into the dynamic cache's informer indexers —
+	// clearing the index before tearing down the informers avoids using
+	// half-disposed informers on the next event-driven rebuild.
+	safeReset("policy report index", ResetPolicyReportIndex)
 	safeReset("dynamic resource cache", ResetDynamicResourceCache)
 
 	// Step 2: resource discovery + resource cache

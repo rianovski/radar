@@ -1,11 +1,15 @@
-import { ClipboardCheck, ArrowRight, Check } from 'lucide-react'
+import { ClipboardCheck, ArrowRight, Check, AlertTriangle } from 'lucide-react'
 import { clsx } from 'clsx'
 import { SEVERITY_TEXT, SEVERITY_DOT } from '../../utils/badge-colors'
+import { SEVERITY_FILL_CLASS, SEVERITY_TEXT_CLASS } from '../checks/severity'
 
 export interface AuditCardData {
+  missingInputs?: string[]
   passing: number
+  /** Raw compatibility counts; warning renders as Medium and danger as High. */
   warning: number
   danger: number
+  /** Nested warning/danger counts follow the same Medium/High mapping. */
   categories: Record<string, { passing: number; warning: number; danger: number }>
 }
 
@@ -14,28 +18,29 @@ interface AuditCardProps {
   onNavigate: () => void
 }
 
-type SeverityLevel = 'success' | 'warning' | 'error'
+type SeverityLevel = 'success' | 'high' | 'medium' | 'neutral'
 
 function getSeverityLevel(data: AuditCardData): SeverityLevel {
-  if (data.warning + data.danger === 0) return 'success'
-  const dangerRatio = data.danger / (data.warning + data.danger)
-  if (dangerRatio > 0.2) return 'error'
-  return 'warning'
+  if (data.warning + data.danger === 0) return data.missingInputs?.length || data.passing === 0 ? 'neutral' : 'success'
+  const highRatio = data.danger / (data.warning + data.danger)
+  if (highRatio > 0.2) return 'high'
+  return 'medium'
 }
 
-// Card-specific accent backgrounds (light opacity variants, work in both themes)
 const ACCENT_BG: Record<SeverityLevel, string> = {
+  neutral: 'bg-theme-elevated',
   success: 'bg-green-500/10',
-  warning: 'bg-yellow-500/10',
-  error: 'bg-red-500/10',
+  high: 'bg-orange-500/10',
+  medium: 'bg-yellow-500/10',
 }
 
 export function AuditCard({ data, onNavigate }: AuditCardProps) {
   const total = data.passing + data.warning + data.danger
   const issueCount = data.warning + data.danger
-  const allPassing = issueCount === 0
+  const incomplete = (data.missingInputs?.length ?? 0) > 0
+  const allPassing = issueCount === 0 && total > 0 && !incomplete
   const level = getSeverityLevel(data)
-  const accentColor = SEVERITY_TEXT[level]
+  const accentColor = level === 'neutral' ? 'text-theme-text-secondary' : level === 'success' ? SEVERITY_TEXT.success : SEVERITY_TEXT_CLASS[level]
   const accentBg = ACCENT_BG[level]
 
   return (
@@ -47,14 +52,14 @@ export function AuditCard({ data, onNavigate }: AuditCardProps) {
         <div className="flex items-center justify-between px-5 py-3 border-b border-theme-border/50">
           <div className="flex items-center gap-2">
             <ClipboardCheck className={clsx('w-4 h-4', accentColor)} />
-            <span className={clsx('text-xs font-semibold uppercase tracking-wider', accentColor)}>Cluster Audit</span>
+            <span className={clsx('text-xs font-semibold uppercase tracking-wider', accentColor)}>Cluster Checks</span>
             {issueCount > 0 ? (
               <span className={clsx('badge-sm', accentBg, accentColor)}>
                 {issueCount}
               </span>
             ) : (
               <span className={clsx('badge-sm', accentBg, accentColor)}>
-                <Check className="w-3 h-3" />
+                {allPassing ? <Check className="w-3 h-3" /> : <ClipboardCheck className="w-3 h-3" />}
               </span>
             )}
           </div>
@@ -69,6 +74,12 @@ export function AuditCard({ data, onNavigate }: AuditCardProps) {
                 <span className="text-xs text-theme-text-tertiary">{total} checks across {Object.keys(data.categories).length} categories</span>
               )}
             </div>
+          ) : issueCount === 0 ? (
+            <div className="flex flex-col items-center gap-2 text-center">
+              {incomplete ? <AlertTriangle className="w-8 h-8 text-warning-text" /> : <ClipboardCheck className="w-8 h-8 text-theme-text-tertiary" />}
+              <span className="text-sm font-medium text-theme-text-primary">{incomplete ? 'Some checks could not run' : 'No resources evaluated'}</span>
+              <span className="text-xs text-theme-text-secondary">{incomplete ? 'No findings in the available data.' : 'Check the selected scope and check settings.'}</span>
+            </div>
           ) : (
             <>
               {/* Distribution bar — only show when we have passing data for context */}
@@ -77,10 +88,10 @@ export function AuditCard({ data, onNavigate }: AuditCardProps) {
                   <div className="flex-1 h-3 rounded-full overflow-hidden bg-theme-hover flex">
                     <div className={clsx('h-full', SEVERITY_DOT.success)} style={{ width: `${(data.passing / total) * 100}%` }} />
                     {data.warning > 0 && (
-                      <div className={clsx('h-full', SEVERITY_DOT.warning)} style={{ width: `${(data.warning / total) * 100}%` }} />
+                      <div className={clsx('h-full', SEVERITY_FILL_CLASS.medium)} style={{ width: `${(data.warning / total) * 100}%` }} />
                     )}
                     {data.danger > 0 && (
-                      <div className={clsx('h-full', SEVERITY_DOT.error)} style={{ width: `${(data.danger / total) * 100}%` }} />
+                      <div className={clsx('h-full', SEVERITY_FILL_CLASS.high)} style={{ width: `${(data.danger / total) * 100}%` }} />
                     )}
                   </div>
                 </div>
@@ -90,7 +101,7 @@ export function AuditCard({ data, onNavigate }: AuditCardProps) {
               <div className="grid grid-cols-1 gap-y-2 mt-4 w-full">
                 {Object.entries(data.categories).map(([category, counts]) => {
                   const catIssues = counts.warning + counts.danger
-                  const dotColor = counts.danger > 0 ? SEVERITY_DOT.error : counts.warning > 0 ? SEVERITY_DOT.warning : SEVERITY_DOT.success
+                  const dotColor = counts.danger > 0 ? SEVERITY_FILL_CLASS.high : counts.warning > 0 ? SEVERITY_FILL_CLASS.medium : SEVERITY_DOT.success
                   return (
                     <div key={category} className="flex items-center gap-2">
                       <span className={clsx('w-2 h-2 rounded-full shrink-0', dotColor)} />
@@ -98,14 +109,14 @@ export function AuditCard({ data, onNavigate }: AuditCardProps) {
                       {catIssues > 0 ? (
                         <div className="flex items-center gap-2">
                           {counts.danger > 0 && (
-                            <span className={clsx('text-xs font-semibold tabular-nums', SEVERITY_TEXT.error)}>{counts.danger} critical</span>
+                            <span className={clsx('text-xs font-semibold tabular-nums', SEVERITY_TEXT_CLASS.high)}>{counts.danger} high</span>
                           )}
                           {counts.warning > 0 && (
-                            <span className={clsx('text-xs font-semibold tabular-nums', SEVERITY_TEXT.warning)}>{counts.warning} warning</span>
+                            <span className={clsx('text-xs font-semibold tabular-nums', SEVERITY_TEXT_CLASS.medium)}>{counts.warning} medium</span>
                           )}
                         </div>
                       ) : (
-                        <span className={clsx('text-xs font-semibold', SEVERITY_TEXT.success)}>All passing</span>
+                        <span className={clsx('text-xs font-semibold', incomplete ? 'text-theme-text-secondary' : SEVERITY_TEXT.success)}>{incomplete ? 'No findings' : 'All passing'}</span>
                       )}
                     </div>
                   )
@@ -114,6 +125,8 @@ export function AuditCard({ data, onNavigate }: AuditCardProps) {
             </>
           )}
         </div>
+
+        {incomplete && issueCount > 0 && <p className="px-4 pb-2 text-xs text-warning-text">Some checks could not run.</p>}
 
         <div className="px-4 py-1.5 border-t border-theme-border/50 flex items-center justify-end">
           <span className={clsx(

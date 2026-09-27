@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 ## Project Overview
 
-Radar is a modern Kubernetes visibility tool — local-first, no account required, no cloud dependency, fast. It provides topology visualization, event timeline, service traffic maps, resource browsing, Helm management, and cluster audit (best-practices scanning). Runs as a kubectl plugin (`kubectl-radar`) or standalone binary and opens a web UI in the browser. Open source, free forever. Built by Skyhook.
+Radar is a modern Kubernetes visibility tool — local-first, no account required, no cloud dependency, fast. It provides topology visualization, event timeline, service traffic maps, resource browsing, Helm management, cluster audit (best-practices scanning), and Kubernetes upgrade impact analysis. Runs as a kubectl plugin (`kubectl-radar`) or standalone binary and opens a web UI in the browser. Open source, free forever. Built by Skyhook.
 
 ## Code comments
 
@@ -12,6 +12,11 @@ Radar is a modern Kubernetes visibility tool — local-first, no account require
 - Don't explain WHAT the code does — well-named identifiers already do that.
 - **Don't reference tickets, PRs, bug numbers, or diff history** in code comments (e.g. "fixes SKY-123", "Bugbot caught this on PR #584", "used to read X, now…"). Those belong in the PR description and rot as the codebase evolves. The WHY of the change should stand on its own.
 - This applies to comments written by any tool (Cursor, Bugbot, Copilot) as well as humans — strip ticket/PR references before merging.
+
+## Release and publishing authorization
+
+- Never create, move, or delete Git tags or GitHub Releases; dispatch release or publish workflows; or publish binaries, container images, npm packages, package-manager artifacts, Helm charts, or other distribution artifacts without explicit user approval naming the exact artifact, version, and action.
+- Approval to implement a change, open or merge a PR, or prepare release changes is not authorization to publish. If release authorization is ambiguous, stop and ask.
 
 ## Reference Docs — MUST READ before making changes
 
@@ -22,13 +27,15 @@ Not everything is in this file. The following files contain critical details tha
 | Adding or modifying **HTTP endpoints** | `internal/server/server.go` — all routes are defined here |
 | Adding or modifying **CLI flags** | `cmd/explorer/main.go` — flag definitions and defaults |
 | Adding a **new CRD integration** (renderer, topology, discovery) | [docs/INTEGRATION_GUIDE.md](docs/INTEGRATION_GUIDE.md) — full checklist with collision gotchas |
+| Working on the **Capacity (Karpenter) views** | [docs/capacity.md](docs/capacity.md) — the four screens, the per-value certainty contract (`= ≥ ≤ ?`, unavailable ≠ zero, partial ≠ exact, declared ≠ actual), demand-evaluation semantics, and the real Karpenter failure model. Wire types in `pkg/capacityapi`, engine in `internal/capacity`, handlers in `internal/server/capacity*` |
 | Working on **resource renderers** | `packages/k8s-ui/src/components/resources/renderers/` — all existing renderers live here |
 | Understanding **cluster connection behavior** | [docs/configuration.md](docs/configuration.md) — kubeconfig precedence, multi-context, in-cluster |
 | Working on **MCP tools or AI context** | [docs/mcp.md](docs/mcp.md) + `internal/mcp/tools.go` — tool definitions and design rationale |
+| Working on the **investigation verdict, story or Findings pane** | [docs/mcp.md](docs/mcp.md#the-story-contract) — the verdict JSON, `[[radar:evidence=N]]` placement grammar, run-scoped citation, and the assessment-turn rule. The contract lives in `pkg/investigation` (shared with Radar Hub): prompt suite `prompt.go` (`SystemPrompt`, `TaskPrompt`, `verdictContract`, `storyGuidance`), verdict types and caps `verdict.go`, parser `parse.go`, binder `bind.go`; OSS orchestration and ref eligibility stay in `internal/ai/runs.go`; frontend tokenizer `web/src/components/diagnose/investigationStory.ts`, story `AnalysisStory.tsx`, turn rule `investigationState.ts` (`investigationIsAssessmentTurn`) |
 | Writing or modifying **frontend UI / styling** | [DESIGN.md](DESIGN.md) — theme tokens, do's/don'ts, component patterns |
 | Touching anything library consumers import | `web/package.json` + `web/src/index.ts` — `web/` IS the `@skyhook-io/radar-app` npm package. Public surface: `RadarApp`, runtime-config setters (`setApiBase` etc.), `NavCustomization`. Breaking it breaks all downstream consumers. |
 | Adding or changing **api/fetch call sites** | `web/src/api/config.ts` — all fetches go through `getApiBase()`, `apiUrl()`, `getWsUrl()`, `getAuthHeaders()`, `getCredentialsMode()`. New fetch sites must use these helpers so library consumers (Radar Hub) can override per-cluster. |
-| Embedding Radar inside another app | `web/src/RadarApp.tsx` + `web/src/context/NavCustomization.tsx` — `apiBase`, `basename`, `router`, `navSlots` props. Changes to this API surface are breaking. |
+| Embedding Radar inside another app | `web/src/RadarApp.tsx` + `web/src/context/NavCustomization.tsx` — `apiBase`, `basename`, `router`, `navSlots` props. Check Radar Hub call sites when changing this interface. |
 
 ## Library distribution
 
@@ -39,11 +46,11 @@ Publish with tag `radar-app-v<semver>` — see `.github/workflows/publish-radar-
 Consumers get:
 - `<RadarApp apiBase basename router navSlots queryClient />` — the whole app as one component
 - Runtime config setters for cross-cutting behavior (`setApiBase`, `setBasename`, `setAuthHeadersProvider`, `setCredentialsMode`) for non-React code paths
-- `NavCustomization` type for nav slot injection
+- `NavCustomization` type for embedded layout and Hub navigation hooks
 
 Known consumers: Radar Hub (`skyhook-dev/radar-hub-web`).
 
-**Backwards-compat rule:** adding props is fine; removing or renaming `apiBase` / `basename` / `navSlots` fields is breaking. Bump major version.
+**Consumer scope:** Radar OSS and Radar Hub are the supported consumers. Coordinate interface changes with Hub; do not preserve unused modes or add migration machinery for hypothetical consumers. `navSlots.embedded` hides all Radar chrome; Hub owns its sidebar and top bar.
 
 ## Architecture
 
@@ -76,150 +83,7 @@ Known consumers: Radar Hub (`skyhook-dev/radar-hub-web`).
 
 ## Project Structure
 
-```
-radar/
-├── cmd/
-│   ├── explorer/              # CLI entry point (main.go)
-│   └── desktop/               # Desktop app entry point (Wails v2)
-├── internal/
-│   ├── app/                   # Application lifecycle management
-│   ├── audit/                 # Radar-specific audit runner (cache → pkg/audit bridge)
-│   ├── config/                # Configuration management
-│   ├── errorlog/              # Error logging utilities
-│   ├── helm/                  # Helm client integration
-│   │   ├── client.go          # Helm SDK wrapper
-│   │   ├── handlers.go        # HTTP handlers for Helm operations
-│   │   └── types.go           # Helm release types
-│   ├── images/                # Container image analysis
-│   │   ├── auth.go            # Registry authentication (pull secrets, ECR, GCR, ACR)
-│   │   ├── handlers.go        # HTTP handlers for image inspection
-│   │   ├── inspector.go       # Image filesystem extraction and caching
-│   │   └── types.go           # Image metadata and filesystem types
-│   ├── k8s/
-│   │   ├── cache.go           # Singleton wrapper over pkg/k8score + Radar-specific extensions
-│   │   ├── capabilities.go    # Cluster capability detection
-│   │   ├── client.go          # K8s client initialization
-│   │   ├── cluster_detection.go # GKE/EKS/AKS platform detection
-│   │   ├── connection_state.go  # Connection state tracking
-│   │   ├── context_manager.go   # Multi-context kubeconfig switching
-│   │   ├── discovery.go       # API resource discovery for CRDs
-│   │   ├── dynamic_cache.go   # CRD/dynamic resource support
-│   │   ├── ephemeral.go       # Ephemeral/debug containers
-│   │   ├── history.go         # Change history tracking
-│   │   ├── fetch.go           # Resource fetching for AI/MCP consumers
-│   │   ├── metrics.go         # Pod/node metrics collection
-│   │   ├── metrics_history.go # Metrics history tracking
-│   │   ├── problems.go        # Problem detection
-│   │   ├── subsystems.go      # Cache subsystem management
-│   │   ├── topology_adapter.go # Topology adaptation layer
-│   │   ├── update.go          # Resource update/delete operations
-│   │   └── workload.go        # Workload operations (restart, scale, rollback)
-│   ├── mcp/                   # MCP (Model Context Protocol) server
-│   │   ├── server.go          # MCP HTTP handler setup
-│   │   ├── tools.go           # MCP tool definitions (15 tools)
-│   │   ├── tools_helm.go      # Helm-specific MCP tools
-│   │   ├── tools_gitops.go    # GitOps-specific MCP tools
-│   │   ├── tools_workloads.go # Workload-specific MCP tools
-│   │   └── resources.go       # MCP resource definitions (3 resources)
-│   ├── opencost/              # OpenCost integration (cost analysis)
-│   │   ├── handlers.go        # HTTP handlers for cost endpoints
-│   │   └── types.go           # Cost data types
-│   ├── prometheus/            # Prometheus client integration
-│   │   ├── client.go          # Prometheus API client
-│   │   ├── discovery.go       # Auto-discovery of Prometheus/VictoriaMetrics
-│   │   ├── handlers.go        # HTTP handlers for Prometheus endpoints
-│   │   └── queries.go         # PromQL query helpers
-│   ├── server/
-│   │   ├── server.go          # chi router, main REST endpoints
-│   │   ├── sse.go             # Server-Sent Events broadcaster
-│   │   ├── certificate.go     # TLS certificate parsing and expiry
-│   │   ├── copy.go            # Copy operations
-│   │   ├── desktop_open_url.go # Desktop URL handling
-│   │   ├── desktop_update.go  # Desktop app auto-update handlers
-│   │   ├── diagnostics.go     # Diagnostics endpoints
-│   │   ├── exec.go            # WebSocket pod terminal exec
-│   │   ├── logs.go            # Pod logs streaming
-│   │   ├── workload_logs.go   # Workload-level log aggregation
-│   │   ├── portforward.go     # Port forwarding sessions
-│   │   ├── resource_counts.go # Resource counting
-│   │   ├── dashboard.go       # Dashboard summary endpoint
-│   │   ├── argo_handlers.go   # ArgoCD sync/refresh/terminate/suspend/resume/rollback/selective-sync handlers
-│   │   ├── flux_handlers.go   # FluxCD reconcile/suspend/resume/sync-with-source handlers
-│   │   ├── gitops_handlers.go # /api/gitops/tree + /api/gitops/insights handlers, insightsResolver wiring
-│   │   ├── gitops_types.go    # Shared GitOps request/response types
-│   │   ├── ai_handlers.go     # AI resource preview endpoints
-│   │   └── traffic_handlers.go # Service mesh traffic flow handlers
-│   ├── settings/              # Application settings management
-│   ├── static/                # Embedded frontend files
-│   ├── traffic/               # Service mesh traffic analysis
-│   ├── updater/               # Binary self-update logic
-│   └── version/               # Version information
-├── pkg/
-│   ├── ai/
-│   │   └── context/           # AI context minification for LLM-friendly output
-│   ├── audit/                 # Shared cluster audit check engine (reusable by skyhook-connector)
-│   ├── gitops/                # GitOps operations abstraction
-│   │   ├── insights/          # Per-app diagnosis pipeline: issues + drift diff + recent events + plan + history
-│   │   └── tree/              # GitOps resource tree builder for ArgoCD/FluxCD detail graphs
-│   ├── k8score/               # Shared K8s caching layer (informers, listers, transforms)
-│   ├── portforward/           # Port forwarding logic
-│   ├── timeline/              # Timeline event storage (memory/SQLite)
-│   └── topology/
-│       ├── builder.go         # Topology graph construction
-│       ├── certificates.go    # Certificate relationship detection
-│       ├── memo.go            # 5s-TTL Memoizer wrapping deterministic Topology builds (used by GitOps handlers)
-│       ├── pod_grouping.go    # Pod grouping/collapsing logic
-│       ├── relationships.go   # Resource relationship detection
-│       └── types.go           # Node, edge, topology definitions
-├── packages/
-│   └── k8s-ui/                # Shared UI package (@skyhook-io/k8s-ui)
-│       └── src/
-│           ├── components/
-│           │   ├── audit/      # AuditCard, AuditAlerts, AuditFindingsTable (shared)
-│           │   ├── resources/  # ResourcesView, resource-utils, renderers
-│           │   ├── shared/     # ResourceRendererDispatch, ResourceActionsBar, EditableYamlView
-│           │   ├── gitops/     # ArgoCD/FluxCD shared status badges, action buttons, tree graph (GitOpsTreeGraph), insights views (GitOpsStatusStrip, GitOpsIssuesBand, GitOpsFailureCard, GitOpsChangesView with inline drift+events expand, GitOpsActivityInsightView)
-│           │   ├── workload/   # WorkloadView
-│           │   ├── timeline/   # Timeline shared components
-│           │   ├── logs/       # Log viewer core
-│           │   └── ui/         # Shared UI primitives (Toast, CodeViewer, etc.)
-│           ├── hooks/          # useKeyboardShortcuts, useRefreshAnimation
-│           ├── types/          # Shared TypeScript types
-│           └── utils/          # Pure utilities (api-resources, format, icons, etc.)
-├── web/                       # React frontend (embedded at build)
-│   ├── src/
-│   │   ├── api/               # API client + SSE hooks
-│   │   ├── components/
-│   │   │   ├── dock/          # Bottom dock with terminal/logs tabs
-│   │   │   ├── gitops/        # GitOps workspace: table+tile views, filters, app detail (Topology/Changes/Activity tabs), SyncOptionsDialog, RollbackDialog
-│   │   │   ├── helm/          # Helm release management UI
-│   │   │   ├── home/          # Home/dashboard view
-│   │   │   ├── logs/          # Logs viewer component
-│   │   │   ├── portforward/   # Port forward manager
-│   │   │   ├── resource/      # Single resource detail page
-│   │   │   ├── resource-drawer/ # Resource drawer overlay
-│   │   │   ├── resources/     # Resource list panels (thin wrappers over @skyhook-io/k8s-ui)
-│   │   │   ├── audit/          # Cluster audit detail view
-│   │   │   ├── cost/           # Cost tracking and visualization
-│   │   │   ├── settings/      # Settings dialog
-│   │   │   ├── shared/        # Shared components (namespace picker, YAML editor)
-│   │   │   ├── timeline/      # Timeline view (activity & changes)
-│   │   │   ├── topology/      # Graph visualization
-│   │   │   ├── traffic/       # Traffic flow visualization
-│   │   │   ├── workload/      # Workload detail view
-│   │   │   └── ui/            # Base shadcn/ui components
-│   │   ├── context/           # React contexts (connection, theme, context-switch)
-│   │   ├── contexts/          # React contexts (capabilities)
-│   │   ├── hooks/             # Custom React hooks
-│   │   ├── types.ts           # TypeScript type definitions
-│   │   └── utils/             # Topology and utility functions
-│   └── package.json
-├── deploy/                    # Docker, Helm, Krew configs
-├── docs/                      # User documentation (configuration, in-cluster guide)
-├── scripts/                   # Release scripts
-├── .github/                   # CI workflows, issue/PR templates, dependabot
-└── Makefile
-```
+See [docs/STRUCTURE.md](docs/STRUCTURE.md) for the full directory map + tech-stack snapshot. The load-bearing concerns (caching, topology, MCP, error handling, renderers) have their own sections below — the directory tree exists to orient, not to drive behavior.
 
 ## Development Commands
 
@@ -247,50 +111,9 @@ make restart       # frontend + embed + backend + restart server
 cd web && npm run build && cd .. && go build -o radar ./cmd/explorer
 ```
 
-### Backend (Go)
-```bash
-# Run in dev mode (serves frontend from web/dist instead of embedded — no embed step needed)
-go run ./cmd/explorer --dev
+### Build / test / run
 
-# Run tests
-go test ./...
-
-# Hot reload with Air (port 9280)
-make watch-backend
-```
-
-### Frontend (React)
-```bash
-cd web
-
-# Install dependencies
-npm install
-
-# Development server with hot reload (port 9273)
-npm run dev
-
-# Build for production (outputs to web/dist)
-npm run build
-
-# Type check
-npm run tsc
-```
-
-### Full Build
-```bash
-make build          # Build everything (frontend + embed + binary)
-make restart        # Build + restart server
-make restart-fe     # Frontend-only rebuild + restart (no Go recompile)
-make frontend       # Build frontend only (to web/dist)
-make embed          # Copy web/dist → internal/static/dist
-make backend        # Build Go binary only (uses embedded assets)
-make watch-frontend # Vite dev server (port 9273)
-make watch-backend  # Air hot reload (port 9280)
-make test           # Run all tests
-make tsc            # Type check frontend
-make kill           # Kill running radar on port 9280
-make clean          # Remove build artifacts
-```
+`make help` lists every target — read the Makefile when uncertain. The day-to-day set: `make build` (frontend + embed + binary), `make restart` / `make restart-fe`, `make watch-backend` / `make watch-frontend` (Air :9280 + Vite :9273), `make test`, `make tsc`. `go run ./cmd/explorer --dev` serves the frontend from `web/dist` without the embed step.
 
 ### Visual Testing
 ```bash
@@ -301,36 +124,70 @@ source .playwright-mcp/visual-test-state.env # Load $RADAR_URL, $SCREENSHOT_DIR,
 ```
 Use `/visual-test` command for the full workflow (cluster check, Playwright MCP, screenshots, report). Screenshots go under `.playwright-mcp/visual-test/`.
 
-**GitOps demo cluster** (`scripts/gitops-demo.sh` + `make gitops-demo`): bootstraps a `kind` cluster pre-loaded with Argo CD + Flux + a curated set of fixtures (healthy + suspended + manual-sync + ApplicationSet → 3 children + Flux Kustomization with dependsOn chain + HelmRelease) for visual-testing GitOps UI changes against realistic state. Coverage matrix in `scripts/gitops-demo/README.md`. When evaluating GitOps UI changes, run `make gitops-demo` and `kubectl config use-context kind-radar-gitops-demo` before `./scripts/visual-test-start.sh` — otherwise you're testing against whatever cluster is in the current context (often a customer/EKS cluster lacking the variety needed). `make gitops-demo-drift` induces a live OutOfSync state on guestbook for testing drift rendering.
+### Demo clusters (scripted test fixtures)
 
-**Before calling a feature done — consider visual-test.** When you wrap up work that touches what the user actually sees (layout, copy, motion, color, theming, loading / empty / error states, modals, navigation, new pages, anything that changed how a screen reads), it's worth pausing to ask whether `/visual-test` would add value. `make tsc` + `make test` verify code correctness; `/visual-test` complements them by checking *feature* correctness — that the screen renders, behaves under interaction, and doesn't obviously regress neighboring surfaces. Not every UI change warrants one; this is a nudge to consider, not a hard rule.
+Scripted `kind` clusters under `scripts/*-demo.sh` reproduce the states each integration needs — states that are hard or impossible to conjure by hand (frozen controllers holding all phases at once, configurations that fail in ways that look like success, connection lanes toggled on demand).
 
-- **Run it yourself** when the change is self-contained and you can predict what the test should assert ("the new audit-finding card should show a severity badge and an expand affordance; clicking expands"). Cheap, catches obvious breakage.
-- **Ask the user** when the change is broad (touches many views), the right validation set is non-obvious, or you'd be picking which screens to capture — that judgment is theirs.
-- **Skip** for pure refactors with no visual diff, backend-only Go changes that don't surface in the UI, type-only changes, or doc edits.
+**Before using one, read its `scripts/<name>-demo/README.md` — this is not optional.** Each README is the only complete account of what the scenarios cover, which modes are NOT interchangeable, and why the cluster is shaped the way it is; the shape encodes hard-won constraints that look like bugs if you don't know them. Don't improvise against the fixtures or "fix" what looks broken before reading it.
 
-If a UI change feels worth checking, mention it when you wrap up — even just flagging "want me to run /visual-test on this?" is fine.
+After `make <name>-demo`, run `kubectl config use-context kind-radar-<name>-demo` before `./scripts/visual-test-start.sh` — otherwise you're testing against whatever cluster the current context points at (often a customer cluster lacking the fixture variety).
 
-### Development Ports
-- **9280**: Backend API server (Go)
-- **9273**: Vite dev server (proxies /api to 9280)
+| Demo | Target | Use when working on |
+|------|--------|---------------------|
+| GitOps | `make gitops-demo` | Argo CD / Flux UI. `-drift` induces live OutOfSync |
+| Kyverno | `make kyverno-demo` | Policy renderers, report-family selection, admission attribution. Scenarios `openreports` / `modern-only` |
+| Velero | `make velero-demo` | Backup/restore surfaces — all 13 Backup phases at once. `-live` for states the controller actually produced |
+| CloudNativePG | `make cnpg-demo` | CNPG renderers/badges. `-live` for real failovers; fixtures have strict ordering constraints |
+| Beyla | `make beyla-demo` | `internal/traffic/beyla.go` — which labels exist depends on Beyla config, not code. Modes `attrs` / `no-network` |
+| Cilium | `make cilium-demo` | `internal/traffic/hubble.go` — every Hubble connection lane. Modes `tls` / `netpol` / `install-radar` |
+| Kubecost | `make kubecost-demo` | Kubecost 3 current costs — real allocation/assets, local port-forward and in-cluster Service DNS. Modes `query` / `install-radar` / `radar-smoke` |
+| Calico | `make calico-demo` | Calico surfaces — both API groups, staged policies, tiers |
+| Crossplane | `make crossplane-demo` | Crossplane renderers and spec-shape dispatch |
+| Rollouts | `make rollouts-demo` | Argo Rollouts progression. `-roll` advances a rollout |
+| GPU ecosystem | `make gpu-ecosystem-demo` | All 37 curated GPU, batch, distributed-training, and inference resource identities. `install-radar` verifies default chart RBAC and group-aware discovery |
+| Kueue admission | `make kueue-demo` | Real Kueue reconciliation: admitted/running, quota-blocked with no Pod, and held-queue with no Pod |
+| JobSet | `make jobset-demo` | Real JobSet reconciliation: role/index Job-to-Pod lineage, dependency gating, and explicit terminal failure |
+| KubeRay | `make kuberay-demo` | Real RayService reconciliation: healthy active Serve revision plus an intentionally failed pending NewCluster revision |
+
+`scripts/rbac-demo.sh` is the odd one out: it seeds RBAC scenarios into the *current* context (no cluster of its own).
+
+**Before calling a UI feature done — consider visual-test.** `make tsc` + `make test` check code; `/visual-test` checks the *screen*. Run it yourself for self-contained UI changes where you can predict what should render; ask the user when the change is broad or the right capture set isn't obvious; skip for pure refactors / Go-only / type-only / doc edits.
+
+### Dev ports
+**9280** Go backend · **9273** Vite (proxies `/api` → 9280).
 
 ## API Endpoints & CLI Flags
 
 **You MUST read `internal/server/server.go` before adding or modifying any endpoint** — it is the single source of truth for all routes. CLI flags live in `cmd/explorer/main.go`. Key URL patterns:
-- REST resources: `/api/resources/{kind}`, `/api/resources/{kind}/{ns}/{name}`, `/api/resources/apply` (POST)
+- REST resources: `/api/resources/{kind}`, `/api/resources/{kind}/{ns}/{name}`, `/api/resources/apply` (POST), `/api/resources/preview` (POST, server-dry-run review), `/api/resources/schemas` (POST, connected-cluster OpenAPI schemas)
+  - `/api/resources/{kind}` returns a **bare array**; `?table=1` switches to the printer-column envelope `{items, kind, group, columns, cells}`, returned for every **200** with null `columns`/`cells` when there is no table (errors stay `{"error"}`). Don't combine with `?include=summary` — the strip runs first and mutates in place, so a column reading a stripped subtree resolves to null.
 - SSE streaming: `/api/events/stream`, `/api/traffic/flows/stream`
 - WebSocket: `/api/pods/{ns}/{name}/exec`
 - MCP: `/mcp` (Streamable HTTP — POST for JSON-RPC, GET for SSE)
 - Helm: `/api/helm/releases/...`
-- Workloads: `/api/workloads/{kind}/{ns}/{name}/...` (logs, restart, scale, rollback)
+- Workloads: `/api/workloads/{kind}/{ns}/{name}/...` (logs, restart, scale, revisions, rollback, images) — `revisions`/`rollback` accept Deployment, StatefulSet, DaemonSet, and **Rollout**; `rollbackableWorkloadKinds` in `server.go` is the gate. `images` GET/POST accepts the same four kinds, uses compare-and-swap JSON Patch, and follows a Rollout's `workloadRef` to the referenced workload
+- Argo Rollouts: `/api/rollouts/{ns}/{name}/{abort,retry,promote,promote-full,skip-step}` (POST) + `/api/rollouts/{ns}/{name}/capabilities` (GET). Rollback/history deliberately live on the `/workloads` routes above (same operation shape, shared revision UI). The status verbs patch the `rollouts/status` subresource, so capabilities SAR `rollouts` **and** `rollouts/status` separately — `patch rollouts` does not imply `patch rollouts/status`. Promotion waits for the controller to observe the current pod template first — a rollback changes it before the controller writes status, and promoting into that window is discarded — so `promote-full` can return **503** (`ErrControllerNotCaughtUp`) and is safe to retry. For a `workloadRef` Rollout that template lives on the referenced workload, which the caller must be able to `get`. Engine in `pkg/rollouts`, handlers in `internal/server/rollouts_handlers.go`
 - GitOps controller actions: `/api/argo/applications/...` (sync, refresh, terminate, suspend, resume, rollback, selective-sync), `/api/flux/{kind}/...` (reconcile, suspend, resume, sync-with-source)
-- GitOps detail data: `/api/gitops/tree/{kind}/{ns}/{name}` (resource tree + ownership edges), `/api/gitops/insights/{kind}/{ns}/{name}` (curated diagnosis: summary + issues + drift + events + plan + history + capabilities)
-- Nodes: `/api/nodes/{name}/...` (cordon, uncordon, drain, debug)
+- Argo CD API integration: `PUT /api/integrations/argocd` (URL/token, probe-before-persist, token preserved across GET-redaction round-trips); `/api/argo/applications/{ns}/{name}/resource-diff` (Git-rendered desired vs live via argocd-server managed-resources; dual RBAC gate + structural Secret redaction; see docs/gitops.md)
+- GitOps detail data: `/api/gitops/tree/{kind}/{ns}/{name}` (resource tree + ownership edges), `/api/gitops/insights/{kind}/{ns}/{name}` (curated diagnosis: summary + issues + drift + events + plan + history + capabilities), `/api/gitops/destination/{kind}/{ns}/{name}` (where a remote Application or `spec.kubeConfig` Flux object deploys: display host + the kubeconfig contexts whose full server URL matches; the object and any kubeconfig Secret are read as the caller, and full URLs never leave the server)
+- Nodes: `/api/nodes/{name}/...` (cordon, uncordon, drain, drain-plan (read-only estimate: per-pod evict/skip/may-block with reasons), debug)
 - Audit: `/api/audit`, `/api/audit/resource/{kind}/{ns}/{name}`, `/api/settings/audit` (GET/PUT)
+- Network trace: `/api/trace/{kind}/{ns}/{name}` (path-shaped diagnosis for Service/Ingress/HTTPRoute/GRPCRoute/Gateway; `?probe=true` runs DNS/TCP/TLS/HTTP probes against the declared path - direct TCP in-cluster, K8s API server proxy from a laptop, gated by the user's `services/proxy` + `pods/proxy` RBAC).
+- Capacity (Karpenter): `/api/capacity` (overview), `/api/capacity/pools` (+ `/{name}`, `/{name}/members`), `/api/capacity/demand` (`?state=`, `?pool=`, `?owner=ns/Kind/name`, `?pod=ns/name`), `/api/capacity/activity` — all read-only, all gated on the caller's ability to list NodePools; deliberately cluster-wide (no namespace view-filter forwarding). See [docs/capacity.md](docs/capacity.md)
+- Upgrade impact: `/api/upgrade-readiness?target={major.minor}` (GET; cluster-wide evidence bounded by the current identity's RBAC and the configured cache scope; `?refresh=true` bypasses the shared scan memo). Engine in `pkg/upgradereadiness`; service layer — runner, live collectors, `EvidenceAuthorizer` seam, bounded scan memo — in `internal/upgrade`, shared by the HTTP handler and the `get_cluster_upgrade_readiness` MCP tool
 - CAPI: `/api/capi/clusters/{ns}/{name}/kubeconfig` (GET), `/api/capi/clusters/{ns}/{name}/connect` (POST)
+- Prometheus metrics: `/api/prometheus/resources/{kind}/{ns}/{name}`, `/api/prometheus/resources/Node/{name}`, `/api/prometheus/namespace/{ns}`, `/api/prometheus/hpa/{ns}/{name}`, `/api/prometheus/pvc/...`, `/api/prometheus/rightsizing/...` are curated charts gated (auth-enabled mode) on reading the resource they chart, through the `AuthGate` seam in `internal/prometheus/auth.go` that `Server.prometheusAuthGate` implements. `/api/prometheus/cluster`, `/api/prometheus/query` and the MCP `query_prometheus` / `discover_metrics` / `get_prometheus_rules` tools are unbounded surfaces and gate on an any-namespace `list pods` SubjectAccessReview (`ClusterWideMetricsDeniedMessage` names the grant). The raw query route applies the same `MaxResponseBytes` / `SummarizeLargeResult` bounding as the MCP tool. No-auth local mode is a passthrough
+- Cloud Connect driver lane: `/api/cloud/install/{prepare,start,status,cancel,dismiss}` — the in-product device-flow install behind the funnel modal. Enabled ONLY local + auth-disabled + no `--cloud-url` (deliberately NOT gated on a loopback listener — `resources/apply` and `pods/exec` are ungated there too; a shared listener instead requires an explicit acknowledgement); every other configuration routes to the Hub wizard. The cluster token never serializes through these endpoints.
+- RBAC reverse-lookup: `/api/rbac/subject/{kind}/{namespace}/{name}` (ServiceAccount) and `/api/rbac/subject/{kind}/{name}` (User/Group) return direct + group-inherited bindings + flattened effective rules. SA subjects also get a `usedByPods` list (Pods whose `spec.serviceAccountName` matches — closes the loop on the SA detail page). `/api/rbac/role/{kind}/{namespace}/{name}` (use `_` for ClusterRole's empty namespace) returns the inverse — bindings that reference the role + their subjects. `/api/rbac/namespace/{namespace}` returns RoleBindings in the namespace + ClusterRoleBindings with at least one SA subject in it + a ServiceAccount count (backs the NamespaceRenderer's RBAC section; group-only ClusterRoleBindings like `system:authenticated` grants are deliberately excluded — they'd appear in every namespace and would be noise). `/api/rbac/whoami?namespace=...` is a pass-through of `SelfSubjectRulesReview` for the current user. Backed by `pkg/rbac/` (pure index + 5s TTL memo); endpoints gate on `list rolebindings` AND `list clusterrolebindings` (403 when either is denied — silent partial views would mislead operators).
+- Policy (Kyverno) reverse-lookup: `/api/policy/resource/{kind}/{ns}/{name}` returns one resource's policy findings; `/api/policy/policies/{policy}?namespace=&limit=` returns the inverse — every resource one policy recorded an outcome for, per rule. Report families are authorized **per subject scope** (`policyreports` cluster-wide is a different grant from `clusterpolicyreports`), findings from an unreadable family are dropped from lists AND counts with the withheld count reported, and `counts` describe the cluster while subject lists are capped and follow the namespace view filter — the two must be read together. `/api/policy/policies/{policy}/queued` returns the policy's in-flight `UpdateRequest`s; Kyverno records those in its own namespace, so it reads cluster-wide gated on `list updaterequests` rather than inheriting the caller's view filter.
+- Velero reverse-lookup: `/api/velero/backupstoragelocations/{ns}/{name}/backups` returns the Backups a storage location holds, with each one's phase, completion time and expiration, plus how many reached `Completed`. Gated on `list backups`; an unset `spec.storageLocation` resolves to whichever location carries `spec.default`, falling back to the name `default` when none does. Backs the storage location's "Stored Here" section, which states what an `Unavailable` location is holding back — the Backup's own status cannot see its location's health. `POST /api/velero/{backups|restores}/{ns}/{name}/messages` returns the warnings and errors behind a run's counts: it creates a `DownloadRequest`, waits for Velero to answer with a pre-signed URL, and fetches the results file from object storage. Impersonated (it creates a CR); needs a running Velero controller and object storage reachable from wherever Radar runs, and reports which of the two failed rather than returning an empty list.
+- CloudNativePG reverse-lookup: `/api/cnpg/imagecatalogs/{ns}/{name}/clusters` and `/api/cnpg/clusterimagecatalogs/{name}/clusters` return the Clusters pinned to an image catalog, with the major each asks for and the image it actually resolved. Cluster-scoped catalogs are referenceable from any namespace, so the cluster-scoped route reads cluster-wide gated on `list clusters` — a view-filtered answer would report "nothing uses this" before an edit.
 
 ## Key Patterns
+
+### Resource identity
+
+`pkg/resourceid` is the one model of resource identity: `Ref` (group + Kind + namespace + name; version is not identity), `Reference` (a possibly-partial reference that records where its group came from, so the core group `""` is never confused with "not recorded"), the `Builtins` table, `GroupFromAPIVersion` / `NormalizeGroup`, and the two resolution policies — `ResolveCurrent` (live joins and user requests; may infer a built-in or uniquely-served group) and `ResolveHistorical` (stored observations; never infers). Use it instead of parsing apiVersions or defaulting groups locally. Controller-recorded groups (Argo CD `status.resources`, Flux inventory) are exact: an omitted group there is core, not unknown.
 
 ### K8s Caching
 - Core informer logic lives in `pkg/k8score` — a shared package with no internal/ imports, designed for reuse
@@ -342,30 +199,23 @@ If a UI change feels worth checking, mention it when you wrap up — even just f
 - Change notifications via channel for real-time SSE updates
 - Application-specific behavior injected via `CacheConfig` callbacks: `OnChange`, `OnEventChange`, `OnReceived`, `OnDrop`, `ComputeDiff`, `IsNoisyResource`
 - **Per-kind scope decisions** via `CacheConfig.ResourceScopes` — each kind can independently be cluster-wide, namespaced, or disabled based on what the SA can list. `pkg/k8score/cache.go`'s `pickFactory` routes each informer to the matching factory; cluster-only kinds (Nodes, Namespaces, PVs, StorageClasses, IngressClasses) always use the cluster-wide factory regardless of caller intent
-- **Probe-based RBAC gating** (`internal/k8s/capabilities.go`): at startup, Radar runs a real list call against each typed kind (using the SA / kubeconfig identity) to decide if it goes cluster-wide, namespace-scoped, or off. List probes are authoritative because they ARE the operation the informer will perform — SSAR is one indirection too many and can disagree with reality on clusters using webhook authorizers (e.g. GKE IAM)
-- **In-app namespace switcher = per-user view filter**: the header's `NamespaceSwitcher` POSTs to `/api/cluster/namespace`, which the server stores as a per-user preference in `Server.nsPreferences` (key: `username\x00contextName`). It does NOT mutate the shared cache. The pick is intersected with the user's RBAC-allowed namespaces on every read in `parseNamespacesForUser` (REST) and `filterNamespacesForUser` (MCP). For the no-auth/local case, the pick persists across restarts via `settings.ActiveNamespaces` and is loaded lazily on first request. On context switch, all users' picks are dropped — they reference the previous cluster's namespaces
+- **Probe-based RBAC gating** (`internal/k8s/capabilities.go`): at startup, Radar runs a real list call against each typed kind (using the SA / kubeconfig identity) to decide if it goes cluster-wide, namespace-scoped, or off. List probes are authoritative because they ARE the operation the informer will perform — SSAR is one indirection too many and can disagree with reality on clusters using webhook authorizers (e.g. GKE IAM). When cluster-wide list is denied for a kind, the probe falls back across candidate namespaces — `{contextNs, flagNs}` plus, when listable, the user's accessible-namespaces set — capped to bound fanout on large clusters; see `buildScopeCandidates`
+- **In-app namespace switcher = per-user view filter**: the header's `NamespaceSwitcher` POSTs to `/api/cluster/namespace`, which the server stores as a per-user preference in `Server.nsPreferences` (key: `username\x00contextName`). It does NOT mutate the shared cache. The pick is intersected with the user's RBAC-allowed namespaces on every read in `parseNamespacesForUser` (REST) and `filterNamespacesForUser` (MCP). For the no-auth/local case, the pick persists across restarts via `settings.ActiveNamespaces` and is loaded lazily on first request; a context with no saved entry defaults to the kubeconfig context's explicit namespace (kubectl parity, in-memory only), and an explicit "All namespaces" choice persists as an empty entry so it suppresses that default. On context switch, all users' picks are dropped — they reference the previous cluster's namespaces
 - **Per-user RBAC filtering** (auth enabled): namespaced reads filter via `parseNamespacesForUser` → `getUserNamespaces` → `auth.DiscoverNamespaces` (SubjectAccessReview-based, "list pods" / "list deployments" sentinel). Cluster-scoped reads gated per-kind via `Server.canRead` / MCP `canReadClusterScopedKind` — both run a SAR for the exact (group, resource, verb) and cache on `UserPermissions.canI`. Cluster-wide pod visibility does NOT imply cluster-scoped reads; this is the load-bearing security distinction. Static cluster-only kinds map via `k8s.ClusterOnlyKindGVR`; dynamic CRDs use discovery's `GetResourceWithGroup`. MCP write tools / exec / logs impersonate via `DynamicClientFromContext`, so the apiserver enforces full RBAC there directly
-- Supports: Pods, Services, Deployments, DaemonSets, StatefulSets, ReplicaSets, Ingresses, IngressClasses, ConfigMaps, Secrets, Events, Jobs, CronJobs, HorizontalPodAutoscalers, PersistentVolumeClaims, PersistentVolumes, StorageClasses, PodDisruptionBudgets, ServiceAccounts, Nodes, Namespaces
+- Supports: Pods, Services, Deployments, DaemonSets, StatefulSets, ReplicaSets, Ingresses, IngressClasses, EndpointSlices, ConfigMaps, Secrets, Events, Jobs, CronJobs, HorizontalPodAutoscalers, PersistentVolumeClaims, PersistentVolumes, StorageClasses, PodDisruptionBudgets, ServiceAccounts, Nodes, Namespaces
 
-### Server-Sent Events (SSE)
-- Central `SSEBroadcaster` manages connected clients
-- Per-client namespace filters and view mode tracking
-- Cached topology for relationship lookups
-- Heartbeat mechanism for connection health
-- Event types: topology changes, K8s events, resource updates
+### SSE + WebSocket exec
 
-### WebSocket Pod Exec
-- Full terminal emulation via xterm.js in browser
-- Container and shell selection support
-- Terminal resize handling with size queue
-- TTY, stdin, stdout, stderr support
+SSE: `internal/server/sse.go` — central `SSEBroadcaster` with per-client namespace filter + view-mode, heartbeats, topology cache for relationship lookups, emits topology / K8s-event / resource-update frames.
+
+WebSocket pod exec: `internal/server/exec.go` — xterm.js terminal, container/shell selection, resize via size queue, full TTY/stdin/stdout/stderr.
 
 ### Topology Builder
 - Constructs directed graph from K8s resources via owner references + selector matching
 - Two view modes: `traffic` (network flow: Ingress/Gateway → HTTPRoute → Service → Pod) and `resources` (hierarchy: Deployment → ReplicaSet → Pod)
 - **Edge type semantics** (drive UI grouping): `EdgeManages` (owner), `EdgeUses` (HPA/VPA/KEDA), `EdgeProtects` (PDB/NetworkPolicy), `EdgeConfigures` (ConfigMap/Secret/DestinationRule), `EdgeExposes` (Service/Ingress/Gateway). Choose the right type — don't reuse.
 - **CRD collision pattern**: When a CRD kind collides with core K8s (e.g., Knative Service, CAPI Cluster), use `GetGVRWithGroup("Kind", "group")` and prefix node IDs (`knativeservice/`, `capicluster/`). Frontend disambiguates via `data?.apiVersion?.includes('group.name')`.
-- Supported integrations: Core K8s, Gateway API, Istio, Knative, Traefik, Contour, CAPI, Karpenter, KEDA, cert-manager, GitOps (Argo/Flux). See `docs/integrations.md` for full list.
+- Supported topology integrations are tracked by the **Topology** column in `docs/integrations.md`; keep that table and the implementation in sync.
 - GitOps nodes: Application (ArgoCD), Kustomization, HelmRelease, GitRepository (FluxCD)
   - `/api/gitops/tree/{kind}/{namespace}/{name}` — resource tree (managed resources + ownership edges)
   - `/api/gitops/insights/{kind}/{namespace}/{name}` — curated diagnosis (summary, issues, drift, events, plan, history, capabilities)
@@ -375,107 +225,55 @@ If a UI change feels worth checking, mention it when you wrap up — even just f
   - **Nested navigation**: `classifyGitOpsKind` tags nodes with `data.gitopsTool` + `data.gitopsKind`. Portal nodes route to child detail pages; lineage breadcrumb (`?from=kind|ns|name`) enables back navigation.
   - **Severity vocabulary**: `critical` (0, red) → `alert` (1, orange) → `warning` (2, amber) → `info` (3, blue). Adding a new severity requires updating both Go `severityRank` and TS union in `gitops-insights.ts`.
   - **Single-cluster limitation**: Application↔resource edges only render when controller + workloads are in same cluster (ArgoCD hub-spoke deployments won't show connections).
+  - **Per-resource health**: read a tree node's resolved `health` + `healthSource` (`controller` | `radar`), never `status.resources[].health` directly — Argo CD 3 doesn't persist it, and `overlayRadarHealth` (`internal/server/gitops_handlers.go`) fills the gap from the issues engine. See [docs/gitops.md](docs/gitops.md#per-resource-health)
   - **Per-resource drift**: computed from `kubectl.kubernetes.io/last-applied-configuration` annotation. SSA/Helm-installed resources lack this; SSA fallback tracked in [#601](https://github.com/skyhook-io/radar/issues/601).
 
-### Timeline
-- In-memory or SQLite storage for event tracking (`--timeline-storage`)
-- Records: resource kind, name, namespace, change type, timestamp, owner info, health state
-- Configurable limit (default: 10000 events)
-- Supports grouping by owner, app label, or namespace
+### Timeline + resource relationships
 
-### Resource Relationships
-- Computed at query time for resource detail views
-- Tracks: parent (owner), children (owned), deployment (grandparent shortcut for Pods owned by ReplicaSets), config (ConfigMaps/Secrets), network (Services/Ingresses/Gateways/Routes), scalers (HPA/VPA/KEDA), policies (PDB), storage (PVC→PV→StorageClass)
-- Used for topology edges and change propagation
+Timeline (`pkg/timeline/`): in-memory or SQLite (`--timeline-storage`), default 10k-event ring. Lane grouping (owner, app, topology) happens in the frontend (`packages/k8s-ui/src/utils/resource-hierarchy.ts`); the stores only filter and page. Resource relationships (`pkg/topology/relationships.go`): computed at query time — parent/children/deployment-grandparent/config/network/scalers/policies/storage — used for both detail views and topology edges.
+
+### RBAC Visibility
+
+`pkg/rbac/` is a pure package over typed `rbacv1` listers — no K8s API calls, no internal/ imports. `BuildIndex` produces `BindingsBySubject` + `BindingsByRole` maps; `EffectiveRules(subject)` flattens direct + implicit-group bindings (`system:authenticated`, `system:serviceaccounts`, `system:serviceaccounts:<ns>` — included only for ServiceAccount subjects) with provenance preserved. Flat rule output capped at `MaxFlatRules` (500); response sets `truncated: true`. 5s `rbac.Memoizer` absorbs the SA/Pod-detail fetch burst; `finalizePostContextSwitch` calls `Invalidate()` so a kubeconfig context switch doesn't serve the previous cluster's RBAC for up to 5s. No mutation invalidation today — read-only MVP.
+
+Renderers (`ServiceAccountRenderer`, `RoleRenderer`, `RoleBindingRenderer`, `PodRenderer`, `WorkloadRenderer`, `NamespaceRenderer`) accept optional `rbacData` / `rbacRoleData` / `roleRules` props and render the reverse-lookup sections only when the host wires the fetch. Host wrappers in `web/src/components/resources/renderers/` use `useRBACSubject` / `useRBACRole` / `useRBACNamespace`. Library consumers (Radar Hub) that skip the fetch get the original sections; nothing breaks.
+
+Pod **Permissions** is the differentiator — frames the SA's grant as blast radius. Workload detail ships the same surface framed at the workload level. Detection lives in `packages/k8s-ui/src/utils/rbac-blast-radius.ts` (`detectBlastRadius` + `rulePermissivenessScore` + `RBAC_BLAST_*` verb-set constants), extracted from the two renderers so they can't drift; 12 unit tests pin the triggers. Triggers: verb wildcards, cluster-admin bindings, `escalate`/`bind`/`impersonate`, cluster-wide `create pods`. Resource-only wildcards deliberately do NOT trigger — they fire on every authenticated SA. Theme-aware badge classes for RBAC display live in `packages/k8s-ui/src/utils/rbac-badges.ts` — hand-rolled `bg-*-500/20 text-*-400` strings wash out in light mode.
 
 ### AI Context Minification
-- Converts K8s resources into token-efficient representations for LLM consumption
-- Three verbosity levels:
-  - `Summary`: Typed struct with key fields per resource kind (used by MCP `list_resources`)
-  - `Detail`: Full spec/status with metadata noise stripped (used by MCP `get_resource`)
-  - `Compact`: Aggressive pruning for token-constrained contexts (probes, volumes, security contexts removed)
-- Secret safety: never exposes `.data`/`.stringData`, redacts env values with known secret patterns (API keys, tokens, passwords, base64 blocks)
-- Event deduplication: groups by (reason, normalized message), replaces pod hashes/UUIDs/IPs with placeholders
-- Log filtering: prioritizes error/warning patterns, falls back to last 20 lines, redacts secrets
+
+`pkg/ai/context/` collapses K8s resources for LLM consumption. Three verbosity levels: `Summary` (MCP `list_resources` — typed structs), `Detail` (MCP `get_resource` — full spec/status, metadata noise stripped), `Compact` (aggressive — probes/volumes/security contexts removed). Secret safety is structural: never emits `.data`/`.stringData`, redacts env values matching API-key/token/password/base64 patterns. Events dedup on `(reason, normalized message)` with hash/UUID/IP placeholders; log filtering prioritizes error/warning lines, falls back to last 20.
 
 ### MCP Server
-- Stateless HTTP handler mounted at `/mcp` (JSON-RPC over HTTP)
-- 17 tools organized into read and write categories:
-  - **Read tools** (8): `get_dashboard` (with problem-correlated changes), `list_resources`, `get_resource` (with optional `include`: events, relationships, metrics, logs), `get_topology` (with `format`: graph or summary), `get_events` (with optional `kind`/`name` resource filter), `get_pod_logs`, `list_namespaces`, `get_changes` (timeline of resource mutations)
-  - **Read tools — Audit** (1): `get_cluster_audit` (best-practice findings with remediation, filter by namespace/category/severity)
-  - **Read tools — Helm** (2): `list_helm_releases`, `get_helm_release` (with optional values/history/diff)
-  - **Read tools — Logs** (1): `get_workload_logs` (aggregated, AI-filtered logs across all pods)
-  - **Write tools** (5): `apply_resource` (create or update from YAML, supports multi-doc and dry-run), `manage_workload` (restart/scale/rollback), `manage_cronjob` (trigger/suspend/resume), `manage_gitops` (ArgoCD sync/suspend/resume, FluxCD reconcile/suspend/resume), `manage_node` (cordon/uncordon/drain)
-- 3 resources: `cluster://health`, `cluster://topology`, `cluster://events`
-- Tool annotations: read-only tools use `readOnlyHint`, write tools use `destructiveHint: false`
-- Respects cluster RBAC
-- Enabled by default, disable with `--no-mcp`
+
+Stateless HTTP at `/mcp` (JSON-RPC). Read tools use `readOnlyHint`, write tools use `destructiveHint: true`. Respects cluster RBAC (impersonates via `DynamicClientFromContext` for write/exec/logs). Enabled by default; `--no-mcp` to disable. Tool catalogue + design rationale lives in `internal/mcp/tools.go` + [docs/mcp.md](docs/mcp.md) — don't restate it here. **When adding/removing a tool in `registerTools`, also update the user-facing setup dialog catalog `web/src/components/home/mcpToolCatalog.ts`** — `TestSetupDialogCoversAllTools` fails CI if the two diverge. A **read** tool additionally needs adding to `radarReadTools` in `internal/ai/diagnoser.go` — the allowlist Radar's own Diagnose agent calls through; a tool missing there reaches every external client but not the product's own agent (`TestDiagnoserAllowlistCoversAllReadTools` fails CI). A **write** tool instead needs adding to both write-tool lists in `internal/mcp/tools_catalog_test.go` (`writeTools` in `TestRegisteredToolAnnotations` and `writeToolNames`) — the second is what keeps it out of the read-only mount, and `radarWriteTools` gates it to confirmed apply turns. New tools also consume the `maxCatalogBytes` description budget; raise it deliberately rather than gutting routing guidance.
 
 ### Error Handling (Backend)
-All HTTP handlers use the simple `writeError` pattern:
-```go
-s.writeError(w, http.StatusXXX, "error message")
-// Returns: {"error": "error message"}
-```
 
-**HTTP Status Code Conventions:**
-- `400 Bad Request`: Invalid input (missing params, invalid YAML, unknown resource kind)
-- `403 Forbidden`: RBAC insufficient permissions (lister is nil or K8s API returns forbidden)
-- `404 Not Found`: Resource doesn't exist
-- `409 Conflict`: Operation already in progress (e.g., sync running)
-- `503 Service Unavailable`: Client/cache not initialized, or not connected to cluster
-- `500 Internal Server Error`: Unexpected errors (always log before returning)
+Handlers emit `{"error": "..."}` via `s.writeError(w, status, msg)`. Status conventions:
+- **400** invalid input (missing params, bad YAML, unknown kind)
+- **403** RBAC denied (nil lister or apiserver Forbidden)
+- **404** resource doesn't exist — check via `apierrors.IsNotFound(err)`
+- **409** operation already in progress (sync running, etc.)
+- **413** request body over the route's cap — the body is bounded *before* it is read (`readBoundedTextBody` for raw YAML, `decodeBoundedJSONBody` for JSON), so nothing has parsed it yet and 400 would wrongly blame the content. Reserve 400 for input that was read and found invalid — including caps counted after parsing, like the YAML document limit
+- **503** cache/connection not ready — most cluster-touching handlers call `s.requireConnected(w)` at the top
+- **500** unexpected — always `log.Printf("[module] Failed to <action> %s/%s: %v", ns, name, err)` before returning
 
-**`requireConnected` Guard:**
-Most handlers that access cluster data call `s.requireConnected(w)` at the top, which returns 503 if the cluster connection isn't established yet. Use this pattern for any new handler that needs cache data.
-
-**Multi-Namespace Query Parameters:**
-Endpoints that accept namespace filters support both `?namespace=X` (single, backward compat) and `?namespaces=X,Y` (comma-separated, preferred). Use the `parseNamespaces()` helper to handle both.
-
-**Logging Convention:**
-Always log 500 errors with context before returning:
-```go
-log.Printf("[module] Failed to <action> %s/%s: %v", namespace, name, err)
-s.writeError(w, http.StatusInternalServerError, err.Error())
-```
-
-**K8s Error Detection:**
-Use `apierrors.IsNotFound(err)` for proper K8s error type checking:
-```go
-if apierrors.IsNotFound(err) {
-    s.writeError(w, http.StatusNotFound, err.Error())
-    return
-}
-```
+Namespace filters accept both `?namespace=X` (single) and `?namespaces=X,Y` (preferred). Use `parseNamespaces()` to handle both.
 
 ### Error Handling (Frontend)
-The frontend uses React Query mutations with meta for toast messages:
-```typescript
-useMutation({
-  mutationFn: async (...) => { ... },
-  meta: {
-    errorMessage: 'Failed to update resource',  // Shown in toast
-    successMessage: 'Resource updated',
-  },
-})
-```
 
-Error responses are parsed as `{"error": "message"}` and displayed in toasts.
+React Query mutations carry `meta: { errorMessage, successMessage }` — the global toast handler reads those. Server errors arrive as `{"error": "..."}` and surface unchanged. Don't add per-mutation `onError` toasts that would duplicate the meta-driven path.
 
 ### Shared UI Package (@skyhook-io/k8s-ui)
-- Located at `packages/k8s-ui/` — shared presentation components decoupled from data fetching
-- Components in the package are pure: data fetching hooks live in `web/`, injected via props/callbacks
-- `web/src/components/resources/ResourcesView.tsx` is a thin wrapper that instantiates hooks and passes data to the package's `ResourcesView`
-- Linked via npm workspaces; Vite aliases `@skyhook-io/k8s-ui` to `../packages/k8s-ui/src` (source-level, no build step)
-- Key exports: `ResourcesView`, `ResourceRendererDispatch`, `ResourceActionsBar`, `EditableYamlView`, all renderers, resource-utils, `categorizeResources`, `getKindLabel`, `getKindPlural`
-- **Badge colors**: `packages/k8s-ui/src/components/ui/Badge.tsx` is the source of truth for badge color definitions (static strings for Tailwind scanning — never use template literals for class names). `packages/k8s-ui/src/utils/badge-colors.ts` re-exports these and provides derived constants (`SEVERITY_BADGE`, `KIND_BADGE_COLORS`, `HEALTH_BADGE_COLORS`, `HELM_STATUS_COLORS`, etc.). For status badges in tables, use CSS classes `.status-healthy`, `.status-degraded`, `.status-alert`, `.status-unhealthy`, `.status-neutral`, `.status-unknown` defined in `packages/k8s-ui/src/theme/components.css`.
-- **Status vocabulary** (one source, three layers): `HealthLevel` type in `resource-utils.ts` (`healthy | degraded | alert | unhealthy | neutral | unknown`) → `.status-*` CSS classes (`theme/components.css`) → typed helpers in `components/ui/status-tone.tsx` (`StatusDot` for tiny indicator dots, `mapHealthToTone` to normalize API strings). All three carry the same six tones; no parallel vocabulary exists. For pill-shaped status badges, use the canonical pattern directly: `<span className={`badge ${healthColors[tone]}`}>...</span>` (used in 56+ sites across OSS). The `alert` (orange) tier is the intermediate between `degraded` (amber) and `unhealthy` (red) — used for severity gradients (Problems pages, Audit findings, Cert expiry) where the data carries a 3-step urgency that must be visually distinguishable. Use `mapHealthToTone(severityOrHealthString)` to normalize raw API values onto a tone.
-- **Centralized CSS classes** (all in `@layer components` in `packages/k8s-ui/src/theme/components.css` — Tailwind utilities can override them):
-  - `.badge` / `.badge-sm` — badge structure (padding, radius, border-width)
-  - `.btn-brand` / `.btn-brand-muted` / `.btn-brand-toggle` — brand buttons (reference `--color-brand` CSS variables)
-  - `.card-inner` / `.card-inner-lg` — nested containers in drawers/renderers
-  - `.selection` / `.selection-strong` / `.selection-text` / `.selection-ring` — selected rows/items (reference `--selection-*` CSS variables)
-  - `.dialog` — modal/dialog containers
+
+`packages/k8s-ui/` is the shared presentation layer — components are pure, data hooks live in `web/` and inject via props/callbacks. `web/src/components/resources/ResourcesView.tsx` is the canonical wrapper pattern. Linked via npm workspaces; Vite source-aliases `@skyhook-io/k8s-ui` → `../packages/k8s-ui/src` (no build step). Key exports: `ResourcesView`, `ResourceRendererDispatch`, `ResourceActionsBar`, `EditableYamlView`, renderers, resource-utils, `categorizeResources`, `getKindLabel`, `getKindPlural`.
+
+**Badges + status tones.** `components/ui/Badge.tsx` owns the canonical color strings (literal class names — Tailwind's scanner can't see template literals). `utils/badge-colors.ts` re-exports + derives `SEVERITY_BADGE`, `KIND_BADGE_COLORS`, `HEALTH_BADGE_COLORS`, `HELM_STATUS_COLORS`. Table status badges use the `.status-*` CSS classes (`theme/components.css`).
+
+The `HealthLevel` vocabulary — `healthy | degraded | alert | unhealthy | neutral | unknown` — flows through three coordinated layers: the type in `resource-utils.ts`, the `.status-*` CSS classes, and `components/ui/status-tone.tsx` (`StatusDot`, `mapHealthToTone`). Same six tones everywhere; no parallel vocabulary. For pill badges: `<span className={`badge ${healthColors[tone]}`}>` (used 56+ places). The `alert` tier (orange) is the intermediate between `degraded` (amber) and `unhealthy` (red) — needed for 3-step severity gradients (Problems, Audit findings, Cert expiry). Normalize raw API strings via `mapHealthToTone`.
+
+Centralized `@layer components` classes in `theme/components.css` (Tailwind utilities can override): `.badge` / `.badge-sm`, `.btn-brand*`, `.card-inner` / `.card-inner-lg`, `.selection*`, `.dialog`.
 
 ### Frontend Styling Rules
 **Use theme tokens — never hardcode colors.** See [DESIGN.md](DESIGN.md) for the full reference. Quick rules:
@@ -485,68 +283,33 @@ Error responses are parsed as `{"error": "message"}` and displayed in toasts.
 - Buttons: `.btn-brand` — not hand-rolled `bg-blue-*`
 - Badges: `<Badge severity="...">` or `<Badge kind="...">` — never hand-write color strings
 - Shadows: `shadow-theme-sm/md/lg` — not raw Tailwind shadows
+- Motion: `<Collapse>` / `<CollapseChevron>` / `useDisclosure` for anything that expands in place; `useAnimatedUnmount(open, overlayExitMs(kind))` + `overlayTransitionStyle` for menus, dialogs, sheets. All timing comes from `packages/k8s-ui/src/utils/animation.ts` — never an inline duration or curve, never `open && (...)` for a disclosure, no native `<details>`. See DESIGN.md §7 Motion.
+
+### Printer columns (uncurated CRDs)
+
+CRDs Radar hasn't curated fill their table from the kind's own
+`spec.versions[].additionalPrinterColumns` — the columns `kubectl get` shows.
+Engine in `internal/server/printer_columns.go`, frontend helpers in
+`packages/k8s-ui/src/components/resources/printer-columns.ts`; both carry the
+detail at the point of use. Three things that are easy to get wrong:
+
+- **Exclusive, never merged.** A kind gets the curated set *or* the printer set, and curated always wins — several curated sets encode why the vendor-obvious field is the wrong one to show. `hasCuratedColumns` is the single definition of curated.
+- **Never hand-roll the JSONPath.** Evaluation goes through `apiextensions-apiserver`'s `tableconvertor`: real CRDs use filter expressions, wildcards and escaped keys, and it also owns first-match semantics and type coercion.
+- **Use the served version, not the storage version.** Printer columns are per-version and the API server converts objects into the version being listed.
 
 ### Resource Renderers
-- **Adding a new CRD integration? You MUST read [docs/INTEGRATION_GUIDE.md](docs/INTEGRATION_GUIDE.md) first** — it has the full step-by-step checklist with all files, patterns, and collision gotchas. Do not skip this.
-- Renderers, resource-utils, and table column config live in `packages/k8s-ui/src/components/resources/`
-- Sections with data should use `defaultExpanded` (true) — only collapse empty or low-priority sections
-- Register in: `packages/k8s-ui/src/components/resources/renderers/index.ts` (export), `packages/k8s-ui/src/components/shared/ResourceRendererDispatch.tsx` (KNOWN_KINDS + render line + `getResourceStatus()`)
-- Use `AlertBanner` for problem detection, `ProblemAlerts` for multiple warnings/errors, `ConditionsSection` for K8s conditions
-- Use `LabelSelectorDisplay` for rendering K8s label selectors — handles `matchLabels` + `matchExpressions` + flat selectors. Never hand-roll selector badge rendering.
-- Long text in alerts/banners needs `break-all` class for CSS word breaking
-- **Kind collision rule:** When a CRD kind collides with a core K8s kind (e.g., Knative Service vs core Service) or two CRD kinds collide (e.g., CNPG Cluster `postgresql.cnpg.io` vs CAPI Cluster `cluster.x-k8s.io`), you must guard THREE places in `ResourceRendererDispatch.tsx`: (1) the core renderer line, (2) `getResourceStatus()`, (3) action buttons (Port Forward, etc.). Use `data?.apiVersion?.includes('group.name')` checks. Missing any one causes dual rendering bugs.
-- Core K8s renderers: Pod, Service, ConfigMap, Secret, Ingress, PersistentVolume, ReplicaSet, StorageClass, NetworkPolicy, Event, Workload (Deployment/StatefulSet/DaemonSet), Role, ClusterRole, RoleBinding, ClusterRoleBinding, ServiceAccount, IngressClass, PriorityClass, RuntimeClass, Lease, MutatingWebhookConfiguration, ValidatingWebhookConfiguration
-- 100+ CRD renderer components across 20+ integrations — see `packages/k8s-ui/src/components/resources/renderers/` for the full list, and **[docs/INTEGRATION_GUIDE.md](docs/INTEGRATION_GUIDE.md)** for the step-by-step checklist when adding new ones
 
-## Tech Stack
+**Adding or modifying a CRD integration? Read [docs/INTEGRATION_GUIDE.md](docs/INTEGRATION_GUIDE.md) first** — full checklist with collision gotchas. Renderers live in `packages/k8s-ui/src/components/resources/renderers/` (100+ components, 20+ integrations); register in that folder's `index.ts` plus `shared/ResourceRendererDispatch.tsx` (KNOWN_KINDS, render line, `getResourceStatus()`). Use `AlertBanner` / `ProblemAlerts` / `ConditionsSection` for problem surfaces and `LabelSelectorDisplay` for selectors — never hand-roll. Sections default to `defaultExpanded={true}` unless empty/low-priority.
 
-### Backend
-- Go 1.26+
-- client-go (K8s client library)
-- chi (HTTP router with middleware)
-- gorilla/websocket (WebSocket support for exec)
-- helm.sh/helm/v3 (Helm SDK)
-- cilium/cilium (Hubble traffic observation)
-- google/go-containerregistry (image filesystem inspection)
-- modernc.org/sqlite (timeline storage)
-- modelcontextprotocol/go-sdk (MCP server implementation)
-- wailsapp/wails/v2 (desktop app framework)
-- go:embed (frontend embedding)
+**Kind collision rule:** When a CRD kind shadows core (Knative Service vs core Service) or two CRDs share a kind (CNPG Cluster vs CAPI Cluster), guard THREE places in `ResourceRendererDispatch.tsx`: the renderer line, `getResourceStatus()`, and action buttons (Port Forward, etc.). Use `data?.apiVersion?.includes('group.name')`. Missing any one produces dual-render bugs.
 
-### Frontend
-- React 19 + TypeScript
-- Vite (build tool, dev server)
-- @xyflow/react + elkjs (graph visualization and layout)
-- @xterm/xterm + @xterm/addon-fit (terminal emulation)
-- @monaco-editor/react (YAML editing)
-- shiki (syntax highlighting)
-- @tanstack/react-query v5 (server state management)
-- react-router-dom (client-side routing)
-- Tailwind CSS v4 + shadcn/ui (styling, uses @tailwindcss/vite plugin)
-- clsx + tailwind-merge (class utilities)
-- react-markdown + @tailwindcss/typography (markdown rendering)
-- Lucide React (icons)
-- yaml (YAML parsing)
+**Crossplane renderers are spec-shape detected, not kind-enumerated.** Managed Resources / Composites / Claims have unbounded plurals (one CRD per provider service), so dispatch uses `isManagedResource(data)` / `isComposite(data)` / `isClaim(data)` from `resource-utils-crossplane.ts` as fall-throughs. `Provider` / `ProviderConfig` / `Composition` / `CompositionRevision` / `XRD` / `Function` / `Configuration` are kind-dispatched. v1↔v2 path handling lives entirely in the resource-utils accessors (try `spec.crossplane.x` first, fall back to `spec.x`). `CompositeRenderer` accepts a `composedRefStatuses` Map injected by the host wrapper (`web/src/components/resources/CompositeRenderer.tsx`) that fans out React Query lookups for each `resourceRefs` entry — each composed-resource row gets a live status badge that way.
 
-## Server Configuration
+## Tech stack + server config
 
-### Middleware Stack
-- Logger, Recoverer (panic recovery)
-- 60-second request timeout
-- CORS enabled for `http://localhost:*` and `http://127.0.0.1:*`
+Tech stack snapshot lives in [docs/STRUCTURE.md](docs/STRUCTURE.md#tech-stack-snapshot). `go.mod` and `web/package.json` are the source of truth. Server middleware (Logger, Recoverer, 60s timeout, CORS for `localhost:*` / `127.0.0.1:*`) and the Vite dev proxy (`/api` → `:9280`, `ws: true`) are configured inline in `internal/server/server.go` and `web/vite.config.ts` — read those when changing them.
 
-### Vite Dev Proxy
-In development, Vite proxies `/api` requests to the backend:
-```javascript
-proxy: {
-  '/api': {
-    target: 'http://localhost:9280',
-    ws: true  // WebSocket support for exec
-  }
-}
-```
-
-## Per-User Context Isolation Status (work-in-progress 2026-05-20)
+## Per-User Context Isolation Status (work-in-progress, updated 2026-09-27 after upstream merge)
 
 ### Why this section exists
 
@@ -562,38 +325,33 @@ Concretely: when user A is on context X and user B is on context Y simultaneousl
 
 ### Next move (pick up here)
 
-**Priority 1 — `/api/packages` (Packages inventory page) still shows default cluster's Helm releases.** This is the most user-visible remaining bug after the Helm tab fix. Driver: `internal/server/packages.go:412` — `collectHelmReleases(namespaces, "", nil)` calls `helm.GetClient().ListReleasesAsUser` with no per-context routing.
+**Upstream merge (2026-09-27).** `skyhook-io/radar` main (v1.15 highlights, ~785 commits since the May fork point) was merged in. Upstream has no pool concept, so every feature it added reads the process globals — `internal/server` alone went from ~28 to ~200 `k8s.Get*()` calls. The merge kept every per-user path listed under "Already migrated" working and made Helm fully per-user, but the new upstream surfaces (issues, capacity, reachability, rollouts, policy, CNPG/Velero/Kyverno pages, timeline filters, upgrade readiness, etc.) show the default cluster to users on another context until migrated.
 
-To fix:
-1. Add `HelmRestConfig *rest.Config` and `HelmContextName string` to `ListPackagesParams` (already a thread-through param struct).
-2. In `handleListPackages`, populate them from `s.helmContextFor(r)`.
-3. Thread them through `ListPackages → computePackagesInternal → collectHelmReleases`.
-4. In `collectHelmReleases`, when `helmRestConfig != nil`, build an `action.Configuration` via `hClient.GetActionConfigForUserWith(restConfig, contextName, ns, "", nil)` then call `helm.ListReleasesWith(actionConfig, ns, "", nil)`. Otherwise fall through to the existing `hClient.ListReleasesAsUser` (default-context behavior preserved).
+**Priority 1 — Request-scoped clients (`k8s.ClientFromContext` / `k8s.DynamicClientFromContext`).** Most write paths and many new upstream reads get their clientset from these two helpers in `internal/k8s/context_client.go`, which always build on `k8s.GetConfig()`. Make them context-aware once and a large set of handlers follows: add a server middleware that, for users on a non-default pool entry (`s.nonDefaultEntryFor(r)`), stores the entry's `RestConfig` on the request context (e.g. `k8s.WithTargetConfig(ctx, cfg)`), and have both helpers (plus `ImpersonatedClient` / `ImpersonatedDynamicClient`) prefer that config over `GetConfig()`. Default-context requests carry nothing and stay byte-identical.
 
-**Priority 2 — `/api/helm/upgrade-check` & `/api/helm/releases/{ns}/{name}/upgrade-info`.** `handleCheckUpgrade` / `handleBatchUpgradeCheck` call `client.CheckForUpgradeAsUser` which still reads globals.
+**Priority 2 — `/api/packages` and `/api/issues` Helm rows.** With `helm.Client.ForContext` this is now small: pass `s.helmClientFor(r, helm.GetClient())` into `ListPackagesParams` (thread to `collectHelmReleases` in `internal/server/packages.go`) and use it in `internal/server/issues_handler.go` (`ListReleasesAcrossNamespaces`).
 
-To fix:
-1. Add `Client.CheckForUpgradeWith(actionConfig, ...)` mirroring the other `*With` methods exposed in `client.go`.
-2. Add a dispatcher `h.checkForUpgrade(r, client, namespace, name, ...)` in `helm/handlers.go` following the same pattern as `h.uninstall`, `h.upgrade` etc.
-3. Wire the handlers to call it.
+**Priority 3 — Namespace switcher preferences leak across contexts.** `internal/server/namespace_scope.go` keys picks with `k8s.GetContextName()`. Replace with `s.pool.ContextForUser(usernameFrom(r))` (falling back to `k8s.GetContextName()` when `s.pool == nil`).
 
-**Priority 3 — Namespace switcher preferences leak across contexts.** `internal/server/namespace_scope.go:62,81,125,321` use `k8s.GetContextName()` to key per-user namespace picks. Replace with `s.pool.ContextForUser(usernameFrom(r))` (falling back to `k8s.GetContextName()` when `s.pool == nil`) so a pick made on context X stays scoped to X and doesn't bleed into Y.
+**Priority 4 — Search / Issues providers.** `internal/search/provider.go` and `internal/issues/provider.go` capture `k8s.GetResourceCache()` / `GetDynamicResourceCache()` / `GetResourceDiscovery()`. Refactor to take a per-request provider so the server can wire `s.cacheFor / s.dynCacheFor / s.discoveryFor`. Affects `/api/search/*`, `/api/issues`, and the issues shown in resource drawers.
 
-**Priority 4 — Search / Issues providers.** `internal/search/provider.go` and `internal/issues/provider.go` capture `k8s.GetResourceCache()` / `GetDynamicResourceCache()` / `GetResourceDiscovery()` at construction time. Refactor to take a `providerFor func(r) (cache, dynCache, discovery)` callback so the server can wire `s.cacheFor / s.dynCacheFor / s.discoveryFor` per-request. Affects `/api/search/*` and `/api/issues`.
+**Priority 5 — Shared server helpers that read globals.** `listDynamicSynced` (`internal/server/policy_handlers.go`, used by policy/CNPG/Cilium pages), `k8s.ReadableCacheForKind` callers outside `gateResourceRead`, and `k8s.GetCachedPermissionResult()` (dashboard visibility summary). Timeline queries filter by the global `ActiveClusterContext()`; pool entries now stamp their own context name on recorded events, so a per-user filter only needs the query side.
 
-**Priority 5 — Image inspector, Prometheus, OpenCost, Traffic.** All have their own connection state attached to the default cluster. Lower priority because Prometheus / OpenCost / Traffic gracefully degrade to "not configured" when the per-context cluster lacks them, and image inspection is an audit-only path. See the table below for file locations.
+**Priority 6 — Image inspector, Prometheus, OpenCost, Traffic.** Own connection state attached to the default cluster; lower priority because they degrade to "not configured".
 
 ### The migration pattern (use this for every fix in this section)
 
 Every per-user fix in this codebase has the same shape — match it so the next agent doesn't re-invent the wheel:
 
-1. **Extend the data carrier**: PoolEntry already has `Cache`, `DynCache`, `Discovery`, `Client`, `RestConfig`, `ContextName`, `ClusterName`. If your subsystem needs something else, add it to `PoolEntry`, populate it in `BuildEntryForContext`, and seed it on the default entry in `bootstrap.go:325`. Read it from the entry instead of the global getter.
+1. **Extend the data carrier**: PoolEntry already has `Cache`, `DynCache`, `Discovery`, `Client`, `RestConfig`, `ContextName`, `ClusterName`. If your subsystem needs something else, add it to `PoolEntry`, populate it in `BuildEntryForContext`, and resolve it live for the default entry in `CachePool.resolveEntryLocked` (`internal/k8s/pool.go`). Read it from the entry instead of the global getter.
 2. **Add `*With` (or `*ForEntry`) variants** to whatever helper currently reads globals. Keep the existing global-reading method as a one-line wrapper that calls the `*With` variant with the global values. This keeps the no-pool / default-context path byte-identical.
-3. **Add a server-side resolver** (`s.someContextFor(r)`) that returns the entry's value when the user is on a non-default pool entry, and `(nil, "")` otherwise. Pattern: `if e := s.entryFor(r); e != nil && e.ContextName != k8s.GetContextName() { return e.RestConfig, e.ContextName }; return nil, ""`. The "default falls back" check is load-bearing — handlers should not pay the per-user code path on default-context requests.
+3. **Add a server-side resolver** (`s.someContextFor(r)`) that returns the entry's value when the user is on a non-default pool entry, and the global otherwise. Use `s.nonDefaultEntryFor(r)` — it returns nil for the default context. The "default falls back" check is load-bearing — handlers should not pay the per-user code path on default-context requests.
 4. **For subsystems with their own handler struct** (e.g. `helm.Handlers`, future `search.Handlers`), add a `ContextResolver func(*http.Request) (...)` field and wire it from `server.New` so the package stays independent of `pool.CachePool`.
 5. **For free functions called from handlers** (e.g. `computePackagesInternal`), add the resolved context as additional parameters to the function's existing params struct — don't reach into HTTP-request internals from deep helpers.
 
-See `internal/helm/handlers.go` and `server.helmContextFor` for a fully-worked example covering both reads and writes.
+See `helm.Client.ForContext` + `helm.Handlers.ContextResolver` + `server.helmTargetFor` for a fully-worked example: one bound-client view instead of parallel `*With` copies, so every upstream Helm method (including ones added later) is per-user without extra code.
+
+**Merging upstream again.** Resolve conflicts by taking upstream's code and re-applying the per-user substitutions (`k8s.GetResourceCache()` → `s.cacheFor(r)` / `mcpCache(ctx)` / `b.getCache()`, etc.). Keep fork-only code in fork-only files where possible (`internal/k8s/pool.go`, `internal/mcp/pool.go`, `internal/mcp/tools_context.go`, `internal/auth/apikey_handlers.go`) so the next merge conflicts less. Then grep the merged `internal/server`, `internal/mcp` and `internal/helm` for new `k8s.Get*()` calls.
 
 ### Already migrated to per-user (DO NOT regress)
 
@@ -608,19 +366,19 @@ See `internal/helm/handlers.go` and `server.helmContextFor` for a fully-worked e
 | Topology builds in handlers | `k8s.NewTopologyResourceProvider(s.cacheFor(r))` + `s.dynCacheFor(r)` | |
 | SSE broadcasting | `s.broadcasterFor(username)` + pool-entry `SSEBroadcaster` via `entryFunc = pool.EntryForContext(contextName)` | |
 | `context_changed` SSE event delivery | `BroadcastReliable` (blocking send with timeout) — NOT `Broadcast` | a dropped `context_changed` leaves the UI overlay stuck forever |
+| Pool default entry | `CachePool.resolveEntryLocked` | the default context's entry is read live from the globals, not the seed-time snapshot — upstream publishes the cache progressively and replaces it on credential recovery |
+| Resource list/detail read gate | `s.gateResourceRead(w, r, kind, group)` → `gatePoolResourceRead`; `s.snapshotCachesFor(r)` | upstream's progressive-sync readiness gate, pool-aware |
+| SSE topology worker + relationship cache | `b.getCache()` / `b.buildFullTopology()` | upstream moved builds to a worker goroutine; they read the broadcaster's own caches |
+| SSE change-frame authorizer memo | keyed by `pool.ContextForUser(username)` | |
+| Helm (all `/api/helm/*` incl. upgrade-check, dashboard summary) | `helm.Client.ForContext(restCfg, ctx, cache)` via `Handlers.ContextResolver` / `s.helmClientFor(r, c)` | release storage reads, Flux attribution and resource status also follow the context |
+| MCP tools | `mcpCache(ctx)` / `mcpDynCache(ctx)` / `mcpDiscovery(ctx)` in `internal/mcp/pool.go`, wired via `mcp.SetPool` | only the tools that already used them; new upstream tools read globals |
+| `/api/connection` | per-user `context`, `clusterName`, `contexts[].isCurrent` | |
 
 ### Still wired to global state — KNOWN BUGS, prioritized
 
 Subsystems that ignore the user's context and always return / act on the default cluster's data. Listed by user-visibility:
 
-1. **Helm — partially migrated.** `internal/helm/client.go` keeps the process-singleton `Client`, but now exposes per-context entry points:
-   - `Client.GetActionConfigForUserWith(restConfig, contextName, ns, user, groups)` builds an `action.Configuration` against an explicit `rest.Config` instead of reading `k8s.GetConfig()` / `k8s.GetContextName()`. Pass it the `PoolEntry.RestConfig` / `ContextName`.
-   - Package-level read wrappers `ListReleasesWith`, `GetReleaseWith`, `GetManifestWith`, `GetValuesWith` and Client write methods `UninstallWith`, `RollbackWith`, `UpgradeWith`, `ApplyValuesWith`, `InstallWith` take an explicit `action.Configuration`.
-   - `helm.Handlers` now carries a `ContextResolver func(*http.Request) (*rest.Config, string)` wired from `server.New` via `helm.NewHandlers(s.helmContextFor)`. All read handlers (list, get, manifest, values, diff) and write handlers (install, upgrade, rollback, uninstall, applyValues, plus their `*-stream` variants) route through dispatchers (`h.listReleases`, `h.getRelease`, `h.uninstall`, etc.) that pick the per-user path when the resolver returns a non-nil rest.Config.
-   - `server.helmContextFor(r)` returns `(entry.RestConfig, entry.ContextName)` for users on a non-default pool entry, or `(nil, "")` so the dispatchers fall through to the existing `helm.GetClient()` methods for the default-context case.
-   - `getDashboardHelmSummary` routes through `s.listHelmReleasesForUser`.
-   - **Still uses globals**: `collectHelmReleases` in `internal/server/packages.go:412` (the `/api/packages` inventory page) calls `helm.GetClient().ListReleasesAsUser` directly. `handleCheckUpgrade` / `handleBatchUpgradeCheck` (`/api/helm/upgrade-check`) use `CheckForUpgradeAsUser` which has not been per-user-ized yet. `internal/mcp/tools_helm.go` is MCP and uses globals.
-   - **To migrate the remaining helm callers**: thread a `helm.Handlers.ContextResolver`-equivalent into `collectHelmReleases` (e.g. add `RestConfig *rest.Config` and `ContextName string` to `ListPackagesParams`), and add `Client.CheckForUpgradeWith(actionConfig, ...)` mirroring the other `*With` methods, then dispatch from `handleCheckUpgrade` like the others.
+1. **Everything upstream added after the fork point** — see "Next move" above. `k8s.ClientFromContext` / `DynamicClientFromContext` are the widest single lever.
 2. **Search provider (`internal/search/provider.go:26-33`)** — captures globals at init. `/api/search/*` returns default cluster's results.
 3. **Issues provider (`internal/issues/provider.go:28-35`)** — captures globals at init. Issues page shows default cluster's issues.
 4. **Namespace switcher prefs (`internal/server/namespace_scope.go:62,81,125,321`)** — key shape `username\x00contextName` uses `k8s.GetContextName()` instead of `pool.ContextForUser(username)`. Picks bleed across contexts.
@@ -637,7 +395,7 @@ After migrating any subsystem from the list above, run through this checklist �
 
 1. **Does the build pass?** `cd /home/astra/Research/Project/radarhq/radar && go build ./...` — no output means clean.
 2. **Did you preserve the default-context path?** A user who never switches contexts should hit byte-identical code paths to before your change. The `*With` variants exist precisely so the default-context call still goes through `helm.GetClient().ListReleasesAsUser(...)` (or whatever) without per-user overhead.
-3. **Does the resolver short-circuit on the default context?** If `s.helmContextFor(r)` returns `(nil, "")` on the default context, the dispatcher must take the original code path, not the `*With` path with a nil rest.Config — nil rest.Config in `GetActionConfigForUserWith` falls back to globals, which works but is wasteful.
+3. **Does the resolver short-circuit on the default context?** Resolvers built on `s.nonDefaultEntryFor(r)` return nil there, so the handler takes the original global code path (e.g. `helm.Client.ForContext(nil, …)` returns the global client unchanged).
 4. **Did you check ALL the variants?** Many subsystems have `Xxx`, `XxxAsUser`, `XxxWithProgress`, `XxxWithProgressAsUser`, plus stream handlers. Helm has 4-5 variants per write operation. Missing any one leaves a hole.
 5. **Did you update CLAUDE.md?** Move the subsystem out of "Still wired to global state" and into "Already migrated", and remove its entry from the "Next move" priority list. The next session's agent reads this section first.
 6. **Did you commit author the right author per remote?** `rianovski <mar.sha1@outlook.com>` for `origin` (GitHub `rianovski/radar`); `Moh. Ferian <moh.ferian@ai.astra.co.id>` for `tfs` (internal). See [[project_git_authors]] memory entry.

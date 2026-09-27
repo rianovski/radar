@@ -2,13 +2,66 @@ package prometheus
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/skyhook-io/radar/internal/errorlog"
 )
+
+func TestHasManualURL(t *testing.T) {
+	client := &Client{}
+	if client.HasManualURL() {
+		t.Fatal("HasManualURL() = true without a configured URL")
+	}
+	client.manualURL = "https://prometheus.example.com"
+	if !client.HasManualURL() {
+		t.Fatal("HasManualURL() = false with a configured URL")
+	}
+}
+
+func TestExplicitFilteredStoreStaysConnected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-only" || r.URL.Path != "/prometheus/api/v1/query" {
+			t.Error("lost auth or base path")
+		}
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+	}))
+	defer srv.Close()
+	c := &Client{manualURL: srv.URL + "/prometheus", headers: map[string]string{"Authorization": "Bearer test-only"}, httpClient: srv.Client()}
+	for i := 0; i < 2; i++ {
+		base, _, err := c.EnsureConnected(context.Background())
+		if err != nil || base != c.manualURL {
+			t.Fatalf("connect/reprobe %d: %s %v", i, base, err)
+		}
+	}
+}
+
+func TestExplicitProbeDiagnosticsDoNotEchoUpstream(t *testing.T) {
+	for _, tc := range []struct {
+		status     int
+		body, want string
+	}{
+		{401, "SECRET", "authentication"},
+		{500, `{"status":"error","error":"SECRET ring failure"}`, "query and storage health"},
+		{200, "<html>SECRET</html>", "API base path"},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(tc.status)
+			_, _ = w.Write([]byte(tc.body))
+		}))
+		c := &Client{manualURL: srv.URL, httpClient: srv.Client()}
+		_, _, err := c.EnsureConnected(context.Background())
+		srv.Close()
+		if err == nil || !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), "SECRET") {
+			t.Fatalf("unsafe/unhelpful error: %v", err)
+		}
+	}
+}
 
 func TestProbe(t *testing.T) {
 	tests := []struct {
@@ -83,5 +136,114 @@ func TestProbe(t *testing.T) {
 				t.Fatalf("empty-instance warning recorded = %v, want %v", gotEmptyEntry, tc.wantEmptyEntry)
 			}
 		})
+	}
+}
+
+func TestHeadersOnProbe(t *testing.T) {
+	var gotAuth, gotOrg atomic.Value
+	gotAuth.Store("")
+	gotOrg.Store("")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth.Store(r.Header.Get("Authorization"))
+		gotOrg.Store(r.Header.Get("X-Scope-OrgID"))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"job":"prometheus"},"value":[1700000000,"1"]}]}}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		headers: map[string]string{
+			"Authorization": "Bearer test-token",
+			"X-Scope-OrgID": "tenant-7",
+		},
+	}
+
+	if !c.probe(context.Background(), srv.URL) {
+		t.Fatal("probe() returned false for healthy server")
+	}
+	if got := gotAuth.Load().(string); got != "Bearer test-token" {
+		t.Errorf("Authorization header = %q, want %q", got, "Bearer test-token")
+	}
+	if got := gotOrg.Load().(string); got != "tenant-7" {
+		t.Errorf("X-Scope-OrgID header = %q, want %q", got, "tenant-7")
+	}
+}
+
+func TestHeadersNoneWhenUnset(t *testing.T) {
+	var sawAuth atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := r.Header["Authorization"]; ok {
+			sawAuth.Store(true)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"job":"prometheus"},"value":[1700000000,"1"]}]}}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{httpClient: &http.Client{Timeout: 5 * time.Second}}
+	if !c.probe(context.Background(), srv.URL) {
+		t.Fatal("probe() returned false for healthy server")
+	}
+	if sawAuth.Load() {
+		t.Error("Authorization header sent when none configured")
+	}
+}
+
+func TestEnsureConnectedReturnsRecentDiscoveryError(t *testing.T) {
+	wantErr := errors.New("cached discovery failure")
+	c := &Client{
+		httpClient:      &http.Client{Timeout: 5 * time.Second},
+		lastDiscoverErr: wantErr,
+		lastDiscoverAt:  time.Now(),
+	}
+
+	_, _, gotErr := c.EnsureConnected(context.Background())
+	if !errors.Is(gotErr, wantErr) {
+		t.Fatalf("EnsureConnected error = %v, want cached error %v", gotErr, wantErr)
+	}
+}
+
+func TestEnsureConnectedIgnoresExpiredDiscoveryError(t *testing.T) {
+	wantErr := errors.New("cached discovery failure")
+	c := &Client{
+		httpClient:      &http.Client{Timeout: 5 * time.Second},
+		lastDiscoverErr: wantErr,
+		lastDiscoverAt:  time.Now().Add(-failedDiscoveryCacheTTL - time.Second),
+	}
+
+	_, _, gotErr := c.EnsureConnected(context.Background())
+	if errors.Is(gotErr, wantErr) {
+		t.Fatalf("EnsureConnected returned expired cached error: %v", gotErr)
+	}
+	if gotErr == nil || gotErr.Error() != "no Kubernetes client available for discovery" {
+		t.Fatalf("EnsureConnected error = %v, want fresh discovery error", gotErr)
+	}
+}
+
+func TestEnsureConnectedDoesNotClearCachedConnectionOnCanceledProbe(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	c := &Client{
+		baseURL:    srv.URL,
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, gotErr := c.EnsureConnected(ctx)
+	if !errors.Is(gotErr, context.Canceled) {
+		t.Fatalf("EnsureConnected error = %v, want context.Canceled", gotErr)
+	}
+	c.mu.RLock()
+	gotBase := c.baseURL
+	c.mu.RUnlock()
+	if gotBase != srv.URL {
+		t.Fatalf("baseURL = %q, want cached connection preserved %q", gotBase, srv.URL)
 	}
 }

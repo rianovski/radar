@@ -1,16 +1,43 @@
-import { AlertTriangle, ChevronDown, ChevronRight, CircleAlert, Clock3, GitBranch, GitCommit, Info, Loader2, Plus, Trash2 } from 'lucide-react'
+import { AlertTriangle, ArrowUpDown, ChevronDown, ChevronRight, ChevronUp, CircleAlert, Clock3, GitBranch, GitCommit, Info, Loader2, Plus, RefreshCw, Trash2 } from 'lucide-react'
+import { PaneLoader } from '../../ui/PaneLoader'
 import { clsx } from 'clsx'
 import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { GitOpsChange, GitOpsHistoryItem, GitOpsInsight, GitOpsInsightRef, GitOpsIssue, GitOpsPlanItem, GitOpsRemediation, GitOpsResourceTree, GitOpsTreeNode } from '../../../types'
 import { HealthStatusBadge, SyncStatusBadge } from '../GitOpsStatusBadge'
+import { radarHealthNote } from '../health-provenance'
 import { SEVERITY_BADGE, SEVERITY_TEXT } from '../../../utils/badge-colors'
 import { formatRelativeAgeTime } from '../../../utils/format'
 import { Tooltip } from '../../ui/Tooltip'
-import { compactSource, entryTone, gitopsToSeverity, messageToPhase, normalizeHealthStatus, normalizeSyncStatus } from './insights-helpers'
+import { SearchBox } from '../../ui/SearchBox'
+import { FilterPill, type FilterPillTone } from '../../ui/FilterPill'
+import { Collapse, CollapseChevron } from '../../ui/Collapse'
+import type { SortDir } from '../../ui/SortableTh'
+import {
+  changeHealth,
+  changeMatchesFacets,
+  changeMatchesSearch,
+  changeSync,
+  compactSource,
+  entryTone,
+  gitopsToSeverity,
+  healthStatusRank,
+  isArgoResourceSyncEligible,
+  messageToPhase,
+  normalizeHealthStatus,
+  normalizeSyncStatus,
+  resourceStatusCounts,
+  syncStatusRank,
+  type ResourceSortKey,
+  type ResourceStatusFacet,
+} from './insights-helpers'
 
 interface GitOpsStatusStripProps {
   insight?: GitOpsInsight | null
   loading?: boolean
+  // Optional host slot: given the latest revision, render inline Git commit
+  // metadata (author, signature) next to the revision SHA. The host wires this
+  // to a data loader; when absent, only the SHA is shown.
+  renderRevisionMeta?: (revision: string) => ReactNode
 }
 
 // Status strip carries the operation chip (when a sync is in flight or
@@ -30,7 +57,7 @@ interface GitOpsStatusStripProps {
 //
 // Health and Sync badges live next to the title in the page header —
 // pair them there with identity, not here.
-export function GitOpsStatusStrip({ insight, loading }: GitOpsStatusStripProps) {
+export function GitOpsStatusStrip({ insight, loading, renderRevisionMeta }: GitOpsStatusStripProps) {
   const summary = insight?.summary
   if (loading) {
     return <div className="h-8 animate-pulse border-b border-theme-border bg-theme-base" />
@@ -55,6 +82,7 @@ export function GitOpsStatusStrip({ insight, loading }: GitOpsStatusStripProps) 
   const operationFailure = (insight.issues ?? []).find(
     (i) => i.severity === 'critical' && i.scope === 'operation' && i.stuck,
   )
+  const operationTooltipMessage = summary.rawOperationMessage || summary.operationMessage
   return (
     <div className="border-b border-theme-border bg-theme-base px-4 py-2">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
@@ -86,7 +114,7 @@ export function GitOpsStatusStrip({ insight, loading }: GitOpsStatusStripProps) 
             (parsed cause, retry count, raw message) so the strip stays a
             calm orientation row instead of duplicating the error three times. */}
         {operation && summary.operationMessage && isInFlightPhase(operation) && (
-          <Tooltip content={summary.operationMessage} delay={400} wrapperClassName="min-w-0 max-w-[60ch]">
+          <Tooltip content={operationTooltipMessage} delay={400} wrapperClassName="min-w-0 max-w-[60ch]">
             <span className="block truncate text-[11px] text-theme-text-secondary">
               {summary.operationMessage}
             </span>
@@ -113,6 +141,7 @@ export function GitOpsStatusStrip({ insight, loading }: GitOpsStatusStripProps) 
                 </Tooltip>
               )}
               {reconcileAge && <span className="text-theme-text-tertiary">· {reconcileAge}</span>}
+              {revision && renderRevisionMeta?.(revision)}
             </span>
           )}
           {!shortRev && reconcileAge && <MetaFact label="Last reconcile" value={reconcileAge} />}
@@ -201,11 +230,13 @@ function buildHealthSummary(changes: GitOpsChange[]): { text: string; tone: stri
   let outOfSync = 0
   let other = 0
   for (const c of changes) {
-    const cat = c.category
-    if (cat === 'Synced' || c.health === 'Healthy') healthy++
-    else if (cat === 'Degraded') degraded++
-    else if (cat === 'Missing') missing++
-    else if (cat === 'OutOfSync') outOfSync++
+    // Count HEALTH, not sync — a Synced resource can still be Degraded, so check
+    // degraded/missing FIRST and never let a Synced sync-state mask it. A Synced
+    // resource with no assessed health (ConfigMaps etc.) still reads as fine.
+    if (c.health === 'Degraded' || c.category === 'Degraded') degraded++
+    else if (c.health === 'Missing' || c.category === 'Missing') missing++
+    else if (c.health === 'Healthy' || c.category === 'Synced') healthy++
+    else if (c.category === 'OutOfSync') outOfSync++
     else other++
   }
   const total = changes.length
@@ -245,7 +276,7 @@ function TerminatingStatusStrip({ summary }: { summary: NonNullable<GitOpsInsigh
           {showHistorical ? '− Hide pre-deletion metadata' : '+ Show pre-deletion metadata'}
         </button>
       </div>
-      {showHistorical && (
+      <Collapse open={showHistorical}>
         <div className="mt-2 flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1 border-t border-theme-border/40 pt-2 text-[11px] text-theme-text-tertiary">
           {summary.source && <MetaFact label="Source" value={summary.source} />}
           {(summary.lastRevision || summary.targetRevision) && (
@@ -254,14 +285,14 @@ function TerminatingStatusStrip({ summary }: { summary: NonNullable<GitOpsInsigh
           {summary.lastReconcile && <MetaFact label="Last reconcile" value={formatRelative(summary.lastReconcile)} />}
           {summary.autoSyncMode && <MetaFact label="Sync mode" value={summary.autoSyncMode} />}
         </div>
-      )}
+      </Collapse>
     </div>
   )
 }
 
 function isInFlightPhase(phase: string): boolean {
   const p = phase.toLowerCase()
-  return p.includes('running') || p.includes('progress') || p.includes('reconcil')
+  return p.includes('running') || p.includes('terminat') || p.includes('progress') || p.includes('reconcil')
 }
 
 // Show the operation chip only for phases the operator needs to *act on*.
@@ -384,7 +415,7 @@ function GitOpsHistoricalIssuesDisclosure({
         aria-expanded={expanded}
       >
         <div className="flex items-center gap-2">
-          {expanded ? <ChevronDown className="h-3.5 w-3.5 text-theme-text-tertiary" /> : <ChevronRight className="h-3.5 w-3.5 text-theme-text-tertiary" />}
+          <CollapseChevron open={expanded} className="h-3.5 w-3.5" />
           <span className="text-[12px] font-medium text-theme-text-secondary">
             Pre-deletion issues ({total})
           </span>
@@ -393,12 +424,12 @@ function GitOpsHistoricalIssuesDisclosure({
           </span>
         </div>
       </button>
-      {expanded && (
+      <Collapse open={expanded}>
         <div className="border-t border-theme-border">
           {operationFailure && <GitOpsFailureCard issue={operationFailure} onSelect={onSelectIssue} onRemediate={onRemediate} remediationPending={remediationPending} />}
           {others.length > 0 && <GitOpsCompactIssueStack issues={others} onSelectIssue={onSelectIssue} />}
         </div>
-      )}
+      </Collapse>
     </div>
   )
 }
@@ -423,6 +454,8 @@ function GitOpsFailureCard({
   const [showRaw, setShowRaw] = useState(false)
   const stuck = !!issue.stuck
   const ref = issue.refs?.[0]
+  const rawControllerMessage = issue.rawMessage || issue.message
+  const rawControllerLabel = issue.rawMessage ? 'raw controller error' : 'controller message'
   // Title prioritizes the parsed cause's first sentence. Without parsing we
   // get the bare phase ("Failed") which alone tells the user nothing — fall
   // back to the first sentence of the raw message in that case so something
@@ -484,15 +517,15 @@ function GitOpsFailureCard({
               onClick={() => setShowRaw((v) => !v)}
               className="inline-flex items-center gap-1 text-[11px] text-theme-text-tertiary transition-colors hover:text-theme-text-secondary"
             >
-              {showRaw ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-              {showRaw ? 'Hide raw controller error' : 'Show raw controller error'}
+              <CollapseChevron open={showRaw} className="h-3 w-3" />
+              {showRaw ? `Hide ${rawControllerLabel}` : `Show ${rawControllerLabel}`}
             </button>
           </div>
-          {showRaw && (
+          <Collapse open={showRaw}>
             <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded border border-theme-border bg-theme-base px-3 py-2 font-mono text-[11px] text-theme-text-secondary">
-              {issue.message}
+              {rawControllerMessage}
             </pre>
-          )}
+          </Collapse>
         </div>
       </div>
     </div>
@@ -572,42 +605,45 @@ function GitOpsCompactIssueStack({ issues, onSelectIssue }: { issues: GitOpsIssu
         }}
         disabled={headlineAction === 'none'}
         className={clsx(
-          'group flex w-full items-center gap-2 px-4 py-2 text-left text-xs transition-colors',
+          'group flex w-full flex-col gap-0.5 px-4 py-2 text-left text-xs transition-colors',
           headlineAction !== 'none' ? 'hover:bg-theme-hover/50' : 'cursor-default',
         )}
         aria-expanded={canExpand ? expanded : undefined}
       >
-        {tone.icon}
-        <span className={clsx('shrink-0 font-semibold', tone.text)}>{headline.reason}</span>
-        <span className="min-w-0 flex-1 truncate text-theme-text-secondary">{headline.message}</span>
-        {/* Inline count when there are more issues behind the headline.
-            Lightweight text — pairs with the chevron as a single disclosure
-            unit instead of a separator-bordered count button. */}
-        {remaining > 0 && (
-          <span className="shrink-0 text-[11px] text-theme-text-tertiary">
-            +{remaining} more
-          </span>
-        )}
-        {/* Open-resource pill: only shown when the row's action IS to open
-            (single-issue case). When the row expands, the per-row Open
-            pills live inside the expanded section, scoped to each item. */}
-        {headlineAction === 'open' && headlineRef && (
-          <span className="shrink-0 text-[11px] font-medium text-theme-text-secondary opacity-70 transition-opacity group-hover:opacity-100">
-            Open {refText(headlineRef)} →
-          </span>
-        )}
-        {canExpand && (
-          expanded
-            ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-theme-text-tertiary" />
-            : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-theme-text-tertiary" />
+        <div className="flex w-full items-center gap-2">
+          {tone.icon}
+          <span className={clsx('shrink-0 font-semibold', tone.text)}>{headline.reason}</span>
+          <span className="min-w-0 flex-1 truncate text-theme-text-secondary">{headline.message}</span>
+          {/* Inline count when there are more issues behind the headline.
+              Lightweight text — pairs with the chevron as a single disclosure
+              unit instead of a separator-bordered count button. */}
+          {remaining > 0 && (
+            <span className="shrink-0 text-[11px] text-theme-text-tertiary">
+              +{remaining} more
+            </span>
+          )}
+          {/* Open-resource pill: only shown when the row's action IS to open
+              (single-issue case). When the row expands, the per-row Open
+              pills live inside the expanded section, scoped to each item. */}
+          {headlineAction === 'open' && headlineRef && (
+            <span className="shrink-0 text-[11px] font-medium text-theme-text-secondary opacity-70 transition-opacity group-hover:opacity-100">
+              Open {refText(headlineRef)} →
+            </span>
+          )}
+          {canExpand && <CollapseChevron open={expanded} className="h-3.5 w-3.5" />}
+        </div>
+        {headline.cause && (
+          <p className="truncate pl-[22px] text-[11px] text-theme-text-tertiary">{headline.cause}</p>
         )}
       </button>
-      {expanded && canExpand && (
+      {canExpand && (
+        <Collapse open={expanded}>
         <div className="divide-y divide-theme-border border-t border-theme-border bg-theme-base/40">
           {issues.slice(1).map((issue: GitOpsIssue, index: number) => {
             const t = severityTone(issue.severity)
             const ref = issue.refs?.[0]
             const actionable = !!(onSelectIssue && ref)
+            const rawMessage = issue.rawMessage && issue.rawMessage !== issue.message ? issue.rawMessage : ''
             return (
               <button
                 key={`${issue.reason}-${index}`}
@@ -626,6 +662,8 @@ function GitOpsCompactIssueStack({ issues, onSelectIssue }: { issues: GitOpsIssu
                     <span className="text-[10px] uppercase tracking-wide text-theme-text-tertiary">{issue.scope}</span>
                   </div>
                   <p className="mt-0.5 text-theme-text-secondary">{issue.message}</p>
+                  {issue.cause && <p className="mt-0.5 text-[11px] text-theme-text-tertiary">{issue.cause}</p>}
+                  {rawMessage && <p className="mt-0.5 break-words font-mono text-[11px] text-theme-text-tertiary">{rawMessage}</p>}
                   {issue.action && <p className="mt-0.5 text-[11px] text-theme-text-tertiary">{issue.action}</p>}
                 </div>
                 {actionable && ref && (
@@ -637,6 +675,7 @@ function GitOpsCompactIssueStack({ issues, onSelectIssue }: { issues: GitOpsIssu
             )
           })}
         </div>
+        </Collapse>
       )}
     </div>
   )
@@ -678,6 +717,8 @@ interface GitOpsChangesViewProps {
   insight?: GitOpsInsight | null
   error?: Error | null
   onOpenResource?: (ref: GitOpsChange['ref']) => void
+  onSyncResource?: (ref: GitOpsChange['ref']) => void
+  syncResourceDisabledReason?: string
   // When set, the matching change row scrolls into view and gets a transient
   // highlight ring. Used when the user clicks "View →" on an issue alert in
   // the band above. Key shape: `${kind}/${namespace||''}/${name}` (group is
@@ -689,16 +730,45 @@ interface GitOpsChangesViewProps {
   // Argo's default list-view behavior. Default mode still shows declared
   // resources only — the diagnostic data (drift, events) lives there.
   tree?: GitOpsResourceTree | null
+  // Host-wired loader for the full Git-rendered desired-vs-live diff of a
+  // single managed resource (Argo CD only). Data fetching lives in web/; this
+  // returns the loaded <ArgoResourceDiff/>. When present AND
+  // insight.capabilities.argoDiffAvailable, resolvable rows expose a "Full
+  // diff" toggle. Library consumers that don't wire it get no such affordance.
+  renderResourceDiff?: (ref: GitOpsInsightRef) => ReactNode
+  // Opens the global Settings dialog. Backs the "Connect Argo CD" hint shown
+  // when the root is an Argo Application without the diff integration.
+  onOpenSettings?: () => void
 }
 
-export function GitOpsChangesView({ insight, error, onOpenResource, focusKey, tree }: GitOpsChangesViewProps) {
+// Status facets for the Resources list. OutOfSync is a sync-status concern
+// (amber/warn); Degraded + Missing are health failures (red/danger).
+const STATUS_FACETS: { key: ResourceStatusFacet; label: string; tone: FilterPillTone }[] = [
+  { key: 'outOfSync', label: 'Out of sync', tone: 'warn' },
+  { key: 'degraded', label: 'Degraded', tone: 'danger' },
+  { key: 'missing', label: 'Missing', tone: 'danger' },
+]
+
+export function GitOpsChangesView({ insight, error, onOpenResource, onSyncResource, syncResourceDisabledReason, focusKey, tree, renderResourceDiff, onOpenSettings }: GitOpsChangesViewProps) {
   // "All resources" toggle: when on, render generated descendants alongside
   // the controller's declared inventory. Argo's UI defaults to "all" — we
   // default to "declared" because the diagnostic data (drift, events) lives
   // on declared resources only and the triage flow stays cleaner without
   // 30+ Pod rows in the way. Operators who want the full picture flip it.
   const [showAll, setShowAll] = useState(false)
+  // Resources list controls: free-text search (name/kind/namespace), status
+  // facets (the three states worth isolating on a drifted app — they replaced
+  // the per-resource OutOfSync "issues" that used to restate the whole table),
+  // and column sort. Default sort is 'order' — the controller's apply sequence
+  // — because it's the only sort under which the wave grouping headers read
+  // correctly.
+  const [search, setSearch] = useState('')
+  const [statusFilters, setStatusFilters] = useState<Set<ResourceStatusFacet>>(new Set())
+  const [sort, setSort] = useState<{ key: ResourceSortKey; dir: SortDir }>({ key: 'order', dir: 'asc' })
   const changes = insight?.changes ?? []
+  // Keep object identity here: tree extras are newly allocated, while ordered
+  // controller changes retain their original references.
+  const declaredChanges = new Set(changes)
   const plan = insight?.plan ?? []
   // Synthesize Change rows for generated tree nodes that aren't already in
   // the declared inventory. These rows carry less diagnostic data — no
@@ -711,38 +781,55 @@ export function GitOpsChangesView({ insight, error, onOpenResource, focusKey, tr
   // map persists across renders so the effect can find the node even when
   // changes re-render (e.g. polling).
   const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+  // A deep-link (an issue's "View →") is an explicit "take me to this resource"
+  // intent. Clear any active search/facet filters so the target can't be
+  // filtered out of the list before we scroll to it. Functional updates keep
+  // this a no-op when no filter is active.
   useEffect(() => {
     if (!focusKey) return
+    setSearch((s) => (s ? '' : s))
+    setStatusFilters((f) => (f.size ? new Set<ResourceStatusFacet>() : f))
+  }, [focusKey])
+  // Scroll to the focused row once it has mounted. Re-runs when the filter
+  // state changes so that after the reset above remounts a previously
+  // filtered-out row, the scroll fires; the ref guard keeps it to one scroll
+  // per focusKey instead of re-scrolling on every poll re-render.
+  const scrolledFor = useRef<string | null>(null)
+  useEffect(() => {
+    if (!focusKey) {
+      scrolledFor.current = null
+      return
+    }
+    if (scrolledFor.current === focusKey) return
     const node = rowRefs.current.get(focusKey)
     if (node) {
       node.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      scrolledFor.current = focusKey
     }
-  }, [focusKey])
+  }, [focusKey, search, statusFilters])
   // Distinguish "still loading" from "fetch failed" so a backend 5xx
   // doesn't render as a stuck "Loading…".
   if (error && !insight) {
     return <InsightErrorState error={error} />
   }
   if (!insight) {
-    return <CenteredText>Loading GitOps resources...</CenteredText>
+    return <PaneLoader label="Loading GitOps resources…" className="h-full" />
   }
   // Build plan metadata maps keyed by ref so each Change row can advertise
-  // its sync step, hook phase, and wave assignment. The plan and changes
-  // lists are the same resources from different angles — we render one
-  // unified list ordered by plan step, with plan metadata folded onto each
-  // change row.
+  // its hook phase and wave assignment. The plan and changes lists are the
+  // same resources from different angles — we fold the plan metadata onto
+  // each change row and order the list by the plan's apply sequence.
   const planByRef = new Map<string, GitOpsPlanItem>()
   for (const item of plan) {
     const key = refKey(item.ref)
     if (!planByRef.has(key)) planByRef.set(key, item)
   }
-  // Sort changes by plan order (step) so the list reads top-to-bottom in
-  // the order the controller will reconcile them. Changes without a plan
-  // entry land at the end in name order — they're managed resources the
-  // controller saw but didn't sequence (rare but possible for hook resources
-  // already completed, or status-only entries). Extras-from-tree land
-  // after all declared rows.
-  const sortedChanges = [...changes, ...extraFromTree].sort((a, b) => {
+  // Apply-order baseline: the list in the sequence the controller reconciles.
+  // Changes without a plan entry land at the end in name order — managed
+  // resources the controller saw but didn't sequence (completed hooks,
+  // status-only entries). Extras-from-tree land after all declared rows.
+  // The column-sort/search/facet controls derive off this ordered baseline.
+  const applyOrdered = [...changes, ...extraFromTree].sort((a, b) => {
     const ap = planByRef.get(refKey(a.ref))?.order
     const bp = planByRef.get(refKey(b.ref))?.order
     if (ap == null && bp == null) return refKey(a.ref).localeCompare(refKey(b.ref))
@@ -750,15 +837,48 @@ export function GitOpsChangesView({ insight, error, onOpenResource, focusKey, tr
     if (bp == null) return -1
     return ap - bp
   })
-  // Wave grouping: when at least one plan entry declares a wave, we render
-  // wave headers between rows so multi-wave apps read as the operator
-  // wrote them. Skip the headers entirely for single-wave / no-wave apps —
-  // an "always wave 0" label is noise.
-  const hasAnyWave = plan.some((i) => i.waveSet)
+  const totalCount = applyOrdered.length
+  const counts = resourceStatusCounts(applyOrdered)
+  const filtered = applyOrdered.filter((c) => changeMatchesSearch(c, search) && changeMatchesFacets(c, statusFilters))
+  const displayChanges = sortChanges(filtered, sort)
+  const filtersActive = search.trim() !== '' || statusFilters.size > 0
+  // Wave grouping only reads correctly in apply order (ascending). Any column
+  // sort or a descending flip breaks the sequence, so drop the headers and
+  // render a flat list. Also skip them for single-wave / no-wave apps — an
+  // "always wave 0" label is noise.
+  const groupByWave = sort.key === 'order' && sort.dir === 'asc' && plan.some((i) => i.waveSet)
   // Source URL for Missing rows. We can't show their live state (resource
   // doesn't exist), but we CAN point at where they're declared in Git —
   // which is the most useful thing to do when there's no drawer to open.
   const sourceTreeURL = gitTreeURL(insight.summary.source, insight.summary.lastRevision || insight.summary.targetRevision || '')
+  // Comparison-coverage disclosure (Argo only). spec.ignoreDifferences hides
+  // fields from drift comparison; surfacing the count keeps the drift view
+  // honest about what it's NOT checking. Neutral note, not an alarm.
+  const ignoredDiffs = insight.summary.ignoredDifferences
+  const isArgoRoot = insight.summary.tool === 'argocd' && insight.summary.kind === 'Application'
+  // Full-diff affordance is offered only when the backend reports the Argo CD
+  // integration is connected for this app AND the host wired the loader.
+  const argoDiffAvailable = isArgoRoot && !!insight.capabilities?.argoDiffAvailable && !!renderResourceDiff
+  // When Argo can't build the desired state (ComparisonError — unreachable repo,
+  // missing revision, broken spec), it can't compare live-vs-Git for ANY
+  // resource, so every row's sync arrives Unknown. Those per-row Unknowns are
+  // all shadows of the one app-level failure already surfaced in the issues
+  // band above; rendering them as N alarming pills makes one problem look like
+  // many. When the app-level sync is Unknown, quiet the derivative per-row sync
+  // to a muted placeholder and explain the cause once. Health stays — it's a
+  // live signal that's still knowable and still worth reading.
+  const syncUnavailable = isArgoRoot && (insight.summary.sync ?? '').toLowerCase() === 'unknown'
+  const toggleFacet = (facet: ResourceStatusFacet) => {
+    setStatusFilters((prev) => {
+      const next = new Set(prev)
+      if (next.has(facet)) next.delete(facet)
+      else next.add(facet)
+      return next
+    })
+  }
+  const onSort = (key: ResourceSortKey) => {
+    setSort((prev) => (prev.key === key ? { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'asc' }))
+  }
   return (
     <div className="h-full overflow-auto bg-theme-base p-4">
       <section className="rounded-md border border-theme-border bg-theme-surface">
@@ -774,7 +894,9 @@ export function GitOpsChangesView({ insight, error, onOpenResource, focusKey, tr
               </Tooltip>
             )}
             <span className="text-[11px] tabular-nums text-theme-text-tertiary">
-              {sortedChanges.length} {sortedChanges.length === 1 ? 'resource' : 'resources'}
+              {filtersActive && displayChanges.length !== totalCount
+                ? `${displayChanges.length} of ${totalCount}`
+                : `${totalCount} ${totalCount === 1 ? 'resource' : 'resources'}`}
             </span>
           </div>
           {tree && (
@@ -810,80 +932,269 @@ export function GitOpsChangesView({ insight, error, onOpenResource, focusKey, tr
             </div>
           )}
         </div>
-        {/* Honest disclaimer about diff scope. Neither Argo nor Flux exposes
-            per-resource desired-vs-live diffs on the CRD — they're computed
-            on demand by their respective servers/CLIs, which Radar doesn't
-            call. */}
-        {sortedChanges.length > 0 && (
-          <div className="border-b border-theme-border bg-theme-base/40 px-4 py-2 text-[11px] text-theme-text-tertiary">
-            Radar reads each resource's drift status from the controller. For a line-by-line diff, {insight.summary.tool === 'fluxcd' ? (
-              insight.summary.kind === 'HelmRelease' ? (
-                <>run <code className="rounded bg-theme-elevated px-1 py-0.5 font-mono text-[10px]">helm diff upgrade {insight.summary.name} &lt;chart&gt;</code> (requires the helm-diff plugin).</>
-              ) : (
-                <>run <code className="rounded bg-theme-elevated px-1 py-0.5 font-mono text-[10px]">flux diff kustomization {insight.summary.name} --path &lt;local-manifests&gt;</code>.</>
-              )
-            ) : (
-              <>use the Argo CD UI or run <code className="rounded bg-theme-elevated px-1 py-0.5 font-mono text-[10px]">argocd app diff {insight.summary.name}</code>.</>
+        {syncUnavailable && totalCount > 0 && (
+          <div className="flex items-start gap-2 border-b border-theme-border bg-theme-base/40 px-4 py-2 text-xs text-theme-text-secondary">
+            <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-theme-text-tertiary" />
+            <span>
+              Argo CD hasn't compared this app against Git yet, so per-resource
+              <span className="font-medium text-theme-text-primary"> sync</span> status is unavailable
+              (a first refresh may still be in flight; if an error is shown above, resolve it to restore comparison).
+              <span className="font-medium text-theme-text-primary"> Health</span> below is still live.
+            </span>
+          </div>
+        )}
+        {/* Filter/sort toolbar. The status facets are the primary way to
+            answer "which resources are the problem?" now that the issues band
+            no longer restates every OutOfSync resource above. */}
+        {totalCount > 0 && (
+          <div className="flex flex-wrap items-center gap-2 border-b border-theme-border px-4 py-2">
+            <SearchBox
+              value={search}
+              onChange={setSearch}
+              scope="gitops"
+              shortcutId="gitops-resources-search"
+              placeholder="Filter resources… (press /)"
+              className="w-full min-w-[180px] sm:w-64"
+            />
+            {/* Status facets appear only when the app actually has that state
+                (or the operator has it toggled on) — a healthy app shouldn't
+                render three "(0)" pills. */}
+            <div className="flex flex-wrap items-center gap-1.5">
+              {STATUS_FACETS.map(({ key, label, tone }) =>
+                counts[key] > 0 || statusFilters.has(key) ? (
+                  <FilterPill
+                    key={key}
+                    label={label}
+                    tone={tone}
+                    active={statusFilters.has(key)}
+                    count={counts[key]}
+                    onClick={() => toggleFacet(key)}
+                  />
+                ) : null,
+              )}
+            </div>
+            {sort.key !== 'order' && (
+              <button
+                type="button"
+                onClick={() => setSort({ key: 'order', dir: 'asc' })}
+                className="ml-auto inline-flex items-center gap-1 text-[11px] text-theme-text-tertiary transition-colors hover:text-theme-text-secondary"
+              >
+                <ArrowUpDown className="h-3 w-3" /> Apply order
+              </button>
             )}
           </div>
         )}
-        {sortedChanges.length === 0 ? (
-          <div className="p-4 text-sm text-theme-text-secondary">No managed resources reported by the GitOps controller.</div>
-        ) : (
-          <div className="divide-y divide-theme-border">
-            {sortedChanges.map((change, idx) => {
-              const planItem = planByRef.get(refKey(change.ref))
-              const step = planItem?.order
-              const hook = planItem?.hook
-              const wave = planItem?.wave
-              const waveSet = !!planItem?.waveSet
-              const rowKey = refKey(change.ref)
-              const focused = focusKey === rowKey
-              const explanation = !change.syncError && !change.message
-                ? explainChangeStatus(change.sync, change.health, insight.summary)
-                : ''
-              const hasInlineDetail = !!(
-                (change.drift && change.drift.entries.length > 0) ||
-                (change.recentEvents && change.recentEvents.length > 0)
+        {/* Honest disclaimer about diff scope. Neither Argo nor Flux exposes
+            per-resource desired-vs-live diffs on the CRD — they're computed
+            on demand by their respective servers/CLIs, which Radar doesn't
+            call. Suppressed for an Argo app that shows the connect/reconnect bar
+            below (which points at Settings), so the two don't stack with subtly
+            different advice — the CLI fallback stays for Flux and for consumers
+            that don't wire Settings. */}
+        {totalCount > 0 && !argoDiffAvailable && !(isArgoRoot && !!onOpenSettings) && (
+          <div className="border-b border-theme-border bg-theme-base/40 px-4 py-2 text-[11px] text-theme-text-tertiary">
+            Radar reads each resource's drift status from the controller. For a line-by-line diff, {insight.summary.tool === 'fluxcd' ? (
+              insight.summary.kind === 'HelmRelease' ? (
+                <>run <code className="inline-code text-[10px]">helm diff upgrade {insight.summary.name} &lt;chart&gt;</code> (requires the helm-diff plugin).</>
+              ) : (
+                <>run <code className="inline-code text-[10px]">flux diff kustomization {insight.summary.name} --path &lt;local-manifests&gt;</code>.</>
               )
-              // Render a wave separator above this row when the wave value
-              // changed from the previous one. waveSet=false rows under a
-              // hasAnyWave plan get a "Default wave" header — matches
-              // how Argo's UI separates explicitly-waved from default.
-              const prevPlan = idx > 0 ? planByRef.get(refKey(sortedChanges[idx - 1]!.ref)) : undefined
-              const showWaveHeader = hasAnyWave && (idx === 0 || prevPlan?.wave !== wave || prevPlan?.waveSet !== waveSet)
-              return (
-                <Fragment key={`${change.ref.group}/${change.ref.kind}/${change.ref.namespace}/${change.ref.name}`}>
-                  {showWaveHeader && (
-                    <div className="bg-theme-base/50 px-4 py-1 text-[10px] font-semibold uppercase tracking-wide text-theme-text-tertiary">
-                      {waveSet ? `Wave ${wave}` : 'Default wave'}
+            ) : (
+              <>use the Argo CD UI or run <code className="inline-code text-[10px]">argocd app diff {insight.summary.name}</code>.</>
+            )}
+          </div>
+        )}
+        {totalCount > 0 && isArgoRoot && !insight.capabilities?.argoDiffAvailable && onOpenSettings && (
+          <div className="border-b border-theme-border bg-theme-base/40 px-4 py-2 text-[11px] text-theme-text-tertiary">
+            {insight.capabilities?.argoConfigured ? (
+              <>
+                Argo CD's full Git-rendered diff isn't available for this app (connection down or token not authorized).{' '}
+                <button type="button" onClick={onOpenSettings} className="font-medium text-accent-text hover:underline">
+                  Check Argo CD in Settings
+                </button>.
+              </>
+            ) : (
+              <>
+                <button type="button" onClick={onOpenSettings} className="font-medium text-accent-text hover:underline">
+                  Connect Argo CD
+                </button>{' '}
+                for the full Git-rendered diff.
+              </>
+            )}
+          </div>
+        )}
+        {ignoredDiffs && ignoredDiffs.ruleCount > 0 && (
+          <div className="flex items-center gap-1.5 border-b border-theme-border bg-theme-base/40 px-4 py-2 text-[11px] text-theme-text-tertiary">
+            <span>
+              Some fields are intentionally excluded from drift comparison, so a resource can read as in sync
+              even if those fields differ.
+            </span>
+            <Tooltip
+              content={
+                <div className="max-w-[46ch] space-y-1 text-left">
+                  <div>
+                    {ignoredDiffs.ruleCount} exclusion {ignoredDiffs.ruleCount === 1 ? 'rule' : 'rules'} configured
+                    {ignoredDiffs.kinds.length > 0 && <> on {ignoredDiffs.kinds.join(', ')}</>} (Argo CD{' '}
+                    <code className="inline-code">spec.ignoreDifferences</code>).
+                  </div>
+                  {ignoredDiffs.unsupportedRuleCount > 0 && (
+                    <div>
+                      {ignoredDiffs.unsupportedRuleCount} of them use jq expressions or managed-fields managers,
+                      which Radar doesn&apos;t evaluate — so a few fields Argo hides may still appear here.
                     </div>
                   )}
-                  <ChangeRow
-                    change={change}
-                    step={step}
-                    hook={hook}
-                    explanation={explanation}
-                    focused={focused}
-                    autoExpand={focused}
-                    hasInlineDetail={hasInlineDetail}
-                    onOpenResource={onOpenResource}
-                    sourceTreeURL={sourceTreeURL}
-                    registerRef={(el) => {
-                      if (el) {
-                        rowRefs.current.set(rowKey, el)
-                      } else {
-                        rowRefs.current.delete(rowKey)
-                      }
-                    }}
-                  />
-                </Fragment>
-              )
-            })}
+                </div>
+              }
+              delay={200}
+            >
+              <span className="inline-flex cursor-help items-center text-theme-text-tertiary hover:text-theme-text-secondary">
+                <Info className="h-3 w-3" />
+                <span className="ml-1 underline decoration-dotted underline-offset-2">details</span>
+              </span>
+            </Tooltip>
           </div>
+        )}
+        {totalCount === 0 ? (
+          <div className="p-4 text-sm text-theme-text-secondary">No managed resources reported by the GitOps controller.</div>
+        ) : displayChanges.length === 0 ? (
+          <div className="flex flex-col items-start gap-2 p-4 text-sm text-theme-text-secondary">
+            <span>No resources match the current filters.</span>
+            <button
+              type="button"
+              onClick={() => {
+                setSearch('')
+                setStatusFilters(new Set())
+              }}
+              className="text-[12px] font-medium text-skyhook-500 hover:underline"
+            >
+              Clear filters
+            </button>
+          </div>
+        ) : (
+          <>
+            <div className="grid grid-cols-[minmax(0,1fr)_120px_120px_220px] gap-3 border-b border-theme-border bg-theme-base/40 px-4 py-2">
+              <ResSortHeader label="Resource" sortKey="name" sort={sort} onSort={onSort} />
+              <ResSortHeader label="Sync" sortKey="sync" sort={sort} onSort={onSort} />
+              <ResSortHeader label="Health" sortKey="health" sort={sort} onSort={onSort} />
+              <div />
+            </div>
+            <div className="divide-y divide-theme-border">
+              {displayChanges.map((change, idx) => {
+                const planItem = planByRef.get(refKey(change.ref))
+                const hook = planItem?.hook
+                const wave = planItem?.wave
+                const waveSet = !!planItem?.waveSet
+                const rowKey = refKey(change.ref)
+                const focused = focusKey === rowKey
+                const explanation = !change.syncError && !change.message
+                  ? explainChangeStatus(change.sync, change.health, insight.summary)
+                  : ''
+                const hasInlineDetail = !!(
+                  (change.drift && change.drift.entries.length > 0) ||
+                  (change.recentEvents && change.recentEvents.length > 0)
+                )
+                // Change rows come from the Application's status.resources, so
+                // they are in the Argo managed set by construction — the diff
+                // endpoint can serve every one (a Missing resource just has an
+                // empty live side). NOT gated on change.hasDesired/partial:
+                // those describe Radar's LOCAL last-applied view, and the Argo
+                // API diff exists precisely for the rows where it's absent.
+                const canFullDiff = argoDiffAvailable && !!change.ref.kind && !!change.ref.name
+                // Render a wave separator above this row when the wave value
+                // changed from the previous one. waveSet=false rows under a
+                // waved plan get a "Default wave" header — matches how Argo's
+                // UI separates explicitly-waved from default. Only in apply
+                // order (groupByWave); a column sort renders a flat list.
+                const prevPlan = idx > 0 ? planByRef.get(refKey(displayChanges[idx - 1]!.ref)) : undefined
+                const showWaveHeader = groupByWave && (idx === 0 || prevPlan?.wave !== wave || prevPlan?.waveSet !== waveSet)
+                return (
+                  <Fragment key={`${change.ref.group}/${change.ref.kind}/${change.ref.namespace}/${change.ref.name}`}>
+                    {showWaveHeader && (
+                      <div className="bg-theme-base/50 px-4 py-1 text-[10px] font-semibold uppercase tracking-wide text-theme-text-tertiary">
+                        {waveSet ? `Wave ${wave}` : 'Default wave'}
+                      </div>
+                    )}
+                    <ChangeRow
+                      change={change}
+                      hook={hook}
+                      explanation={explanation}
+                      syncUnavailable={syncUnavailable}
+                      focused={focused}
+                      autoExpand={focused}
+                      hasInlineDetail={hasInlineDetail}
+                      canFullDiff={canFullDiff}
+                      renderResourceDiff={renderResourceDiff}
+                      onOpenResource={onOpenResource}
+                      onSyncResource={onSyncResource}
+                      syncResourceDisabledReason={syncResourceDisabledReason}
+                      declared={declaredChanges.has(change)}
+                      sourceTreeURL={sourceTreeURL}
+                      registerRef={(el) => {
+                        if (el) {
+                          rowRefs.current.set(rowKey, el)
+                        } else {
+                          rowRefs.current.delete(rowKey)
+                        }
+                      }}
+                    />
+                  </Fragment>
+                )
+              })}
+            </div>
+          </>
         )}
       </section>
     </div>
+  )
+}
+
+// sortChanges applies the active column sort to the already apply-ordered
+// list. 'order' is the identity ordering (the list arrives in apply sequence),
+// so ascending returns it untouched and descending reverses. Column sorts
+// tie-break on kind/name so equal-status rows stay stable and readable.
+function sortChanges(list: GitOpsChange[], sort: { key: ResourceSortKey; dir: SortDir }): GitOpsChange[] {
+  if (sort.key === 'order') return sort.dir === 'asc' ? list : [...list].reverse()
+  const dir = sort.dir === 'asc' ? 1 : -1
+  const nameKey = (c: GitOpsChange) => `${c.ref.kind}/${c.ref.name}`
+  return [...list].sort((a, b) => {
+    let cmp = 0
+    if (sort.key === 'name') cmp = nameKey(a).localeCompare(nameKey(b))
+    else if (sort.key === 'sync') cmp = syncStatusRank(changeSync(a)) - syncStatusRank(changeSync(b))
+    else if (sort.key === 'health') cmp = healthStatusRank(changeHealth(a)) - healthStatusRank(changeHealth(b))
+    if (cmp === 0) cmp = nameKey(a).localeCompare(nameKey(b))
+    return cmp * dir
+  })
+}
+
+// ResSortHeader is the div-grid equivalent of ui/SortableTh (which renders a
+// <th>): the Resources list is a grid of expandable rows, not a <table>, so it
+// can't use the table header cell. Same chevron affordance for consistency.
+function ResSortHeader({
+  label,
+  sortKey,
+  sort,
+  onSort,
+}: {
+  label: string
+  sortKey: ResourceSortKey
+  sort: { key: ResourceSortKey; dir: SortDir }
+  onSort: (key: ResourceSortKey) => void
+}) {
+  const active = sort.key === sortKey
+  return (
+    <button
+      type="button"
+      onClick={() => onSort(sortKey)}
+      aria-label={`Sort by ${label}`}
+      className="inline-flex items-center gap-1 select-none text-[10px] font-semibold uppercase tracking-wide text-theme-text-tertiary transition-colors hover:text-theme-text-secondary focus-visible:text-theme-text-secondary focus-visible:outline-none"
+    >
+      {label}
+      {active ? (
+        sort.dir === 'asc' ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />
+      ) : (
+        <ArrowUpDown className="h-3 w-3 opacity-40" />
+      )}
+    </button>
   )
 }
 
@@ -920,6 +1231,9 @@ function buildTreeExtras(nodes: GitOpsTreeNode[], declared: GitOpsChange[]): Git
       category: 'Unknown',
       sync: n.sync,
       health: n.health,
+      // No healthSource: generated rows are always Radar's read and never
+      // had a controller verdict to be distinguished from.
+      message: n.healthMessage,
       hasDesired: false,
       hasLive: true,
       partial: true,
@@ -983,27 +1297,41 @@ function explainChangeStatus(
 //     "what's the underlying cluster reason?"
 function ChangeRow({
   change,
-  step,
   hook,
   explanation,
+  syncUnavailable,
   focused,
   autoExpand,
   hasInlineDetail,
+  canFullDiff,
+  renderResourceDiff,
   onOpenResource,
+  onSyncResource,
+  syncResourceDisabledReason,
+  declared,
   sourceTreeURL,
   registerRef,
 }: {
   change: GitOpsChange
-  step: number | undefined
   // Hook phase from the plan item (the controller-declared annotation).
   // Falls back to change.hookPhase (the executed phase) for visibility on
   // resources that already ran their hook.
   hook: string | undefined
   explanation: string
+  // True when the parent app can't compare against Git at all (ComparisonError):
+  // this row's Unknown sync is derivative, so render it muted instead of loud.
+  syncUnavailable: boolean
   focused: boolean
   autoExpand: boolean
   hasInlineDetail: boolean
+  // When true, the expanded panel offers a "Full diff" toggle that mounts the
+  // host-wired Argo CD diff loader for this resource.
+  canFullDiff: boolean
+  renderResourceDiff?: (ref: GitOpsInsightRef) => ReactNode
   onOpenResource?: (ref: GitOpsChange['ref']) => void
+  onSyncResource?: (ref: GitOpsChange['ref']) => void
+  syncResourceDisabledReason?: string
+  declared: boolean
   // Constructed URL pointing at the source directory in the remote Git
   // host (github / gitlab / bitbucket). Used as the "where this would be
   // declared" affordance on Missing rows, since opening the drawer for a
@@ -1011,12 +1339,15 @@ function ChangeRow({
   sourceTreeURL?: string | null
   registerRef: (el: HTMLDivElement | null) => void
 }) {
-  const [expanded, setExpanded] = useState(autoExpand && hasInlineDetail)
+  // A row expands when it has inline diagnostics (drift/events) or can load a
+  // full Argo CD diff — both live in the same disclosure panel.
+  const expandable = hasInlineDetail || canFullDiff
+  const [expanded, setExpanded] = useState(autoExpand && expandable)
   // Auto-expand when an issue alert deep-links to this row — the user just
   // clicked the issue, so they want to see the detail immediately.
   useEffect(() => {
-    if (autoExpand && hasInlineDetail) setExpanded(true)
-  }, [autoExpand, hasInlineDetail])
+    if (autoExpand && expandable) setExpanded(true)
+  }, [autoExpand, expandable])
   const driftEntries = change.drift?.entries ?? []
   const events = change.recentEvents ?? []
   // Missing resources have no live state to drill into — opening the drawer
@@ -1025,18 +1356,31 @@ function ChangeRow({
   // and offer "View in Git →" instead so the operator can read the
   // declared source instead of a non-existent live object.
   const isAbsent = change.health === 'Missing' && !change.hasLive
+  const radarNote = radarHealthNote({ health: change.health, healthSource: change.healthSource, healthMessage: change.message })
   const handleRowClick = () => {
-    if (hasInlineDetail) {
+    if (expandable) {
       setExpanded((v) => !v)
     } else if (!isAbsent && onOpenResource) {
       onOpenResource(change.ref)
     }
   }
-  // Row stays click-affordant when there's inline detail to expand OR a
+  // Row stays click-affordant when there's a disclosure panel to expand OR a
   // live resource to drill into. Missing rows without inline detail are
   // intentionally non-interactive — there's nowhere useful to go.
-  const rowInteractive = hasInlineDetail || (!isAbsent && !!onOpenResource)
+  const rowInteractive = expandable || (!isAbsent && !!onOpenResource)
   const hookLabel = change.hookPhase || hook
+  const canSyncResource = !!onSyncResource && isArgoResourceSyncEligible(change, declared, hookLabel)
+  const syncResourceButton = canSyncResource ? (
+    <button
+      type="button"
+      onClick={() => onSyncResource(change.ref)}
+      disabled={!!syncResourceDisabledReason}
+      className="inline-flex w-full items-center justify-center gap-1.5 rounded border border-theme-border bg-theme-base px-2 py-1 text-[11px] font-medium text-theme-text-secondary transition-colors hover:bg-theme-hover hover:text-theme-text-primary disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      <RefreshCw className="h-3 w-3" />
+      Sync resource
+    </button>
+  ) : null
   return (
     <div
       ref={registerRef}
@@ -1060,19 +1404,10 @@ function ChangeRow({
           )}
         >
           <div className="flex items-baseline gap-2">
-            {hasInlineDetail ? (
-              expanded
-                ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-theme-text-tertiary" />
-                : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-theme-text-tertiary" />
+            {expandable ? (
+              <CollapseChevron open={expanded} className="h-3.5 w-3.5 self-center" />
             ) : (
               <span aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
-            )}
-            {step !== undefined && (
-              <Tooltip content={`Sync plan step ${step}`} delay={200} wrapperClassName="shrink-0">
-                <span className="rounded border border-theme-border bg-theme-elevated px-1.5 py-0.5 font-mono text-[10px] text-theme-text-tertiary">
-                  step {step}
-                </span>
-              </Tooltip>
             )}
             <div className="min-w-0 truncate font-medium text-theme-text-primary">{change.ref.kind} / {change.ref.name}</div>
             {hookLabel && (
@@ -1110,7 +1445,7 @@ function ChangeRow({
               live health message — operators chasing a broken sync want
               the failure reason on the same row, not in a drawer. */}
           {change.syncError && (
-            <Tooltip content={change.syncError} delay={400} wrapperClassName="ml-[18px] mt-1 block max-w-full">
+            <Tooltip content={change.rawSyncError || change.syncError} delay={400} wrapperClassName="ml-[18px] mt-1 block max-w-full">
               <span className="line-clamp-3 text-xs text-red-600 dark:text-red-400">{change.syncError}</span>
             </Tooltip>
           )}
@@ -1119,9 +1454,31 @@ function ChangeRow({
             <div className="ml-[18px] mt-1 text-xs text-theme-text-tertiary">{explanation}</div>
           )}
         </button>
-        <div className="self-start"><SyncStatusBadge sync={normalizeSyncStatus(change.sync ?? change.category)} /></div>
-        <div className="self-start"><HealthStatusBadge health={normalizeHealthStatus(change.health)} /></div>
         <div className="self-start">
+          {syncUnavailable && normalizeSyncStatus(change.sync ?? change.category) === 'Unknown' ? (
+            <Tooltip content="Sync unavailable — Argo CD hasn't compared this app against Git yet." delay={200} wrapperClassName="inline-flex">
+              <span className="cursor-help select-none px-1 text-theme-text-tertiary" aria-label="Sync status unavailable">—</span>
+            </Tooltip>
+          ) : (
+            <SyncStatusBadge sync={normalizeSyncStatus(change.sync ?? change.category)} />
+          )}
+        </div>
+        <div className="flex flex-col items-start gap-1 self-start">
+          <HealthStatusBadge health={normalizeHealthStatus(change.health)} />
+          {radarNote && (
+            <Tooltip content={radarNote} delay={200} wrapperClassName="inline-flex">
+              <span className="cursor-help select-none rounded border border-theme-border bg-theme-elevated/70 px-1.5 py-0.5 text-[10px] leading-3 text-theme-text-tertiary">
+                Found by Radar
+              </span>
+            </Tooltip>
+          )}
+        </div>
+        <div className="self-start space-y-1.5">
+          {syncResourceButton && syncResourceDisabledReason ? (
+            <Tooltip content={syncResourceDisabledReason} delay={200} wrapperClassName="block">
+              {syncResourceButton}
+            </Tooltip>
+          ) : syncResourceButton}
           {/* Three affordance states:
               - Live resource (not Missing): "Open <kind> <name> →" opens the
                 K8s drawer.
@@ -1160,11 +1517,22 @@ function ChangeRow({
           )}
         </div>
       </div>
-      {expanded && hasInlineDetail && (
-        <div className="border-t border-theme-border bg-theme-base/40 px-4 py-3">
-          {driftEntries.length > 0 && <DriftPanel drift={change.drift!} />}
-          {events.length > 0 && <RecentEventsPanel events={events} />}
-        </div>
+      {expandable && (
+        <Collapse open={expanded} mountLazily>
+          <div className="border-t border-theme-border bg-theme-base/40 px-4 py-3">
+            {driftEntries.length > 0 && <DriftPanel drift={change.drift!} />}
+            {events.length > 0 && <RecentEventsPanel events={events} />}
+            {/* Expanding a row IS the request to see its diff — render it inline
+                rather than behind a second "Full diff" click. The capability is
+                already gated on a live Argo connection, so this only mounts (and
+                fetches) when the diff can actually be served. */}
+            {canFullDiff && (
+              <div className={clsx((driftEntries.length > 0 || events.length > 0) && 'mt-3')}>
+                {renderResourceDiff?.(change.ref)}
+              </div>
+            )}
+          </div>
+        </Collapse>
       )}
     </div>
   )
@@ -1175,6 +1543,7 @@ function ChangeRow({
 // inline as "old → new". Path is monospace; values are JSON-encoded and
 // pre-wrapped so structured values (objects, arrays) render readably.
 function DriftPanel({ drift }: { drift: NonNullable<GitOpsChange['drift']> }) {
+  const sourceLabel = driftSourceLabel(drift.source)
   return (
     <div>
       <div className="mb-2 flex items-baseline justify-between gap-2">
@@ -1182,6 +1551,7 @@ function DriftPanel({ drift }: { drift: NonNullable<GitOpsChange['drift']> }) {
         <span className="text-[10px] text-theme-text-tertiary">
           desired (Git) → live ·
           {drift.truncated ? ' showing first 50 entries' : ` ${drift.entries.length} field${drift.entries.length === 1 ? '' : 's'}`}
+          {sourceLabel && ` · ${sourceLabel}`}
         </span>
       </div>
       <div className="space-y-1 font-mono text-[11px]">
@@ -1191,6 +1561,15 @@ function DriftPanel({ drift }: { drift: NonNullable<GitOpsChange['drift']> }) {
       </div>
     </div>
   )
+}
+
+// Provenance label for a Drift's field entries. Only Argo-sourced drift gets an
+// explicit label; the built-in last-applied path renders without one (the
+// "desired (Git) → live" copy already implies it). Unknown sources (a library
+// consumer lagging the backend) fall through to no label rather than surfacing
+// a raw enum string.
+function driftSourceLabel(source: NonNullable<GitOpsChange['drift']>['source']): string {
+  return source === 'argocd-api' ? 'via Argo CD API' : ''
 }
 
 function DriftEntryRow({ entry }: { entry: NonNullable<GitOpsChange['drift']>['entries'][number] }) {
@@ -1273,7 +1652,7 @@ interface GitOpsActivityInsightViewProps {
 
 export function GitOpsActivityInsightView({ insight, error, onRollback }: GitOpsActivityInsightViewProps) {
   if (error && !insight) return <InsightErrorState error={error} />
-  if (!insight) return <CenteredText>Loading GitOps activity...</CenteredText>
+  if (!insight) return <PaneLoader label="Loading GitOps activity…" className="h-full" />
   const canRollback = !!insight.capabilities?.rollback && !!onRollback
   // Auto-sync makes rollback futile — the controller would re-sync to HEAD
   // immediately. Argo's own Web UI disables the button in this state. Detect
@@ -1384,7 +1763,9 @@ function HistoryRows({
                 </Tooltip>
               )}
               {item.message && (
-                <div className={clsx('mt-0.5 line-clamp-2 text-[11px]', sourceDisplay ? 'text-theme-text-tertiary' : 'text-theme-text-secondary')}>{item.message}</div>
+                <Tooltip content={item.rawMessage || item.message} delay={400} wrapperClassName="mt-0.5 block max-w-full">
+                  <div className={clsx('line-clamp-2 text-[11px]', sourceDisplay ? 'text-theme-text-tertiary' : 'text-theme-text-secondary')}>{item.message}</div>
+                </Tooltip>
               )}
             </div>
           </li>
@@ -1426,10 +1807,6 @@ function SectionHeader({ icon: Icon, title, hint }: { icon: typeof GitBranch; ti
       )}
     </div>
   )
-}
-
-function CenteredText({ children }: { children: ReactNode }) {
-  return <div className="flex h-full items-center justify-center text-sm text-theme-text-secondary">{children}</div>
 }
 
 // Surfaced when the insights endpoint errors. Without this the subviews

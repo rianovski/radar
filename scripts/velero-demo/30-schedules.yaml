@@ -1,0 +1,100 @@
+# Schedules. Covers healthy, invalid cron, a validation error with NO phase
+#   set (Velero leaves it empty on some failures), paused, and the important
+#   one: paused AND invalid, the row that used to read only "Paused" and gave
+#   no sign the schedule was broken.
+---
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: sched-enabled
+  namespace: velero
+spec:
+  paused: false
+  schedule: "0 1 * * *"
+  template:
+    includedNamespaces:
+      - "*"
+    storageLocation: default
+    ttl: 720h0m0s
+status:
+  lastBackup: "@now-1870m"
+  phase: Enabled
+---
+# Synthetic on two counts, both deliberate, because this fixture guards two
+# different things that Velero itself will not produce together.
+#
+# The missing phase: v1.18's schedule controller writes status.phase and
+# status.validationErrors in one assignment, so it does not emit errors without
+# FailedValidation. The detector checks the array independently anyway, for
+# older versions, and this exercises that branch.
+#
+# The error text: v1.18 validates only the cron expression, so it would not
+# report a missing storage location. It says so here on purpose — the cron below
+# is valid, so this is the counter-example that catches anything deriving
+# "invalid cron" from the mere presence of validation errors. Replacing it with
+# a cron error would remove the only fixture testing that distinction.
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: sched-errors-no-phase
+  namespace: velero
+spec:
+  schedule: "0 4 * * *"
+  template:
+    includedNamespaces:
+      - default
+status:
+  validationErrors:
+    - "storage location \"gone\" not found"
+---
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: sched-failedvalidation
+  namespace: velero
+spec:
+  paused: false
+  schedule: not-a-cron
+  template:
+    includedNamespaces:
+      - "*"
+    storageLocation: default
+    ttl: 720h0m0s
+status:
+  phase: FailedValidation
+  validationErrors:
+    - "invalid schedule: expected exactly 5 fields, found 1: [not-a-cron]"
+---
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: sched-paused
+  namespace: velero
+spec:
+  paused: true
+  schedule: "0 3 * * 0"
+  template:
+    includedNamespaces:
+      - "*"
+    storageLocation: default
+    ttl: 720h0m0s
+status:
+  phase: Enabled
+---
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: sched-paused-invalid
+  namespace: velero
+spec:
+  paused: true
+  schedule: bad-cron
+  template:
+    includedNamespaces:
+      - "*"
+    storageLocation: default
+    ttl: 720h0m0s
+status:
+  phase: FailedValidation
+  validationErrors:
+    - stale error retained while paused

@@ -5,42 +5,87 @@ import "time"
 
 // Flow represents a single network flow between two endpoints.
 type Flow struct {
-	Source      Endpoint  `json:"source"`
-	Destination Endpoint  `json:"destination"`
-	Protocol    string    `json:"protocol"` // tcp, udp, http, grpc
-	Port        int       `json:"port"`
-	L7Protocol  string    `json:"l7Protocol,omitempty"` // HTTP, gRPC, DNS (if L7 visibility)
+	Source           Endpoint `json:"source"`
+	Destination      Endpoint `json:"destination"`
+	Protocol         string   `json:"protocol"` // tcp, udp, http, grpc
+	Port             int      `json:"port"`
+	L7Protocol       string   `json:"l7Protocol,omitempty"` // HTTP, gRPC, DNS (if L7 visibility)
 	HTTPMethod       string   `json:"httpMethod,omitempty"`
 	HTTPPath         string   `json:"httpPath,omitempty"`
 	HTTPStatus       int      `json:"httpStatus,omitempty"`
-	LatencyNs        uint64   `json:"latencyNs,omitempty"`        // from Layer7.latency_ns (RESPONSE flows)
-	L7Type           string   `json:"l7Type,omitempty"`            // REQUEST, RESPONSE, SAMPLE
-	HTTPProtocol     string   `json:"httpProtocol,omitempty"`      // HTTP/1.1, HTTP/2
-	HTTPHeaders      []string `json:"httpHeaders,omitempty"`       // allowlisted headers as "key: value"
+	LatencyNs        uint64   `json:"latencyNs,omitempty"`    // from Layer7.latency_ns (RESPONSE flows)
+	L7Type           string   `json:"l7Type,omitempty"`       // REQUEST, RESPONSE, SAMPLE
+	HTTPProtocol     string   `json:"httpProtocol,omitempty"` // HTTP/1.1, HTTP/2
+	HTTPHeaders      []string `json:"httpHeaders,omitempty"`  // allowlisted headers as "key: value"
 	DNSQuery         string   `json:"dnsQuery,omitempty"`
 	DNSIPs           []string `json:"dnsIPs,omitempty"`
 	DNSTTL           uint32   `json:"dnsTTL,omitempty"`
-	DNSRCode         uint32   `json:"dnsRCode,omitempty"`          // 0=NoError, 3=NXDomain
+	DNSRCode         uint32   `json:"dnsRCode,omitempty"` // 0=NoError, 3=NXDomain
 	DNSQTypes        []string `json:"dnsQTypes,omitempty"`
-	TrafficDirection string   `json:"trafficDirection,omitempty"`  // ingress, egress
+	TrafficDirection string   `json:"trafficDirection,omitempty"` // ingress, egress
 	DropReasonDesc   string   `json:"dropReasonDesc,omitempty"`
 	SourceService    string   `json:"sourceService,omitempty"`
 	DestService      string   `json:"destService,omitempty"`
-	BytesSent   int64     `json:"bytesSent"`
-	BytesRecv   int64     `json:"bytesRecv"`
-	Connections int64     `json:"connections"`
-	Verdict     string    `json:"verdict"` // forwarded, dropped, error
-	LastSeen    time.Time `json:"lastSeen"`
+	BytesSent        int64    `json:"bytesSent"`
+	BytesRecv        int64    `json:"bytesRecv"`
+	Connections      int64    `json:"connections"`
+	// DirectionUnknown marks a conversation whose initiator could not be
+	// established, so the two endpoints are ordered arbitrarily and BytesSent /
+	// BytesRecv follow that ordering rather than describing a caller and a callee.
+	// The graph draws these without an arrowhead: the traffic is real, only its
+	// direction is not known.
+	DirectionUnknown bool   `json:"directionUnknown,omitempty"`
+	Verdict          string `json:"verdict"` // forwarded, dropped, error
+	// PolicyVerdict is the network plugin's own account of which policies
+	// decided this flow, when it reports one (Hubble does). It is the ground
+	// truth a static evaluation can only approximate, and it names policy
+	// kinds the static model cannot see, such as CiliumNetworkPolicy.
+	PolicyVerdict *PolicyVerdict `json:"policyVerdict,omitempty"`
+	LastSeen      time.Time      `json:"lastSeen"`
 	// L7 stats (populated by Istio source)
 	RequestRate float64 `json:"requestRate,omitempty"` // requests per second
 	ErrorRate   float64 `json:"errorRate,omitempty"`   // 5xx errors per second
 }
 
+// PolicyVerdict is the set of policies the network plugin reports as having
+// allowed or denied a flow.
+type PolicyVerdict struct {
+	AllowedBy []PolicyRef `json:"allowedBy,omitempty"`
+	DeniedBy  []PolicyRef `json:"deniedBy,omitempty"`
+	// Withheld counts denying references the plugin reported that were
+	// removed before delivery because the caller may not read policies of
+	// that kind there. The verdict still says a policy blocked the flow; only
+	// its identity is kept back. Allowing references the caller may not read
+	// are dropped without a count — they never explain a drop.
+	Withheld int `json:"withheld,omitempty"`
+}
+
+// PolicyRef identifies a policy by kind, namespace and name; a cluster-scoped
+// kind has an empty namespace.
+type PolicyRef struct {
+	Kind      string `json:"kind"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name"`
+}
+
+// Endpoint kinds. Only Pod carries labels and a namespace a policy can
+// select; the others say what kind of non-pod the plugin identified, which
+// decides what a policy evaluation may conclude about it.
+const (
+	EndpointKindPod = "Pod"
+	// EndpointKindExternal: outside the cluster (the world, or a CIDR identity).
+	EndpointKindExternal = "External"
+	// EndpointKindHost: a node, the host network, or the API server.
+	EndpointKindHost = "Host"
+	// EndpointKindUnknown: the plugin reported no usable identity.
+	EndpointKindUnknown = "Unknown"
+)
+
 // Endpoint represents a source or destination in a flow.
 type Endpoint struct {
 	Name      string            `json:"name"`               // Pod or service name
 	Namespace string            `json:"namespace"`          // Namespace
-	Kind      string            `json:"kind"`               // Pod, Service, External
+	Kind      string            `json:"kind"`               // Pod, Service, External, Host, Unknown
 	IP        string            `json:"ip,omitempty"`       // IP address
 	Labels    map[string]string `json:"labels,omitempty"`   // K8s labels
 	Workload  string            `json:"workload,omitempty"` // Parent workload name (Deployment, etc.)
@@ -61,7 +106,24 @@ type FlowsResponse struct {
 	Timestamp time.Time `json:"timestamp"` // When this data was collected
 	Flows     []Flow    `json:"flows"`
 	Warning   string    `json:"warning,omitempty"` // Non-fatal warning (e.g., query errors)
+	// WarningKind separates a warning worth retrying from one that is simply the
+	// truth about this data. Empty means transient, so a source that does not set
+	// it keeps the retrying behaviour it had. A client must not retry
+	// WarningPartial: the answer will not change, and the warning explains
+	// something the user needs to read rather than wait out.
+	WarningKind string `json:"warningKind,omitempty"`
 }
+
+// Warning kinds for FlowsResponse.WarningKind.
+const (
+	// WarningTransient marks a condition that may resolve on its own — a query
+	// that failed, a port-forward still coming up.
+	WarningTransient = "transient"
+	// WarningPartial marks flows that are correct but incomplete, for a reason
+	// retrying cannot fix (a source not exporting an attribute, traffic that
+	// cannot be oriented). Always shown alongside whatever flows did arrive.
+	WarningPartial = "partial"
+)
 
 // AggregatedFlow represents flows aggregated by service pair.
 type AggregatedFlow struct {
@@ -74,19 +136,22 @@ type AggregatedFlow struct {
 	BytesRecv   int64     `json:"bytesRecv"`
 	Connections int64     `json:"connections"`
 	LastSeen    time.Time `json:"lastSeen"`
+	// DirectionUnknown is set when the flows behind this edge could not be
+	// oriented; the graph then draws it without an arrowhead.
+	DirectionUnknown bool `json:"directionUnknown,omitempty"`
 	// L7 stats (if available)
-	L7Protocol       string             `json:"l7Protocol,omitempty"`       // HTTP, gRPC, DNS (from majority of flows)
-	RequestCount     int64              `json:"requestCount,omitempty"`
-	ErrorCount       int64              `json:"errorCount,omitempty"`
-	AvgLatencyMs     float64            `json:"avgLatencyMs,omitempty"`
-	LatencyP50Ms     float64            `json:"latencyP50Ms,omitempty"`
-	LatencyP95Ms     float64            `json:"latencyP95Ms,omitempty"`
-	LatencyP99Ms     float64            `json:"latencyP99Ms,omitempty"`
-	HTTPStatusCounts map[string]int64   `json:"httpStatusCounts,omitempty"` // "2xx": 150, "5xx": 3
-	TopHTTPPaths     []HTTPPathStat     `json:"topHTTPPaths,omitempty"`
-	TopDNSQueries    []DNSQueryStat     `json:"topDNSQueries,omitempty"`
-	VerdictCounts    map[string]int64   `json:"verdictCounts,omitempty"`    // "forwarded": 500, "dropped": 3
-	DropReasons      map[string]int64   `json:"dropReasons,omitempty"`
+	L7Protocol       string           `json:"l7Protocol,omitempty"` // HTTP, gRPC, DNS (from majority of flows)
+	RequestCount     int64            `json:"requestCount,omitempty"`
+	ErrorCount       int64            `json:"errorCount,omitempty"`
+	AvgLatencyMs     float64          `json:"avgLatencyMs,omitempty"`
+	LatencyP50Ms     float64          `json:"latencyP50Ms,omitempty"`
+	LatencyP95Ms     float64          `json:"latencyP95Ms,omitempty"`
+	LatencyP99Ms     float64          `json:"latencyP99Ms,omitempty"`
+	HTTPStatusCounts map[string]int64 `json:"httpStatusCounts,omitempty"` // "2xx": 150, "5xx": 3
+	TopHTTPPaths     []HTTPPathStat   `json:"topHTTPPaths,omitempty"`
+	TopDNSQueries    []DNSQueryStat   `json:"topDNSQueries,omitempty"`
+	VerdictCounts    map[string]int64 `json:"verdictCounts,omitempty"` // "forwarded": 500, "dropped": 3
+	DropReasons      map[string]int64 `json:"dropReasons,omitempty"`
 }
 
 // HTTPPathStat tracks request statistics for a specific HTTP method+path combination.
@@ -112,12 +177,18 @@ type DetectionResult struct {
 	Version   string `json:"version,omitempty"`
 	Native    bool   `json:"native"` // True if built into the cluster (e.g., Cilium/Hubble in GKE)
 	Message   string `json:"message,omitempty"`
+	// Present means the source was found in the cluster but cannot be used as it
+	// stands — misconfigured, or not being scraped. Only meaningful when Available
+	// is false, and it is what separates a problem the user can fix from a source
+	// they simply have not installed. Absence needs no explanation; a broken
+	// install does.
+	Present bool `json:"present,omitempty"`
 }
 
 // ClusterInfo contains cluster platform and CNI information.
 type ClusterInfo struct {
-	Platform    string `json:"platform"`    // gke, eks, aks, generic
-	CNI         string `json:"cni"`         // cilium, calico, flannel, vpc-cni, azure-cni, etc.
+	Platform    string `json:"platform"`    // rke2, gke, eks, aks, minikube, kind, docker-desktop, openshift, rancher, generic
+	CNI         string `json:"cni"`         // cilium, canal, calico, flannel, vpc-cni, azure-cni, gke-native, unknown
 	DataplaneV2 bool   `json:"dataplaneV2"` // GKE-specific: is Dataplane V2 enabled?
 	ClusterName string `json:"clusterName"` // Cluster name if available
 	K8sVersion  string `json:"k8sVersion"`  // Kubernetes version

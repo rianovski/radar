@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Server, Globe, Network, Layers, Download, CheckCircle, AlertCircle } from 'lucide-react'
-import { Section, PropertyList, Property, ConditionsSection, AlertBanner, ResourceLink } from '../../ui/drawer-components'
+import { Section, PropertyList, Property, ConditionsSection, AlertBanner, ResourceLink, useOperationalIssuesShown} from '../../ui/drawer-components'
 import { kindToPlural } from '../../../utils/navigation'
 import { formatAge } from '../resource-utils'
 import { getClusterStatus, getClusterClass, getClusterVersion, getClusterEndpoint, getProviderFromInfraKind, parseCAPIConditionMessage } from '../resource-utils-capi'
@@ -9,15 +9,17 @@ interface Props {
   data: any
   onNavigate?: (ref: { kind: string; namespace: string; name: string; group?: string }) => void
   apiBase?: string
+  canConnect?: boolean
 }
 
-export function CAPIClusterRenderer({ data, onNavigate, apiBase = '' }: Props) {
+export function CAPIClusterRenderer({ data, onNavigate, apiBase = '', canConnect = true }: Props) {
   const status = data.status || {}
   const spec = data.spec || {}
   const conditions = status.v1beta2?.conditions || status.conditions || []
 
   const clusterStatus = getClusterStatus(data)
   const isFailed = clusterStatus.level === 'unhealthy'
+  const operationalIssuesShown = useOperationalIssuesShown()
   const readyCond = conditions.find((c: any) => c.type === 'Ready' || c.type === 'Available')
 
   const phase = status.phase || 'Unknown'
@@ -102,7 +104,7 @@ export function CAPIClusterRenderer({ data, onNavigate, apiBase = '' }: Props) {
         />
       )}
 
-      {isFailed && (() => {
+      {isFailed && !operationalIssuesShown && (() => {
         const msg = readyCond?.message || `Cluster is in ${phase} state.`
         const items = parseCAPIConditionMessage(msg)
         return <AlertBanner variant="error" title="Cluster Not Ready" items={items || undefined} message={items ? undefined : msg} />
@@ -124,7 +126,7 @@ export function CAPIClusterRenderer({ data, onNavigate, apiBase = '' }: Props) {
 
       {/* Kubeconfig Actions */}
       <div className="px-3 py-2 flex items-center gap-2">
-        <button
+        {canConnect && <button
           onClick={handleConnectToCluster}
           disabled={connectState === 'loading' || connectState === 'success'}
           className="btn-brand flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md"
@@ -134,7 +136,7 @@ export function CAPIClusterRenderer({ data, onNavigate, apiBase = '' }: Props) {
           {connectState === 'error' && <AlertCircle className="w-3.5 h-3.5" />}
           {connectState === 'idle' && <Globe className="w-3.5 h-3.5" />}
           {connectState === 'loading' ? 'Connecting...' : connectState === 'success' ? 'Connected — reloading...' : 'Connect to Cluster'}
-        </button>
+        </button>}
         <button
           onClick={handleDownloadKubeconfig}
           disabled={downloadState === 'loading'}

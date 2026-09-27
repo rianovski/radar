@@ -63,6 +63,15 @@ export interface GitOpsStatus {
   message?: string
   lastSyncTime?: string
   suspended: boolean
+  /**
+   * A reconcile pass is executing right now. Activity, not sync and not health —
+   * it never influences either, because a controller being mid-pass says nothing
+   * about whether the declared state is applied. Renderers may show a subtle
+   * indicator; nothing that drives a status word.
+   */
+  reconciling?: boolean
+  /** When the in-flight pass started, so a wedged controller can be told from a routine one. */
+  reconcilingSince?: string
 }
 
 /**
@@ -97,61 +106,78 @@ export interface FluxCondition {
 // ============================================================================
 
 /**
- * Maps FluxCD conditions to unified GitOpsStatus
+ * Generation tracking for a Flux object. `observedGeneration` has three states,
+ * and the difference matters: absent means the controller never reports it and
+ * we have no signal, which must not be read as drift.
+ */
+export interface FluxGeneration {
+  generation?: number
+  observedGeneration?: number
+}
+
+/**
+ * True when the controller has demonstrably not yet acted on the current spec.
+ * Absent observedGeneration is no signal, not drift — some Flux kinds and older
+ * controllers never set it, and treating absence as drift would mark every
+ * healthy object on them as out of date. A present-but-different value counts,
+ * including the -1 sentinel Flux writes on an object it has never reconciled.
+ */
+function hasGenerationDrift(gen?: FluxGeneration): boolean {
+  if (!gen) return false
+  const { generation, observedGeneration } = gen
+  if (typeof generation !== 'number' || typeof observedGeneration !== 'number') return false
+  return generation !== observedGeneration
+}
+
+/**
+ * Maps FluxCD conditions to unified GitOpsStatus.
  *
- * FluxCD status patterns:
- * - Ready=True: Synced and healthy
- * - Ready=False + Stalled=True: Degraded
- * - Ready=False + Reconciling=True: Reconciling
- * - Ready=False (other): OutOfSync
- * - Healthy=False: Deployed but unhealthy resources
- * - spec.suspend=true: Suspended
+ * Sync answers "is the declared state applied", which is `Ready` plus
+ * `observedGeneration`. `Reconciling` answers "is the controller mid-pass",
+ * which is neither — the two are independent conditions upstream, and letting
+ * activity outvote readiness reported a healthy object as not synced.
+ *
+ * Order matters:
+ * - suspend                                   → Suspended (sync from Ready, unless drifted)
+ * - Stalled=True                              → OutOfSync / Degraded
+ * - Ready=True and no generation drift        → Synced, health from Healthy
+ * - drift, or Reconciling with Ready not True → Reconciling / Progressing
+ * - Ready=False                               → OutOfSync
  */
 export function fluxConditionsToGitOpsStatus(
   conditions: FluxCondition[],
-  suspended: boolean
+  suspended: boolean,
+  generation?: FluxGeneration
 ): GitOpsStatus {
   const readyCondition = conditions.find(c => c.type === 'Ready')
   const reconcilingCondition = conditions.find(c => c.type === 'Reconciling')
   const stalledCondition = conditions.find(c => c.type === 'Stalled')
   const healthyCondition = conditions.find(c => c.type === 'Healthy')
 
-  // Handle suspended state
+  const drifted = hasGenerationDrift(generation)
+  const isReconciling = reconcilingCondition?.status === 'True'
+  // Carried on every result so a wedged controller is visible next to an
+  // otherwise-correct Synced, without any status word claiming a fault.
+  const activity = isReconciling
+    ? { reconciling: true, reconcilingSince: reconcilingCondition?.lastTransitionTime }
+    : {}
+
+  // Handle suspended state. Suspending does not un-apply what was applied, so a
+  // suspended object that was Ready stays Synced — but a spec change made while
+  // suspended will never be picked up, so drift downgrades it to Unknown.
   if (suspended) {
     return {
-      sync: readyCondition?.status === 'True' ? 'Synced' : 'Unknown',
+      sync: readyCondition?.status === 'True' && !drifted ? 'Synced' : 'Unknown',
       health: 'Suspended',
       message: 'Reconciliation is suspended',
       lastSyncTime: readyCondition?.lastTransitionTime,
       suspended: true,
+      ...activity,
     }
   }
 
-  // Handle reconciling state
-  if (reconcilingCondition?.status === 'True') {
-    return {
-      sync: 'Reconciling',
-      health: 'Progressing',
-      message: reconcilingCondition.message || 'Reconciliation in progress',
-      lastSyncTime: readyCondition?.lastTransitionTime,
-      suspended: false,
-    }
-  }
-
-  // Handle ready state
-  if (readyCondition?.status === 'True') {
-    // Check if deployed resources are healthy
-    const isHealthy = healthyCondition?.status !== 'False'
-    return {
-      sync: 'Synced',
-      health: isHealthy ? 'Healthy' : 'Degraded',
-      message: isHealthy ? undefined : healthyCondition?.message,
-      lastSyncTime: readyCondition.lastTransitionTime,
-      suspended: false,
-    }
-  }
-
-  // Handle stalled state (permanent failure)
+  // Stalled is a terminal failure and outranks readiness: it means the
+  // controller has given up, whatever the last successful apply left behind.
   if (stalledCondition?.status === 'True') {
     return {
       sync: 'OutOfSync',
@@ -159,6 +185,34 @@ export function fluxConditionsToGitOpsStatus(
       message: stalledCondition.message || 'Reconciliation stalled',
       lastSyncTime: readyCondition?.lastTransitionTime,
       suspended: false,
+      ...activity,
+    }
+  }
+
+  // The applied state. Ahead of the reconciling branch on purpose — this is the
+  // whole point of the ordering.
+  if (readyCondition?.status === 'True' && !drifted) {
+    const isHealthy = healthyCondition?.status !== 'False'
+    return {
+      sync: 'Synced',
+      health: isHealthy ? 'Healthy' : 'Degraded',
+      message: isHealthy ? undefined : healthyCondition?.message,
+      lastSyncTime: readyCondition.lastTransitionTime,
+      suspended: false,
+      ...activity,
+    }
+  }
+
+  // Genuinely not applied: the controller has not observed the current spec, or
+  // it is working and has not reached Ready.
+  if (drifted || isReconciling) {
+    return {
+      sync: 'Reconciling',
+      health: 'Progressing',
+      message: reconcilingCondition?.message || 'Reconciliation in progress',
+      lastSyncTime: readyCondition?.lastTransitionTime,
+      suspended: false,
+      ...activity,
     }
   }
 
@@ -173,6 +227,7 @@ export function fluxConditionsToGitOpsStatus(
       message: readyCondition.message,
       lastSyncTime: readyCondition.lastTransitionTime,
       suspended: false,
+      ...activity,
     }
   }
 
@@ -182,6 +237,7 @@ export function fluxConditionsToGitOpsStatus(
     health: 'Unknown',
     message: 'Status cannot be determined',
     suspended: false,
+    ...activity,
   }
 }
 
@@ -254,7 +310,7 @@ export interface ArgoAppStatus {
  * ArgoCD status patterns:
  * - sync.status: Synced, OutOfSync, Unknown
  * - health.status: Healthy, Progressing, Degraded, Suspended, Missing, Unknown
- * - operationState.phase: Running, Succeeded, Failed, Error
+ * - operationState.phase: Running, Terminating, Succeeded, Failed, Error
  */
 export function argoStatusToGitOpsStatus(status: ArgoAppStatus): GitOpsStatus {
   const syncStatus = status.sync?.status
@@ -267,7 +323,7 @@ export function argoStatusToGitOpsStatus(status: ArgoAppStatus): GitOpsStatus {
     sync = 'Synced'
   } else if (syncStatus === 'OutOfSync') {
     sync = 'OutOfSync'
-  } else if (opPhase === 'Running') {
+  } else if (opPhase === 'Running' || opPhase === 'Terminating') {
     sync = 'Reconciling'
   }
 
@@ -288,7 +344,7 @@ export function argoStatusToGitOpsStatus(status: ArgoAppStatus): GitOpsStatus {
   }
 
   // Override with operation state if active
-  if (opPhase === 'Running') {
+  if (opPhase === 'Running' || opPhase === 'Terminating') {
     health = 'Progressing'
   } else if (opPhase === 'Failed' || opPhase === 'Error') {
     health = 'Degraded'
@@ -300,6 +356,57 @@ export function argoStatusToGitOpsStatus(status: ArgoAppStatus): GitOpsStatus {
     message: status.health?.message || status.operationState?.message,
     lastSyncTime: status.reconciledAt || status.operationState?.finishedAt,
     suspended,
+  }
+}
+
+/**
+ * Maps an Argo CD ApplicationSet's conditions to a GitOpsStatus.
+ *
+ * An ApplicationSet generates Applications; it does not apply declared state
+ * to a cluster itself. Sync answers "is the declared state applied", so there
+ * is no honest sync value here and it stays Unknown - the generated
+ * Applications each carry their own.
+ *
+ * Health answers whether the generator is doing its job, which its conditions
+ * do report, in a vocabulary of their own (ErrorOccurred / ParametersGenerated
+ * / ResourcesUpToDate - never Ready):
+ * - ErrorOccurred=True      → Degraded, carrying the controller's message
+ * - ResourcesUpToDate=True  → Healthy
+ * - neither                 → Unknown (status not populated yet)
+ *
+ * The Resources view renders the same three conditions through
+ * getArgoApplicationSetStatus for its own badge vocabulary. The two read the
+ * same signals and must agree on which condition wins.
+ */
+export function argoApplicationSetConditionsToGitOpsStatus(
+  conditions: FluxCondition[]
+): GitOpsStatus {
+  const error = conditions.find(c => c.type === 'ErrorOccurred' && c.status === 'True')
+  if (error) {
+    return {
+      sync: 'Unknown',
+      health: 'Degraded',
+      message: error.message || 'Generation failed',
+      lastSyncTime: error.lastTransitionTime,
+      suspended: false,
+    }
+  }
+
+  const upToDate = conditions.find(c => c.type === 'ResourcesUpToDate')
+  if (upToDate?.status === 'True') {
+    return {
+      sync: 'Unknown',
+      health: 'Healthy',
+      lastSyncTime: upToDate.lastTransitionTime,
+      suspended: false,
+    }
+  }
+
+  return {
+    sync: 'Unknown',
+    health: 'Unknown',
+    message: 'Status cannot be determined',
+    suspended: false,
   }
 }
 

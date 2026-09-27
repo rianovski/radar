@@ -20,6 +20,7 @@ import {
   Globe,
   Monitor,
   PenLine,
+  RotateCw,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 // CSS_EASE (the shared spring curve) is intentionally NOT used for this panel —
@@ -30,7 +31,9 @@ import { Tooltip } from '../ui/Tooltip'
 import { useToast } from '../ui/Toast'
 import { openExternal } from '../../utils/navigation'
 import { apiUrl } from '../../api/config'
+import { apiFetch, useCapabilities } from '../../api/client'
 import { pluralize } from '@skyhook-io/k8s-ui'
+import { Collapse } from '@skyhook-io/k8s-ui/components/ui/Collapse'
 
 // --- Types -------------------------------------------------------------------
 
@@ -82,14 +85,18 @@ function buildRecreateBody(session: PortForwardSession, overrides: { localPort: 
 
 // --- Shared query ------------------------------------------------------------
 
-function usePortForwardQuery() {
+function usePortForwardQuery(enabled: boolean) {
   return useQuery<PortForwardSession[]>({
     queryKey: ['portforwards'],
     queryFn: async () => {
-      const res = await fetch(apiUrl('/portforwards'))
+      const res = await apiFetch(apiUrl('/portforwards'))
       if (!res.ok) throw new Error('Failed to fetch port forwards')
       return res.json()
     },
+    // Port-forward is a local-binary feature; in-cluster (Radar Cloud) the
+    // capability is false, so don't poll an endpoint that can never return a
+    // usable session. Also covers RBAC-denied users.
+    enabled,
     // 30s fallback poll — user mutations invalidate immediately, but out-of-band
     // session death (pod restart, OOM kill, server-side cleanup) only surfaces on
     // the next tick.
@@ -142,12 +149,21 @@ interface PortForwardContextValue {
 const PortForwardContext = createContext<PortForwardContextValue | null>(null)
 
 export function PortForwardProvider({ children }: { children: ReactNode }) {
+  // Gate the session-list poll on runtime mode, not the RBAC capability: port-forward
+  // only works when radar runs as a local binary, so in-cluster (Radar Cloud) we never
+  // poll /portforwards. We deliberately do NOT gate on `portForward` (RBAC) — a local
+  // user with portforward rights in only some namespaces must still see/stop the
+  // sessions they start (the start buttons gate per-namespace separately). Using the
+  // resolved value (undefined while capabilities load → no poll) keeps Cloud silent on
+  // first paint.
+  const { data: caps } = useCapabilities()
+  const canPortForward = caps?.deployment?.mode === 'local'
   const {
     data: sessions = [],
     isLoading,
     isError: isQueryError,
     error: queryError,
-  } = usePortForwardQuery()
+  } = usePortForwardQuery(canPortForward)
   const activeSessions = sessions.filter((s) => s.status !== 'stopped')
   const errorSessions = sessions.filter((s) => s.status === 'error')
   const count = activeSessions.length
@@ -390,6 +406,9 @@ export function PortForwardPanel() {
   // without disabling all stop buttons (the old shared-mutation approach blocked
   // every row when any single stop was in-flight).
   const [stoppingIds, setStoppingIds] = useState<Set<string>>(() => new Set())
+  // Per-session retry tracking — same rationale as stoppingIds: multiple failed
+  // forwards can be retried independently without disabling every retry button.
+  const [retryingIds, setRetryingIds] = useState<Set<string>>(() => new Set())
   const queryClient = useQueryClient()
   const { showSuccess, showError } = useToast()
 
@@ -424,7 +443,7 @@ export function PortForwardPanel() {
   const stopPortForward = useCallback(async (id: string) => {
     setStoppingIds(prev => new Set(prev).add(id))
     try {
-      const res = await fetch(apiUrl(`/portforwards/${id}`), { method: 'DELETE' })
+      const res = await apiFetch(apiUrl(`/portforwards/${id}`), { method: 'DELETE' })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
         throw new Error(body.error || `Failed to stop port forward (HTTP ${res.status})`)
@@ -444,6 +463,48 @@ export function PortForwardPanel() {
     }
   }, [queryClient, showError])
 
+  // Recreate a failed forward. The errored session is already dead — there's no live
+  // forward to lose — so we drop the stale row FIRST, then recreate. Delete-first keeps
+  // the panel at exactly one row in every outcome (success → one running row; failure →
+  // one errored row), avoiding the orphaned-duplicate the reverse order would leave when
+  // the backend keeps a failed-start session in its map. A 404 means it was already
+  // cleared (e.g. context switch) — benign, proceed. Service-resolved sessions re-route
+  // through the service path via buildRecreateBody, so a retry after the backing pod was
+  // replaced re-resolves to a currently-running pod.
+  const retryPortForward = useCallback(async (session: PortForwardSession) => {
+    commitInteraction()
+    setRetryingIds(prev => new Set(prev).add(session.id))
+    try {
+      const delRes = await apiFetch(apiUrl(`/portforwards/${session.id}`), { method: 'DELETE' })
+      if (!delRes.ok && delRes.status !== 404) {
+        const body = await delRes.json().catch(() => ({}))
+        throw new Error(body.error || `Failed to clear failed port forward (HTTP ${delRes.status})`)
+      }
+      const res = await apiFetch(apiUrl('/portforwards'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildRecreateBody(session, { localPort: session.localPort, listenAddress: session.listenAddress })),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error || `Failed to retry port forward (HTTP ${res.status})`)
+      }
+      queryClient.invalidateQueries({ queryKey: ['portforwards'] })
+      showSuccess('Port forward restarted', `Now listening on localhost:${session.localPort}`)
+    } catch (err) {
+      queryClient.invalidateQueries({ queryKey: ['portforwards'] })
+      const msg = err instanceof Error ? err.message : 'Failed to retry port forward'
+      showError('Failed to retry port forward', msg)
+      console.error('Failed to retry port forward:', err)
+    } finally {
+      setRetryingIds(prev => {
+        const next = new Set(prev)
+        next.delete(session.id)
+        return next
+      })
+    }
+  }, [commitInteraction, queryClient, showSuccess, showError])
+
   const toggleListenAddress = async (session: PortForwardSession) => {
     commitInteraction()
     const newAddress = session.listenAddress === '0.0.0.0' ? '127.0.0.1' : '0.0.0.0'
@@ -454,13 +515,13 @@ export function PortForwardPanel() {
     // apart from "original gone and recreate failed = data loss."
     let deleted = false
     try {
-      const delRes = await fetch(apiUrl(`/portforwards/${session.id}`), { method: 'DELETE' })
+      const delRes = await apiFetch(apiUrl(`/portforwards/${session.id}`), { method: 'DELETE' })
       if (!delRes.ok) {
         const body = await delRes.json().catch(() => ({}))
         throw new Error(body.error || `Failed to stop existing port forward (HTTP ${delRes.status})`)
       }
       deleted = true
-      const res = await fetch(apiUrl('/portforwards'), {
+      const res = await apiFetch(apiUrl('/portforwards'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildRecreateBody(session, { localPort: session.localPort, listenAddress: newAddress })),
@@ -501,13 +562,13 @@ export function PortForwardPanel() {
     // apart from "original gone and recreate failed = data loss."
     let deleted = false
     try {
-      const delRes = await fetch(apiUrl(`/portforwards/${session.id}`), { method: 'DELETE' })
+      const delRes = await apiFetch(apiUrl(`/portforwards/${session.id}`), { method: 'DELETE' })
       if (!delRes.ok) {
         const body = await delRes.json().catch(() => ({}))
         throw new Error(body.error || `Failed to stop existing port forward (HTTP ${delRes.status})`)
       }
       deleted = true
-      const res = await fetch(apiUrl('/portforwards'), {
+      const res = await apiFetch(apiUrl('/portforwards'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildRecreateBody(session, { localPort: newPort, listenAddress: session.listenAddress })),
@@ -584,7 +645,7 @@ export function PortForwardPanel() {
       onMouseEnter={onPanelHoverEnter}
       onMouseLeave={onPanelHoverLeave}
       className={clsx(
-        'fixed z-[51] w-80',
+        'fixed z-[51] w-[26rem] max-w-[calc(100vw-2rem)]',
         'transition-opacity duration-150 ease-out',
         isPanelOpen
           ? 'opacity-100 pointer-events-auto'
@@ -601,17 +662,10 @@ export function PortForwardPanel() {
           keeping border and rounded corners correct at every intermediate height. */}
       <div className="overflow-hidden rounded-xl bg-theme-surface dark:bg-theme-elevated border-2 border-skyhook-500/35 dark:border-skyhook-400/40 shadow-2xl dark:shadow-[0_24px_60px_-12px_rgba(0,0,0,0.75),0_10px_24px_-6px_rgba(0,0,0,0.45)]">
 
-        {/* Grid sizer — the height engine. grid-template-rows 0fr→1fr animates
-            height from 0 to auto. Content clips from the bottom up, creating a
-            natural top-to-bottom reveal (header appears first, sessions follow). */}
-        <div
-          className={clsx(
-            'grid transition-[grid-template-rows] duration-300',
-            isPanelOpen ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
-          )}
-          style={{ transitionTimingFunction: 'cubic-bezier(0.16, 1, 0.3, 1)' }}
-        >
-          <div className="overflow-hidden">
+        {/* Height engine — Collapse animates grid-template-rows 0fr→1fr so the
+            shell grows from 0 to auto. Content clips from the bottom up, creating
+            a natural top-to-bottom reveal (header appears first, sessions follow). */}
+        <Collapse open={isPanelOpen}>
 
       {/* Header — tinted green when all sessions running, red when any have failed. */}
       <div
@@ -666,14 +720,16 @@ export function PortForwardPanel() {
           </div>
         ) : (
           <div className="divide-y divide-theme-border">
-            {activeSessions.map((session) => (
-              <div
-                key={session.id}
-                className={clsx(
-                  'p-3 space-y-1',
-                  session.status === 'error' ? 'bg-red-500/10' : 'hover:bg-theme-elevated'
-                )}
-              >
+            {activeSessions.map((session) => {
+              const resourceName = session.serviceName || session.podName
+              return (
+                <div
+                  key={session.id}
+                  className={clsx(
+                    'p-3 space-y-1',
+                    session.status === 'error' ? 'bg-red-500/10' : 'hover:bg-theme-elevated'
+                  )}
+                >
                 {/* Row 1: status dot + name | stop button */}
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex items-start gap-2 min-w-0 flex-1">
@@ -683,9 +739,11 @@ export function PortForwardPanel() {
                         session.status === 'running' ? 'bg-green-500' : 'bg-red-500'
                       )}
                     />
-                    <span className="text-sm text-theme-text-primary font-medium break-all line-clamp-2">
-                      {session.serviceName || session.podName}
-                    </span>
+                    <Tooltip content={resourceName} delay={300} position="bottom" disabled={!isPanelOpen} wrapperClassName="min-w-0 flex-1">
+                      <span className="block min-w-0 truncate text-sm font-medium text-theme-text-primary">
+                        {resourceName}
+                      </span>
+                    </Tooltip>
                     {session.status === 'error' && (
                       <span className={clsx('badge-sm shrink-0', SEVERITY_BADGE.error)}>Failed</span>
                     )}
@@ -716,13 +774,28 @@ export function PortForwardPanel() {
                       </button>
                       </Tooltip>
                     )}
+                    {session.status === 'error' && (
+                      <Tooltip content="Retry" delay={300} position="bottom" disabled={!isPanelOpen}>
+                      <button
+                        onClick={() => retryPortForward(session)}
+                        disabled={retryingIds.has(session.id) || stoppingIds.has(session.id)}
+                        className="p-1.5 text-theme-text-tertiary hover:text-green-400 hover:bg-theme-hover rounded disabled:opacity-50"
+                      >
+                        {retryingIds.has(session.id) ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <RotateCw className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                      </Tooltip>
+                    )}
                     <Tooltip content={session.status === 'error' ? 'Dismiss' : 'Stop'} delay={300} position="bottom" disabled={!isPanelOpen}>
                     <button
                       onClick={() => {
                         commitInteraction()
                         stopPortForward(session.id)
                       }}
-                      disabled={stoppingIds.has(session.id)}
+                      disabled={stoppingIds.has(session.id) || retryingIds.has(session.id)}
                       className="p-1.5 text-theme-text-tertiary hover:text-red-400 hover:bg-theme-hover rounded disabled:opacity-50"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
@@ -794,7 +867,7 @@ export function PortForwardPanel() {
                           <Tooltip content="Click to change local port" delay={300} position="bottom" disabled={!isPanelOpen}>
                           <code
                             className={clsx(
-                              'group/port text-xs bg-theme-base px-2 py-1 rounded text-accent-text transition-all inline-flex items-center gap-1',
+                              'inline-code group/port text-xs transition-all inline-flex items-center gap-1',
                               changingPortId === session.id
                                 ? 'opacity-50'
                                 : 'cursor-pointer hover:ring-1 hover:ring-blue-500/50'
@@ -841,14 +914,14 @@ export function PortForwardPanel() {
                     </div>
                   </div>
                 )}
-              </div>
-            ))}
+                </div>
+              )
+            })}
           </div>
         )}
       </div>
 
-          </div>{/* /overflow-hidden */}
-        </div>{/* /grid-sizer */}
+        </Collapse>
       </div>{/* /panel-shell */}
 
       {/* Caret — rendered after the shell so it paints on top (z-10). Opaque fill
@@ -882,7 +955,7 @@ export function useStartPortForward() {
       localPort?: number
       listenAddress?: string // "127.0.0.1" (default) or "0.0.0.0"
     }) => {
-      const res = await fetch(apiUrl('/portforwards'), {
+      const res = await apiFetch(apiUrl('/portforwards'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(req),
@@ -908,6 +981,7 @@ export function useStartPortForward() {
 
 // Backwards-compat: existing consumers that just want a count number.
 export function usePortForwardCount() {
-  const { data: sessions = [] } = usePortForwardQuery()
+  const { data: caps } = useCapabilities()
+  const { data: sessions = [] } = usePortForwardQuery(caps?.deployment?.mode === 'local')
   return sessions.filter((s) => s.status !== 'stopped').length
 }

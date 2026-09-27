@@ -1,6 +1,7 @@
 import { createContext, useContext, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { isMac as isMacPlatform } from '../utils/platform'
 
-export type ShortcutScope = 'global' | 'topology' | 'resources' | 'timeline' | 'helm' | 'gitops' | 'traffic' | 'drawer'
+export type ShortcutScope = 'global' | 'topology' | 'resources' | 'timeline' | 'helm' | 'gitops' | 'traffic' | 'applications' | 'audit' | 'drawer'
 
 // Scope priority: higher number = higher priority (wins when multiple scopes active)
 const SCOPE_PRIORITY: Record<ShortcutScope, number> = {
@@ -11,6 +12,8 @@ const SCOPE_PRIORITY: Record<ShortcutScope, number> = {
   helm: 1,
   gitops: 1,
   traffic: 1,
+  applications: 1,
+  audit: 1,
   drawer: 2,
 }
 
@@ -43,6 +46,10 @@ interface RegisteredShortcut extends KeyboardShortcut {
 interface KeyboardShortcutContextType {
   registerShortcut: (shortcut: KeyboardShortcut) => () => void
   activeShortcuts: KeyboardShortcut[]
+  /** When true, view-level shortcuts (the per-page scopes) are suppressed — used
+   *  while a fullscreen detail overlay covers the page so the hidden view's keys
+   *  don't fire. `global` (⌘K, the overlay's Escape) and `drawer` still fire. */
+  setBaseShortcutsSuppressed: (suppressed: boolean) => void
 }
 
 const KeyboardShortcutContext = createContext<KeyboardShortcutContextType | null>(null)
@@ -76,7 +83,7 @@ interface KeyMatcher {
   altKey?: boolean
 }
 
-const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform)
+const isMac = isMacPlatform()
 
 function parseKeys(keys: string): KeyMatcher {
   // Multi-key sequence (space-separated, e.g. "g g")
@@ -139,6 +146,9 @@ export function KeyboardShortcutProvider({ children }: { children: ReactNode }) 
   const [version, setVersion] = useState(0)
   const sequenceKeyRef = useRef<string | null>(null)
   const sequenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Read in the keydown handler (a ref, so no re-subscribe needed on change).
+  const baseSuppressedRef = useRef(false)
+  const setBaseShortcutsSuppressed = useCallback((s: boolean) => { baseSuppressedRef.current = s }, [])
 
   const registerShortcut = useCallback((shortcut: KeyboardShortcut) => {
     const id = nextRegistrationId++
@@ -158,9 +168,13 @@ export function KeyboardShortcutProvider({ children }: { children: ReactNode }) 
       const suppression = getSuppressionLevel(e)
       const suppressed = suppression !== 'none'
 
-      // Get all enabled shortcuts, sorted by scope priority (highest first)
+      // Get all enabled shortcuts, sorted by scope priority (highest first).
+      // While a fullscreen overlay covers the page, drop the view-level scopes
+      // (the hidden page's keys) but keep `global` (⌘K, the overlay's Escape) and
+      // `drawer` so the overlay still works.
       const shortcuts = Array.from(shortcutsRef.current.values())
         .filter(s => s.enabled !== false)
+        .filter(s => !baseSuppressedRef.current || s.scope === 'global' || s.scope === 'drawer')
         .sort((a, b) => SCOPE_PRIORITY[b.scope] - SCOPE_PRIORITY[a.scope])
 
       // Check for multi-key sequence completion
@@ -255,10 +269,20 @@ export function KeyboardShortcutProvider({ children }: { children: ReactNode }) 
   , [version])
 
   return (
-    <KeyboardShortcutContext.Provider value={{ registerShortcut, activeShortcuts }}>
+    <KeyboardShortcutContext.Provider value={{ registerShortcut, activeShortcuts, setBaseShortcutsSuppressed }}>
       {children}
     </KeyboardShortcutContext.Provider>
   )
+}
+
+/** Suppress view-level shortcuts while `active` (a fullscreen detail overlay is up).
+ *  `global` and `drawer` scopes keep firing so ⌘K and the overlay's own keys work. */
+export function useSuppressBaseShortcuts(active: boolean) {
+  const ctx = useContext(KeyboardShortcutContext)
+  useEffect(() => {
+    ctx?.setBaseShortcutsSuppressed(active)
+    return () => ctx?.setBaseShortcutsSuppressed(false)
+  }, [ctx, active])
 }
 
 /** Register a keyboard shortcut. Automatically deregisters on unmount or when key config changes. */

@@ -20,6 +20,7 @@ import {
   ShieldAlert,
   Radio,
   Globe,
+  Network,
 
   // Config
   FileSliders,
@@ -29,7 +30,14 @@ import {
   HardDrive,
   Cylinder,
   Database,
+  DatabaseBackup,
+  Waypoints,
   FileSearch,
+  Fingerprint,
+  Wand2,
+  Sparkles,
+  Trash2,
+  ShieldOff,
 
   // Cluster
   Cpu,
@@ -65,6 +73,11 @@ import {
   HeartPulse,
   BookOpen,
 
+  // Velero
+  Cloud,
+  Camera,
+  Package,
+
   // Fallback
   Puzzle,
 } from 'lucide-react'
@@ -84,6 +97,11 @@ const KIND_ICON_MAP: Record<string, LucideIcon> = {
   service: Plug,
   ingress: DoorOpen,
   networkpolicy: ShieldCheck,
+  caliconetworkpolicy: ShieldCheck,
+  calicoglobalnetworkpolicy: ShieldCheck,
+  calicostagednetworkpolicy: ShieldCheck,
+  calicostagedglobalnetworkpolicy: ShieldCheck,
+  calicostagedkubernetesnetworkpolicy: ShieldCheck,
   ciliumnetworkpolicy: ShieldCheck,
   ciliumclusterwidenetworkpolicy: ShieldCheck,
   clusternetworkpolicy: ShieldCheck,
@@ -129,7 +147,9 @@ const KIND_ICON_MAP: Record<string, LucideIcon> = {
 
   // Argo
   workflow: Activity,
+  cronworkflow: Activity,
   workflowtemplate: Activity,
+  clusterworkflowtemplate: Activity,
   application: GitBranch, // ArgoCD Application
   applicationset: GitBranch, // ArgoCD ApplicationSet
 
@@ -145,7 +165,7 @@ const KIND_ICON_MAP: Record<string, LucideIcon> = {
   nodeclaim: Server,
   ec2nodeclass: Server,
   aksnodeclass: Server,
-  gcpnodeclass: Server,
+  gcenodeclass: Server,
 
   // KEDA
   scaledobject: Scaling,
@@ -194,6 +214,12 @@ const KIND_ICON_MAP: Record<string, LucideIcon> = {
   // Contour
   httpproxy: Globe,
 
+  // CloudNativePG. Pooler is unambiguous so it keys directly; CNPG's colliding
+  // kinds resolve through GROUP_QUALIFIED_KIND_ICONS below. Topology
+  // pseudo-kinds (cnpgcluster/…) belong here only once pkg/topology's
+  // KindForGVK emits them — it has no CNPG case today.
+  pooler: Waypoints,
+
   // Cluster API
   capicluster: Server,
   machinedeployment: Layers,
@@ -225,22 +251,88 @@ const KIND_ICON_MAP: Record<string, LucideIcon> = {
   azuremachinetemplate: Cpu,
   azuremanagedcluster: Server,
 
+  // Kyverno — legacy kyverno.io family, modern policies.kyverno.io CEL
+  // family, and the wgpolicyk8s.io reports every engine writes into.
+  policy: Shield,
+  clusterpolicy: Shield,
+  policyreport: FileSearch,
+  clusterpolicyreport: FileSearch,
+  validatingpolicy: ShieldCheck,
+  namespacedvalidatingpolicy: ShieldCheck,
+  imagevalidatingpolicy: Fingerprint,
+  namespacedimagevalidatingpolicy: Fingerprint,
+  mutatingpolicy: Wand2,
+  namespacedmutatingpolicy: Wand2,
+  generatingpolicy: Sparkles,
+  namespacedgeneratingpolicy: Sparkles,
+  deletingpolicy: Trash2,
+  namespaceddeletingpolicy: Trash2,
+  policyexception: ShieldOff,
+  cleanuppolicy: Trash2,
+  clustercleanuppolicy: Trash2,
+
   // Trivy Operator
   vulnerabilityreport: Shield,
   configauditreport: ShieldCheck,
   exposedsecretreport: ShieldAlert,
   sbomreport: FileSearch,
+
+  // Velero. Only kinds whose names no other operator claims: this map is keyed
+  // on kind alone with no group awareness, so a shared name would give a foreign
+  // resource a Velero icon. That rules out `backup` (CNPG), `restore`
+  // (rancher/backup-restore-operator) and `schedule` (several operators).
+  backupstoragelocation: Cloud,
+  volumesnapshotlocation: Camera,
+  backuprepository: Package,
 }
 
 /** Get the icon for a Kubernetes resource kind (case-insensitive). */
-export function getResourceIcon(kind: string): LucideIcon {
-  return KIND_ICON_MAP[kind.toLowerCase()] ?? Puzzle
+/**
+ * Kinds shared by more than one operator, where the icon can only be chosen
+ * once the API group is known. The resource browser passes the group; callers
+ * that don't have one fall through to the ungrouped map.
+ */
+const GROUP_QUALIFIED_KIND_ICONS: Record<string, Record<string, LucideIcon>> = {
+  cluster: { 'postgresql.cnpg.io': Database, 'cluster.x-k8s.io': Server },
+  backup: { 'postgresql.cnpg.io': DatabaseBackup },
+  scheduledbackup: { 'postgresql.cnpg.io': DatabaseBackup },
+  pooler: { 'postgresql.cnpg.io': Waypoints },
+  networkpolicy: {
+    'networking.k8s.io': ShieldCheck,
+    'crd.projectcalico.org': ShieldCheck,
+    'projectcalico.org': ShieldCheck,
+  },
+  hostendpoint: { 'crd.projectcalico.org': Network, 'projectcalico.org': Network },
+  ippool: { 'crd.projectcalico.org': Network, 'projectcalico.org': Network },
+  tier: { 'crd.projectcalico.org': Network, 'projectcalico.org': Network },
+  globalnetworkpolicy: { 'crd.projectcalico.org': ShieldCheck, 'projectcalico.org': ShieldCheck },
+  stagednetworkpolicy: { 'crd.projectcalico.org': ShieldCheck, 'projectcalico.org': ShieldCheck },
+  stagedglobalnetworkpolicy: { 'crd.projectcalico.org': ShieldCheck, 'projectcalico.org': ShieldCheck },
+  stagedkubernetesnetworkpolicy: { 'crd.projectcalico.org': ShieldCheck, 'projectcalico.org': ShieldCheck },
+}
+
+const TOPOLOGY_KIND_ICONS: Record<string, LucideIcon> = {
+  CalicoNetworkPolicy: ShieldCheck,
+  CalicoGlobalNetworkPolicy: ShieldCheck,
+  CalicoStagedNetworkPolicy: ShieldCheck,
+  CalicoStagedGlobalNetworkPolicy: ShieldCheck,
+  CalicoStagedKubernetesNetworkPolicy: ShieldCheck,
+}
+
+export function getResourceIcon(kind: string, group?: string): LucideIcon {
+  const k = kind.toLowerCase()
+  if (group) {
+    const groupMap = GROUP_QUALIFIED_KIND_ICONS[k]
+    if (groupMap) return groupMap[group] ?? DEFAULT_RESOURCE_ICON
+  }
+  return KIND_ICON_MAP[k] ?? Puzzle
 }
 
 /** Get the icon for a topology node kind, including virtual kinds (Internet, PodGroup). */
 export function getTopologyIcon(kind: string): LucideIcon {
   if (kind === 'Internet') return Globe
   if (kind === 'PodGroup') return Boxes
+  if (TOPOLOGY_KIND_ICONS[kind]) return TOPOLOGY_KIND_ICONS[kind]
   return getResourceIcon(kind)
 }
 

@@ -18,14 +18,14 @@ var (
 	serverVersionMu     sync.Mutex
 )
 
-// getServerVersion returns the cached Kubernetes server version.
+// GetServerVersion returns the cached Kubernetes server version.
 // The version is fetched once and cached for the lifetime of the context.
-func getServerVersion() string {
+func GetServerVersion() string {
 	serverVersionMu.Lock()
 	defer serverVersionMu.Unlock()
 	serverVersionOnce.Do(func() {
-		if k8sClient != nil {
-			if v, err := k8sClient.Discovery().ServerVersion(); err == nil {
+		if client := GetClient(); client != nil {
+			if v, err := client.Discovery().ServerVersion(); err == nil {
 				cachedServerVersion = v.GitVersion
 			}
 		}
@@ -46,7 +46,7 @@ func InvalidateServerVersionCache() {
 type ClusterInfo struct {
 	Context            string `json:"context"`  // kubeconfig context name
 	Cluster            string `json:"cluster"`  // cluster name from kubeconfig
-	Platform           string `json:"platform"` // gke, gke-autopilot, eks, aks, minikube, kind, docker-desktop, generic
+	Platform           string `json:"platform"` // rke2, gke, gke-autopilot, eks, aks, minikube, kind, docker-desktop, openshift, rancher, generic
 	KubernetesVersion  string `json:"kubernetesVersion"`
 	NodeCount          int    `json:"nodeCount"`
 	PodCount           int    `json:"podCount"`
@@ -116,7 +116,7 @@ func GetClusterInfo(ctx context.Context) (*ClusterInfo, error) {
 	}
 
 	// Get version info (cached — only fetched once per context)
-	info.KubernetesVersion = getServerVersion()
+	info.KubernetesVersion = GetServerVersion()
 
 	// Get counts from cache (listers may be nil when RBAC restricts access)
 	cache := GetResourceCache()
@@ -162,14 +162,10 @@ func getClusterPlatformFromCache(cache *ResourceCache) (string, error) {
 	if err != nil || len(nodeList) == 0 {
 		return "unknown", nil
 	}
-	node := *nodeList[0]
-	if p := detectByProviderID(node); p != "unknown" {
+	if p := k8score.DetectNodePlatform(*nodeList[0]); p != "unknown" {
 		return p, nil
 	}
-	if p := detectByLabels(node); p != "unknown" {
-		return p, nil
-	}
-	return detectByNodeName(node), nil
+	return "generic", nil
 }
 
 // GetClusterPlatform attempts to detect the Kubernetes platform/provider
@@ -188,50 +184,32 @@ func GetClusterPlatform(ctx context.Context) (string, error) {
 	}
 
 	// Fallback to direct API if cache unavailable
-	if len(nodes) == 0 && k8sClient != nil {
-		nodeList, err := k8sClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+	if client := GetClient(); len(nodes) == 0 && client != nil {
+		nodeList, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{
 			Limit: 1,
 		})
 		if err != nil {
 			return detectPlatformFallback(ctx)
 		}
 		if len(nodeList.Items) == 0 {
-			return "unknown", nil
+			return detectPlatformFallback(ctx)
 		}
 		nodes = nodeList.Items
 	}
 
 	if len(nodes) == 0 {
-		return "unknown", nil
+		return detectPlatformFallback(ctx)
 	}
 
 	node := nodes[0]
 
-	// Primary detection: Provider ID
-	platform := detectByProviderID(node)
+	platform := k8score.DetectNodePlatform(node)
 	if platform != "unknown" {
 		if platform == "gke" {
 			if isAutopilot, _ := IsGKEAutopilot(ctx); isAutopilot {
 				return "gke-autopilot", nil
 			}
 		}
-		return platform, nil
-	}
-
-	// Secondary detection: Platform-specific labels
-	platform = detectByLabels(node)
-	if platform != "unknown" {
-		if platform == "gke" {
-			if isAutopilot, _ := IsGKEAutopilot(ctx); isAutopilot {
-				return "gke-autopilot", nil
-			}
-		}
-		return platform, nil
-	}
-
-	// Tertiary detection: Node name patterns
-	platform = detectByNodeName(node)
-	if platform != "unknown" {
 		return platform, nil
 	}
 
@@ -253,8 +231,8 @@ func IsGKEAutopilot(ctx context.Context) (bool, error) {
 		}
 	}
 
-	if len(nodes) == 0 && k8sClient != nil {
-		nodeList, err := k8sClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{Limit: 1})
+	if client := GetClient(); len(nodes) == 0 && client != nil {
+		nodeList, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{Limit: 1})
 		if err == nil && len(nodeList.Items) > 0 {
 			nodes = nodeList.Items
 		}
@@ -265,7 +243,7 @@ func IsGKEAutopilot(ctx context.Context) (bool, error) {
 		if val, exists := node.Labels["cloud.google.com/gke-autopilot"]; exists && val == "true" {
 			return true, nil
 		}
-		if !isNodeGKE(node) {
+		if !k8score.IsNodeGKE(node) {
 			return false, nil
 		}
 	}
@@ -296,8 +274,8 @@ func checkAutopilotViaAnnotations(ctx context.Context) (bool, bool) {
 		}
 	}
 
-	if len(pods) == 0 && k8sClient != nil {
-		podList, err := k8sClient.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{Limit: 10})
+	if client := GetClient(); len(pods) == 0 && client != nil {
+		podList, err := client.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{Limit: 10})
 		if err == nil {
 			pods = podList.Items
 		}
@@ -314,16 +292,13 @@ func checkAutopilotViaAnnotations(ctx context.Context) (bool, bool) {
 	return false, len(pods) > 0
 }
 
-// Pure helpers delegate to pkg/k8score for reuse without singletons.
-func detectByProviderID(node corev1.Node) string { return k8score.DetectByProviderID(node) }
-func detectByLabels(node corev1.Node) string     { return k8score.DetectByLabels(node) }
-func detectByNodeName(node corev1.Node) string   { return k8score.DetectByNodeName(node) }
-func isNodeGKE(node corev1.Node) bool            { return k8score.IsNodeGKE(node) }
-
 func detectPlatformFallback(ctx context.Context) (string, error) {
 	isAutopilot, found := checkAutopilotViaAnnotations(ctx)
 	if found && isAutopilot {
 		return "gke-autopilot", nil
+	}
+	if platform := k8score.DetectPlatformFromVersion(GetServerVersion()); platform != "unknown" {
+		return platform, nil
 	}
 	return "unknown", nil
 }

@@ -1,30 +1,100 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/remotecommand"
 
 	"github.com/skyhook-io/radar/internal/auth"
+	"github.com/skyhook-io/radar/internal/cloud"
 	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/pkg/k8score"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for local dev
-	},
+// The authenticated tunnel is server-to-server and carries a transport-bound
+// marker that browsers cannot forge, so its forwarded Origin is trusted.
+func checkWebSocketOrigin(r *http.Request) bool {
+	if cloud.IsAuthenticatedTunnelRequest(r.Context()) {
+		return true
+	}
+	if allowed, decided := fetchMetadataOriginVerdict(r); decided {
+		return allowed
+	}
+	return sameAuthorityOriginOK(r)
 }
+
+// fetchMetadataOriginVerdict uses the browser-controlled relationship between
+// the initiating page and this request when it is conclusive. It survives
+// reverse proxies that rewrite Host and cannot be forged by page scripts.
+func fetchMetadataOriginVerdict(r *http.Request) (allowed, decided bool) {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "same-origin":
+		return true, true
+	case "cross-site":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func sameAuthorityOriginOK(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if (r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")) &&
+		!strings.EqualFold(u.Scheme, "https") {
+		return false
+	}
+	originAuthority, originOK := normalizeOrigin(origin)
+	requestAuthority, requestOK := normalizeOrigin(u.Scheme + "://" + r.Host)
+	return originOK && requestOK && originAuthority == requestAuthority
+}
+
+func (s *Server) viteDevProxyOriginOK(r *http.Request) bool {
+	if !s.devMode || r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		return false
+	}
+	u, err := url.Parse(r.Header.Get("Origin"))
+	return err == nil &&
+		u.Scheme == "http" &&
+		u.Port() == "9273" &&
+		browserLoopbackHostname(u.Hostname()) &&
+		requestHostIsLoopback(r)
+}
+
+func (s *Server) websocketOriginAllowed(r *http.Request) bool {
+	if checkWebSocketOrigin(r) {
+		return true
+	}
+	return s.viteDevProxyOriginOK(r)
+}
+
+func (s *Server) upgradeWebSocket(w http.ResponseWriter, r *http.Request) (*websocket.Conn, error) {
+	return (&websocket.Upgrader{CheckOrigin: s.websocketOriginAllowed}).Upgrade(w, r, nil)
+}
+
+const podExecHeartbeatInterval = 30 * time.Second
 
 // defaultShellScript is the built-in fallback command used when no shell is
 // requested explicitly via ?shell= and no override is set via --pod-shell-default.
@@ -52,26 +122,124 @@ var upgrader = websocket.Upgrader{
 // working-directory-in-prompt symptom from skyhook-io/radar#452.
 const defaultShellScript = "export TERM=xterm-256color; if command -v bash >/dev/null 2>&1; then exec bash -il; elif command -v ash >/dev/null 2>&1; then exec ash; else exec sh; fi"
 
+// windowsDefaultShellScript prefers PowerShell, falling back to cmd.exe.
+// The `|| cmd` branch is load-bearing for Nano Server images, which ship
+// without PowerShell.
+const windowsDefaultShellScript = `where powershell >nul 2>&1 && powershell || cmd`
+
 // DefaultPodShellCommand, when non-empty, overrides defaultShellScript as the
 // script passed to `sh -c`. Set by the bootstrap layer from the
 // --pod-shell-default CLI flag. Empty means "use the built-in default".
+//
+// POSIX-only by design — Windows pods always use windowsDefaultShellScript
+// regardless of this value. A single command string can't safely target both
+// shells.
 var DefaultPodShellCommand string
 
 // defaultExecCommand builds the command argv for a pod exec session.
 //
 // Precedence:
-//  1. If override is non-empty (from ?shell=), use it verbatim as a single argv
-//     element — the caller is explicitly asking for that shell.
-//  2. If fallback is non-empty (from --pod-shell-default), run it as `sh -c fallback`.
-//  3. Otherwise run `sh -c defaultShellScript`.
-func defaultExecCommand(override, fallback string) []string {
+//  1. ?shell= override — verbatim as a single argv element.
+//  2. podOS == "windows" — cmd.exe + windowsDefaultShellScript.
+//  3. --pod-shell-default fallback (POSIX-only, see DefaultPodShellCommand).
+//  4. Built-in defaultShellScript.
+//
+// Empty podOS defaults to Linux so detection failures don't break the
+// common case.
+func defaultExecCommand(override, fallback, podOS string) []string {
 	if override != "" {
 		return []string{override}
+	}
+	if podOS == "windows" {
+		return []string{"cmd.exe", "/c", windowsDefaultShellScript}
 	}
 	if fallback != "" {
 		return []string{"sh", "-c", fallback}
 	}
 	return []string{"sh", "-c", defaultShellScript}
+}
+
+// defaultContainerAnnotation is the client-side convention kubectl, k9s, and
+// Lens use to mark the "main" container of a multi-container pod. Service
+// meshes (Istio, Linkerd, ASM) set it during injection to point past their
+// sidecar — without it, an unspecified container defaults to containers[0],
+// which on a mesh pod is the distroless proxy with no shell.
+const defaultContainerAnnotation = "kubectl.kubernetes.io/default-container"
+
+// defaultExecContainer picks the container to target when the request doesn't
+// name one. It honors defaultContainerAnnotation (matching kubectl exec
+// behavior), falling back to the first container. Returns "" only for a pod
+// with no containers.
+func defaultExecContainer(pod *corev1.Pod) string {
+	if name := pod.Annotations[defaultContainerAnnotation]; name != "" {
+		for _, c := range pod.Spec.Containers {
+			if c.Name == name {
+				return name
+			}
+		}
+	}
+	if len(pod.Spec.Containers) > 0 {
+		return pod.Spec.Containers[0].Name
+	}
+	return ""
+}
+
+// osNodeLabelsLookup is injected so detectPodOS is unit-testable without a
+// fake client.
+type osNodeLabelsLookup func(ctx context.Context, nodeName string) (map[string]string, error)
+
+// detectPodOS returns "windows" or "linux" (lowercased), or "" when unknown.
+// Three tiers, in order of authority:
+//
+//  1. pod.Spec.OS.Name — GA in K8s 1.25, designed for exactly this.
+//  2. pod.Spec.NodeSelector kubernetes.io/os (beta. variant as fallback).
+//  3. The scheduled node's labels — covers pods placed by default
+//     node-affinity rather than an explicit selector, common when Windows
+//     nodes are tainted and admission webhooks add the toleration without
+//     also injecting the selector.
+//
+// On tier-3 lookup failure (typically RBAC denying `get nodes`), returns ""
+// so the caller defaults to Linux — matches pre-Windows-support behavior.
+func detectPodOS(ctx context.Context, pod *corev1.Pod, lookupNode osNodeLabelsLookup) string {
+	if pod.Spec.OS != nil && pod.Spec.OS.Name != "" {
+		return strings.ToLower(string(pod.Spec.OS.Name))
+	}
+	if osName, ok := osFromLabels(pod.Spec.NodeSelector); ok {
+		return strings.ToLower(osName)
+	}
+	if pod.Spec.NodeName == "" {
+		return ""
+	}
+	labels, err := lookupNode(ctx, pod.Spec.NodeName)
+	if err != nil {
+		log.Printf("[exec] node label lookup for OS detection failed (node=%s, assuming Linux): %v", pod.Spec.NodeName, err)
+		return ""
+	}
+	if osName, ok := osFromLabels(labels); ok {
+		return strings.ToLower(osName)
+	}
+	return ""
+}
+
+// osFromLabels prefers kubernetes.io/os over the deprecated beta. variant.
+func osFromLabels(m map[string]string) (string, bool) {
+	if v, ok := m["kubernetes.io/os"]; ok && v != "" {
+		return v, true
+	}
+	if v, ok := m["beta.kubernetes.io/os"]; ok && v != "" {
+		return v, true
+	}
+	return "", false
+}
+
+func nodeLabelsLookupFor(client kubernetes.Interface) osNodeLabelsLookup {
+	return func(ctx context.Context, nodeName string) (map[string]string, error) {
+		node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		return node.Labels, nil
+	}
 }
 
 // ExecSession tracks an active exec WebSocket connection
@@ -121,6 +289,24 @@ type TerminalMessage struct {
 	Cols uint16 `json:"cols,omitempty"`
 }
 
+func runPodExecHeartbeat(conn *websocket.Conn, interval time.Duration, done <-chan struct{}) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			// Active output already keeps intermediaries alive, so let the Ping
+			// wait behind it instead of timing out a healthy busy terminal.
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Time{}); err != nil {
+				return
+			}
+		}
+	}
+}
+
 // wsWriter wraps a websocket connection to satisfy io.Writer
 type wsWriter struct {
 	conn *websocket.Conn
@@ -160,16 +346,12 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request) {
 	namespace := chi.URLParam(r, "namespace")
 	podName := chi.URLParam(r, "name")
 	container := r.URL.Query().Get("container")
-
-	// Build the argv for the exec. If the caller explicitly requested a shell
-	// via ?shell=, honour it; otherwise use defaultExecCommand, which runs the
-	// configured fallback (or the built-in bash/ash/sh detection script) under sh -c.
-	command := defaultExecCommand(r.URL.Query().Get("shell"), DefaultPodShellCommand)
+	overrideShell := r.URL.Query().Get("shell")
 
 	// Upgrade to WebSocket
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := s.upgradeWebSocket(w, r)
 	if err != nil {
-		log.Printf("WebSocket upgrade error: %v", err)
+		log.Printf("WebSocket upgrade error (origin=%q host=%q): %v", r.Header.Get("Origin"), r.Host, err)
 		return
 	}
 
@@ -196,6 +378,9 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		log.Printf("Exec session %s ended (%s/%s)", sessionID, namespace, podName)
 	}()
+	heartbeatDone := make(chan struct{})
+	defer close(heartbeatDone)
+	go runPodExecHeartbeat(conn, podExecHeartbeatInterval, heartbeatDone)
 
 	// Get K8s client and config (impersonated when auth is enabled)
 	client := s.getClientForRequest(r)
@@ -206,7 +391,33 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request) {
 	}
 	auth.AuditLog(r, namespace, podName)
 
-	// Create SPDY executor
+	// Fetch the pod when we need it for OS detection (?shell= not explicit) or
+	// to default an unspecified container. Defaulting to containers[0] without
+	// consulting kubectl.kubernetes.io/default-container lands mesh-injected
+	// pods in their distroless sidecar (no shell); honor the annotation like
+	// kubectl does. Pod-fetch failure is non-fatal: log, assume Linux, and let
+	// the apiserver apply its own containers[0] default.
+	var podOS string
+	if overrideShell == "" || container == "" {
+		pod, err := client.CoreV1().Pods(namespace).Get(r.Context(), podName, metav1.GetOptions{})
+		if err != nil {
+			log.Printf("[exec] pod fetch failed for %s/%s (OS detection + container defaulting skipped): %v", k8s.SanitizeForLog(namespace), k8s.SanitizeForLog(podName), err)
+		} else {
+			if overrideShell == "" {
+				podOS = detectPodOS(r.Context(), pod, nodeLabelsLookupFor(client))
+			}
+			if container == "" {
+				container = defaultExecContainer(pod)
+				execManager.mu.Lock()
+				session.Container = container
+				execManager.mu.Unlock()
+				log.Printf("[exec] session %s defaulted to container %q for %s/%s", sessionID, container, k8s.SanitizeForLog(namespace), k8s.SanitizeForLog(podName))
+			}
+		}
+	}
+	command := defaultExecCommand(overrideShell, DefaultPodShellCommand, podOS)
+
+	// Create remote command executor
 	exec, err := k8score.NewPodExecExecutor(client, config, namespace, podName, container, command, true)
 	if err != nil {
 		sendWSError(conn, fmt.Sprintf("Failed to create executor: %v", err))
@@ -378,12 +589,21 @@ func isShellNotFoundError(errMsg string) bool {
 		"not found in $path",
 		// POSIX exit 127 = "command not found". Some runtime/kubelet
 		// combinations surface a missing shell as "command terminated with
-		// exit code 127" via the SPDY stream rather than as a structured
+		// exit code 127" via the exec stream rather than as a structured
 		// runtime error. Our default exec wraps in `sh -c <script>`, so an
 		// exit-127 from that wrapper means `sh` itself couldn't run — i.e.
 		// shell missing. The drift canary picked this up against distroless
 		// coredns; see skyhook-io/radar#456 (comment thread).
 		"exit code 127",
+		// Windows-container equivalents. hcsshim (the Host Compute Service
+		// runtime backing containerd on Windows) surfaces missing executables
+		// as "hcs::System::CreateProcess: ... The system cannot find the file
+		// specified." The localized phrasing is what English Windows uses;
+		// non-English locales emit the same hcs::System::CreateProcess prefix
+		// with a translated tail, so we match the prefix as the durable
+		// signal and keep the English tail for backstop coverage.
+		"hcs::system::createprocess",
+		"the system cannot find the file",
 	}
 	errLower := strings.ToLower(errMsg)
 	for _, pattern := range patterns {
@@ -418,6 +638,19 @@ func looksLikeShellNotFound(errMsg string) bool {
 		return true
 	}
 	return false
+}
+
+// resolveDebugImage returns the image to use for a debug container/pod: an
+// explicit per-request override, else the operator-configured --debug-image,
+// else the built-in busybox default.
+func (s *Server) resolveDebugImage(requested string) string {
+	if requested != "" {
+		return requested
+	}
+	if s.effectiveConfig != nil && s.effectiveConfig.DebugImage != "" {
+		return s.effectiveConfig.DebugImage
+	}
+	return k8score.DefaultDebugImage
 }
 
 // NodeDebugRequest is the request body for creating a node debug pod
@@ -457,7 +690,7 @@ func (s *Server) handleNodeDebug(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create the debug pod
-	result, err := k8score.CreateNodeDebugPod(r.Context(), client, nodeName, req.Image)
+	result, err := k8score.CreateNodeDebugPod(r.Context(), client, nodeName, s.resolveDebugImage(req.Image))
 	if err != nil {
 		if apierrors.IsForbidden(err) {
 			s.writeError(w, http.StatusForbidden, err.Error())
@@ -486,7 +719,6 @@ func (s *Server) handleNodeDebug(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleNodeDebugCleanup deletes debug pods for a node
 func (s *Server) handleNodeDebugCleanup(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
@@ -498,15 +730,30 @@ func (s *Server) handleNodeDebugCleanup(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	auth.AuditLog(r, "", nodeName)
+	namespace := r.URL.Query().Get("namespace")
+	podName := r.URL.Query().Get("podName")
+	uid := r.URL.Query().Get("uid")
+	if err := k8score.ValidateNodeDebugPodIdentity(namespace, podName, types.UID(uid)); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	auth.AuditLog(r, namespace, podName)
 	client := s.getClientForRequest(r)
 	if client == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "cluster client not available — check cluster connection")
 		return
 	}
 
-	if err := k8score.DeleteNodeDebugPods(r.Context(), client, nodeName); err != nil {
-		log.Printf("[exec] Failed to cleanup node debug pods for %s: %v", nodeName, err)
+	if err := k8score.DeleteNodeDebugPod(r.Context(), client, namespace, podName, types.UID(uid)); err != nil {
+		if apierrors.IsConflict(err) {
+			s.writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		if apierrors.IsForbidden(err) {
+			s.writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		log.Printf("[exec] Failed to cleanup node debug pod %s/%s: %v", namespace, podName, err)
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -549,7 +796,7 @@ func (s *Server) handleCreateDebugContainer(w http.ResponseWriter, r *http.Reque
 		Namespace:       namespace,
 		PodName:         podName,
 		TargetContainer: req.TargetContainer,
-		Image:           req.Image,
+		Image:           s.resolveDebugImage(req.Image),
 	}, client)
 	if err != nil {
 		errMsg := err.Error()

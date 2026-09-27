@@ -1,9 +1,12 @@
 import { useState, useEffect, useMemo } from 'react'
-import { X, Plus, Trash2 } from 'lucide-react'
+import { X, Plus, Trash2, Lock } from 'lucide-react'
 import { clsx } from 'clsx'
-import { useAuditSettings, useUpdateAuditSettings, useAudit } from '../../api/client'
+import { useAuditSettings, useUpdateAuditSettings, useAudit, useCloudRole, useCapabilities } from '../../api/client'
+import { OperatorManagedNotice } from '../settings/OperatorManagedNotice'
 import type { CheckMeta } from '@skyhook-io/k8s-ui'
 import { validateRFC1123Label, type ValidationResult } from '@skyhook-io/k8s-ui/utils/validators'
+import { Tooltip } from '../ui/Tooltip'
+import { Input } from '@skyhook-io/k8s-ui'
 
 interface AuditSettingsDialogProps {
   namespaces: string[]
@@ -14,6 +17,13 @@ export function AuditSettingsDialog({ namespaces, onClose }: AuditSettingsDialog
   const { data: settings } = useAuditSettings()
   const { data: auditData } = useAudit(namespaces)
   const updateSettings = useUpdateAuditSettings()
+  // Audit policy is cluster-shared, so writes are owner-gated (enforced
+  // server-side too). Non-owners get a read-only view. Non-Cloud callers
+  // have no role and pass.
+  const { canAtLeast } = useCloudRole()
+  const { data: capabilities } = useCapabilities()
+  const operatorManaged = capabilities?.configManagement === 'operator'
+  const canEdit = capabilities != null && !operatorManaged && canAtLeast('owner')
   const [ignoredNs, setIgnoredNs] = useState<string[]>([])
   const [disabledChecks, setDisabledChecks] = useState<string[]>([])
   const [newNs, setNewNs] = useState('')
@@ -68,13 +78,23 @@ export function AuditSettingsDialog({ namespaces, onClose }: AuditSettingsDialog
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
       <div className="bg-theme-surface rounded-xl shadow-xl w-full max-w-lg mx-4 max-h-[80vh] flex flex-col" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between px-5 py-4 border-b border-theme-border shrink-0">
-          <h2 className="text-sm font-semibold text-theme-text-primary">Audit Settings</h2>
+          <h2 className="text-sm font-semibold text-theme-text-primary">Checks Settings</h2>
           <button onClick={onClose} className="p-1 rounded-lg hover:bg-theme-hover transition-colors">
             <X className="w-4 h-4 text-theme-text-tertiary" />
           </button>
         </div>
 
         <div className="px-5 py-4 overflow-y-auto flex-1">
+          {operatorManaged && <div className="mb-4"><OperatorManagedNotice helmValue="audit" /></div>}
+          {capabilities && !operatorManaged && !canEdit && (
+            <div className="mb-4 rounded-lg border border-theme-border bg-theme-elevated/50 p-3 flex items-start gap-2.5">
+              <Lock className="w-3.5 h-3.5 mt-0.5 shrink-0 text-theme-text-tertiary" />
+              <p className="text-xs text-theme-text-tertiary">
+                Audit policy is shared across everyone using this Radar instance, so editing
+                is limited to owners. You can review the current settings here.
+              </p>
+            </div>
+          )}
           {/* Ignored Namespaces */}
           <div className="mb-6">
             <label className="text-xs font-medium text-theme-text-secondary uppercase tracking-wider">
@@ -88,12 +108,13 @@ export function AuditSettingsDialog({ namespaces, onClose }: AuditSettingsDialog
               {ignoredNs.map(ns => (
                 <div key={ns} className="flex items-center justify-between px-3 py-1.5 bg-theme-elevated rounded-lg">
                   <span className="text-sm text-theme-text-primary">{ns}</span>
-                  <button
+                  {!operatorManaged && <button
                     onClick={() => setIgnoredNs(ignoredNs.filter(n => n !== ns))}
-                    className="p-1 rounded hover:bg-theme-hover text-theme-text-tertiary hover:text-red-400 transition-colors"
+                    disabled={!canEdit}
+                    className="p-1 rounded hover:bg-theme-hover text-theme-text-tertiary hover:text-red-400 transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-theme-text-tertiary"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
-                  </button>
+                  </button>}
                 </div>
               ))}
               {ignoredNs.length === 0 && (
@@ -101,13 +122,13 @@ export function AuditSettingsDialog({ namespaces, onClose }: AuditSettingsDialog
               )}
             </div>
 
-            <div className="flex gap-2">
-              <input
-                type="text"
+            {!operatorManaged && <div className="flex gap-2">
+              <Input
                 value={newNs}
                 onChange={e => setNewNs(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter') addNamespace() }}
                 placeholder="Add namespace..."
+                disabled={!canEdit}
                 aria-invalid={newNsError ? true : undefined}
                 aria-describedby="new-ns-help"
                 className={clsx(
@@ -119,12 +140,12 @@ export function AuditSettingsDialog({ namespaces, onClose }: AuditSettingsDialog
               />
               <button
                 onClick={addNamespace}
-                disabled={!canAddNamespace}
+                disabled={!canEdit || !canAddNamespace}
                 className="px-3 py-1.5 text-sm btn-brand rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Plus className="w-4 h-4" />
               </button>
-            </div>
+            </div>}
             {(newNsError || newNsDuplicate) && (
               <p id="new-ns-help" className="mt-1.5 text-xs text-red-400">
                 {newNsDuplicate
@@ -140,7 +161,7 @@ export function AuditSettingsDialog({ namespaces, onClose }: AuditSettingsDialog
               Enabled Checks
             </label>
             <p className="text-xs text-theme-text-tertiary mt-1 mb-3">
-              Uncheck to disable specific checks globally across all views.
+              {operatorManaged ? 'Checks enabled by the installation’s audit policy.' : 'Uncheck to disable specific checks globally across all views.'}
             </p>
 
             <div className="flex flex-col gap-0.5">
@@ -155,7 +176,8 @@ export function AuditSettingsDialog({ namespaces, onClose }: AuditSettingsDialog
                       type="checkbox"
                       checked={!disabled}
                       onChange={() => toggleCheck(check.id)}
-                      className="w-4 h-4 rounded border-theme-border text-skyhook-500 focus:ring-skyhook-500"
+                      disabled={!canEdit}
+                      className="w-4 h-4 rounded border-theme-border text-skyhook-500 focus:ring-skyhook-500 disabled:opacity-40 disabled:cursor-not-allowed"
                     />
                     <div className="flex-1 min-w-0">
                       <span className="text-sm text-theme-text-primary">{check.title}</span>
@@ -173,27 +195,32 @@ export function AuditSettingsDialog({ namespaces, onClose }: AuditSettingsDialog
             onClick={onClose}
             className="px-4 py-1.5 text-sm text-theme-text-secondary hover:text-theme-text-primary bg-theme-elevated hover:bg-theme-hover border border-theme-border rounded-lg transition-colors"
           >
-            Cancel
+            {operatorManaged ? 'Close' : 'Cancel'}
           </button>
+          {!operatorManaged && <Tooltip
+            content={
+              !canEdit
+                ? 'Audit settings can only be changed by owners'
+                : newNsError
+                  ? 'Fix or clear the pending namespace input before saving'
+                  : newNsDuplicate
+                    ? 'Clear the duplicate pending input before saving'
+                    : ''
+            }
+          >
           <button
             onClick={handleSave}
             // Block save while the namespace input has unfixed pending
             // text — otherwise the user clicks Save expecting their
             // entry to be included and it's silently dropped.
             disabled={
-              updateSettings.isPending || newNsError !== null || newNsDuplicate
+              !canEdit || updateSettings.isPending || newNsError !== null || newNsDuplicate
             }
-            title={
-              newNsError
-                ? 'Fix or clear the pending namespace input before saving'
-                : newNsDuplicate
-                  ? 'Clear the duplicate pending input before saving'
-                  : undefined
-            }
-            className="px-4 py-1.5 text-sm btn-brand rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
+            className="px-4 py-1.5 text-sm btn-brand rounded-lg disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none"
           >
             {updateSettings.isPending ? 'Saving...' : 'Save'}
           </button>
+          </Tooltip>}
         </div>
       </div>
     </div>

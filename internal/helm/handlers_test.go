@@ -3,8 +3,11 @@ package helm
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/skyhook-io/radar/internal/auth"
@@ -29,22 +32,22 @@ func TestRequireCloudRole(t *testing.T) {
 		// CloudRole is RoleNone, AtLeast bypasses. This is permissive
 		// by design — the assumption is that radar-hub guarantees the
 		// role group when forwarding.
-		{name: "user without cloud:* — bypass", groups: []string{"developers"}, min: auth.RoleOwner, wantOK: true},
+		{name: "user without radar:* — bypass", groups: []string{"developers"}, min: auth.RoleOwner, wantOK: true},
 
 		// Cloud-attributed users — gate enforces.
-		{name: "viewer denied member-required op", groups: []string{"cloud:viewer"}, min: auth.RoleMember,
+		{name: "viewer denied member-required op", groups: []string{"radar:viewer"}, min: auth.RoleMember,
 			wantOK: false, wantCode: auth.ErrCodeCloudRoleInsufficient},
-		{name: "viewer denied owner-required op", groups: []string{"cloud:viewer"}, min: auth.RoleOwner,
+		{name: "viewer denied owner-required op", groups: []string{"radar:viewer"}, min: auth.RoleOwner,
 			wantOK: false, wantCode: auth.ErrCodeCloudRoleInsufficient},
-		{name: "viewer allowed viewer-required op", groups: []string{"cloud:viewer"}, min: auth.RoleViewer, wantOK: true},
-		{name: "member allowed member-required op", groups: []string{"cloud:member"}, min: auth.RoleMember, wantOK: true},
-		{name: "member denied owner-required op", groups: []string{"cloud:member"}, min: auth.RoleOwner,
+		{name: "viewer allowed viewer-required op", groups: []string{"radar:viewer"}, min: auth.RoleViewer, wantOK: true},
+		{name: "member allowed member-required op", groups: []string{"radar:member"}, min: auth.RoleMember, wantOK: true},
+		{name: "member denied owner-required op", groups: []string{"radar:member"}, min: auth.RoleOwner,
 			wantOK: false, wantCode: auth.ErrCodeCloudRoleInsufficient},
-		{name: "owner allowed owner-required op", groups: []string{"cloud:owner"}, min: auth.RoleOwner, wantOK: true},
+		{name: "owner allowed owner-required op", groups: []string{"radar:owner"}, min: auth.RoleOwner, wantOK: true},
 
 		// Defensive: a stuffed lower tier alongside owner shouldn't
 		// downgrade the user. CloudRoleFromGroups picks the highest.
-		{name: "stuffed viewer + owner — allowed", groups: []string{"cloud:viewer", "cloud:owner"}, min: auth.RoleOwner, wantOK: true},
+		{name: "stuffed viewer + owner — allowed", groups: []string{"radar:viewer", "radar:owner"}, min: auth.RoleOwner, wantOK: true},
 	}
 
 	for _, tc := range cases {
@@ -83,6 +86,96 @@ func TestRequireCloudRole(t *testing.T) {
 	}
 }
 
+func TestDecodeOptionalApplyValuesRequest(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		hasBody bool
+		want    map[string]any
+		wantErr bool
+	}{
+		{name: "nil body"},
+		{name: "empty body", hasBody: true},
+		{name: "explicit empty values stays non nil", body: `{"values":{}}`, hasBody: true, want: map[string]any{}},
+		{name: "populated values", body: `{"values":{"replicaCount":2}}`, hasBody: true, want: map[string]any{"replicaCount": float64(2)}},
+		{name: "invalid json", body: `{"values":`, hasBody: true, wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body io.Reader
+			if tc.hasBody {
+				body = strings.NewReader(tc.body)
+			}
+
+			got, err := decodeOptionalApplyValuesRequest(body)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decodeOptionalApplyValuesRequest returned error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("values = %#v, want %#v", got, tc.want)
+			}
+			if tc.want != nil && got == nil {
+				t.Fatal("values = nil, want explicit non-nil map")
+			}
+		})
+	}
+}
+
+// TestDecodeApplyValuesRequest pins the apply contract: the endpoint refuses
+// a chart-version change instead of silently dropping it. Preview accepts
+// Version/Repository and renders against the target chart, so the same body
+// sent to apply must fail loudly; apply always targets the release's current
+// chart, and version changes belong to the upgrade endpoints.
+func TestDecodeApplyValuesRequest(t *testing.T) {
+	rejected := []struct {
+		name string
+		body string
+	}{
+		{"version set", `{"values":{"a":1},"version":"1.1.0"}`},
+		{"repository set", `{"values":{"a":1},"repository":"my-repo"}`},
+		{"both set", `{"values":{"a":1},"version":"1.1.0","repository":"my-repo"}`},
+	}
+
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decodeApplyValuesRequest(strings.NewReader(tc.body))
+			if err == nil {
+				t.Fatal("expected rejection (version/repository must be refused, not dropped)")
+			}
+			if !strings.Contains(err.Error(), "upgrade endpoint") {
+				t.Errorf("error = %q, want it to point at the upgrade endpoint", err.Error())
+			}
+		})
+	}
+
+	t.Run("values only accepted", func(t *testing.T) {
+		req, err := decodeApplyValuesRequest(strings.NewReader(`{"values":{"a":1}}`))
+		if err != nil {
+			t.Fatalf("decodeApplyValuesRequest returned error: %v", err)
+		}
+		if !reflect.DeepEqual(req.Values, map[string]any{"a": float64(1)}) {
+			t.Fatalf("values = %#v, want the decoded map", req.Values)
+		}
+	})
+
+	t.Run("malformed body rejected", func(t *testing.T) {
+		_, err := decodeApplyValuesRequest(strings.NewReader(`{"values":`))
+		if err == nil {
+			t.Fatal("expected error for malformed JSON")
+		}
+		if !strings.Contains(err.Error(), "invalid request body") {
+			t.Errorf("error = %q, want an invalid-request-body message", err.Error())
+		}
+	})
+}
+
 // TestSensitiveHelmHandlers_GateOnViewer asserts that every Helm
 // handler we believe is gated actually 403s a Cloud viewer with
 // error_code=cloud_role_insufficient. The unit test above
@@ -98,7 +191,7 @@ func TestRequireCloudRole(t *testing.T) {
 // We don't need a real Helm client because the gate runs first; the
 // handler short-circuits before touching `helm.GetClient()`.
 func TestSensitiveHelmHandlers_GateOnViewer(t *testing.T) {
-	h := NewHandlers()
+	h := NewHandlers(nil)
 
 	// (name, method, handler) for every endpoint we believe is gated.
 	// Sensitive reads → member; writes → member.
@@ -110,6 +203,9 @@ func TestSensitiveHelmHandlers_GateOnViewer(t *testing.T) {
 		{"GetManifest", http.MethodGet, h.handleGetManifest},
 		{"GetValues", http.MethodGet, h.handleGetValues},
 		{"GetDiff", http.MethodGet, h.handleGetDiff},
+		{"GetNotesDiff", http.MethodGet, h.handleGetNotesDiff},
+		{"GetHooksDiff", http.MethodGet, h.handleGetHooksDiff},
+		{"GetResourceDiff", http.MethodGet, h.handleGetResourceDiff},
 		{"PreviewValues", http.MethodPost, h.handlePreviewValues},
 		{"ApplyValues", http.MethodPut, h.handleApplyValues},
 		{"Rollback", http.MethodPost, h.handleRollback},
@@ -126,7 +222,7 @@ func TestSensitiveHelmHandlers_GateOnViewer(t *testing.T) {
 			req := httptest.NewRequest(tc.method, "/test", nil)
 			req = req.WithContext(auth.ContextWithUser(req.Context(), &auth.User{
 				Username: "viewer-test",
-				Groups:   []string{"cloud:viewer"},
+				Groups:   []string{"radar:viewer"},
 			}))
 			rec := httptest.NewRecorder()
 

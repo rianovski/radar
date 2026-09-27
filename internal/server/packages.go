@@ -11,13 +11,48 @@ import (
 	"sync"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/skyhook-io/radar/internal/auth"
 	"github.com/skyhook-io/radar/internal/helm"
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/pkg/health"
 	"github.com/skyhook-io/radar/pkg/packages"
+	"github.com/skyhook-io/radar/pkg/subject"
 )
+
+// toPackagesOverlay maps the unified resolver's app-overlay (pkg/subject) into
+// the plain packages.Overlay carried on the wire. nil → nil (raw-always: no
+// app-overlay degrades to package/subject-only on the Applications surface).
+func toPackagesOverlay(ao *subject.AppOverlay) *packages.Overlay {
+	if ao == nil {
+		return nil
+	}
+	return &packages.Overlay{
+		Key:        ao.Winner.Key,
+		Tier:       int(ao.Winner.Tier),
+		Confidence: string(ao.Winner.Confidence),
+	}
+}
+
+// declarationOverlay derives the app-overlay for a GitOps declaration from its
+// own identity, mirroring the key format pkg/subject.ResolveOverlay produces
+// for the workloads the controller stamps — so a Helm-labeled workload and its
+// managing declaration collapse to one app. Argo App → tier 3; Flux HelmRelease
+// (has a chart) → tier 1; Flux Kustomization (no chart) → tier 2.
+func declarationOverlay(d packages.Declaration) *packages.Overlay {
+	switch strings.ToLower(d.Source) {
+	case "argocd", "argo-cd", "argo":
+		return &packages.Overlay{Key: d.Namespace + "/Application/" + d.Name, Tier: int(subject.TierArgoTrackingID), Confidence: string(subject.ConfidenceHigh)}
+	case "flux", "fluxcd":
+		if d.Chart != "" {
+			return &packages.Overlay{Key: d.Namespace + "/HelmRelease/" + d.Name, Tier: int(subject.TierFluxHelmRelease), Confidence: string(subject.ConfidenceHigh)}
+		}
+		return &packages.Overlay{Key: d.Namespace + "/Kustomization/" + d.Name, Tier: int(subject.TierFluxKustomize), Confidence: string(subject.ConfidenceHigh)}
+	}
+	return nil
+}
 
 // packagesCacheTTL bounds how often we recompute the merged package
 // list. Aggregate is cheap; the inputs (Helm secret reads, dynamic-cache
@@ -54,18 +89,18 @@ type PackagesResponse struct {
 // SourceError carries a per-source failure. Field names + JSON tags
 // are part of the /api/packages public response shape — wire-stable.
 // Code values are likewise stable (see ErrCode* below); add new codes,
-// never rename. Renaming any of these fields silently breaks the SPA
+// never rename. Renaming any of these fields silently breaks the frontend
 // (radar-hub-web) and MCP fleet_list_packages clients.
 type SourceError struct {
 	Source     packages.SourceCode `json:"source"`
 	StatusCode int                 `json:"statusCode,omitempty"`
 	Error      string              `json:"error"`
 	// Code is a machine-readable category for this failure. Stable
-	// across phrasing changes in Error so consumers (the SPA's
+	// across phrasing changes in Error so consumers (the frontend's
 	// categorize fn, MCP clients) can branch without string-matching
 	// log messages. Populated for known failure shapes; empty for
 	// generic errors (consumer falls back to category="failed").
-	// Producer: errorCodeForHelm in this file. Consumer: the SPA's
+	// Producer: errorCodeForHelm in this file. Consumer: the frontend's
 	// categorizeSourceError in radar-hub-web.
 	Code string `json:"code,omitempty"`
 	// AffectedNamespaces, when set, lists the namespaces this error
@@ -76,8 +111,8 @@ type SourceError struct {
 	AffectedNamespaces []string `json:"affectedNamespaces,omitempty"`
 }
 
-// Error code constants. Stable wire values — the SPA categorize and
-// MCP clients branch on these. Add new codes here, never rename.
+// Error code constants. Stable wire values that the frontend and MCP clients
+// branch on. Add new codes here, never rename.
 const (
 	ErrCodeRBACDenied   = "rbac_denied"
 	ErrCodeUnreachable  = "unreachable"
@@ -87,7 +122,7 @@ const (
 )
 
 // errorCodeForHelm classifies a Helm error string + status into a
-// stable Code value. The SPA used to do this with regex on the user-
+// stable Code value. The frontend used to do this with regex on the user-
 // visible string; doing it backend-side means a phrasing change in
 // the SDK doesn't silently move errors into "failed" until someone
 // updates the regex too.
@@ -243,6 +278,12 @@ func evictOldestPackagesCacheEntry() {
 	}
 }
 
+func clearPackagesCache() {
+	packagesCacheMu.Lock()
+	packagesCache = map[string]packagesCacheEntry{}
+	packagesCacheMu.Unlock()
+}
+
 // packagesCacheKeyFor produces a stable cache key from the requested
 // namespace set. User identity is intentionally NOT part of the key:
 // inventory reads run via the ServiceAccount (see computePackagesInternal),
@@ -325,7 +366,7 @@ func computePackagesInternal(ctx context.Context, namespaces []string, cache *k8
 
 	// Helm releases (source H). Inventory reads pass empty user/groups
 	// so the SA does the read — see deploy/helm/radar/templates/clusterrole.yaml
-	// for the secrets-rule rationale (cloud:viewer → K8s `view` excludes
+	// for the secrets-rule rationale (radar:viewer → K8s `view` excludes
 	// secrets, so impersonating would 403 viewers on inventory metadata
 	// that isn't credential data). Sensitive Helm reads (GetValues,
 	// GetManifest) and all writes still impersonate.
@@ -534,6 +575,10 @@ func collectWorkloadInputs(cache *k8s.ResourceCache, namespaces []string) ([]pac
 		if lbls["helm.sh/chart"] == "" && anns["meta.helm.sh/release-name"] == "" {
 			return
 		}
+		// Resolve the Tier-2 app-overlay from the workload's metadata via the
+		// unified resolver. allowBareApp=false: a bare `app` label alone never
+		// silently groups (raw-always — see pkg/subject.ResolveOverlay).
+		meta := metav1.ObjectMeta{Namespace: ns, Name: name, Labels: lbls, Annotations: anns}
 		out = append(out, packages.Workload{
 			Kind:        kind,
 			Namespace:   ns,
@@ -541,6 +586,7 @@ func collectWorkloadInputs(cache *k8s.ResourceCache, namespaces []string) ([]pac
 			Labels:      lbls,
 			Annotations: anns,
 			Health:      health,
+			Overlay:     toPackagesOverlay(subject.ResolveOverlay(&meta, false)),
 		})
 	}
 
@@ -563,7 +609,7 @@ func collectWorkloadInputs(cache *k8s.ResourceCache, namespaces []string) ([]pac
 				noteErr("Deployment", ns, err)
 				for _, d := range items {
 					add("Deployment", d.Namespace, d.Name, d.Labels, d.Annotations,
-						deploymentHealth(int(d.Status.Replicas), int(d.Status.AvailableReplicas)))
+						levelToPackagesHealth(health.Workload(d, time.Now()).Level))
 				}
 				return
 			}
@@ -571,7 +617,7 @@ func collectWorkloadInputs(cache *k8s.ResourceCache, namespaces []string) ([]pac
 			noteErr("Deployment", ns, err)
 			for _, d := range items {
 				add("Deployment", d.Namespace, d.Name, d.Labels, d.Annotations,
-					deploymentHealth(int(d.Status.Replicas), int(d.Status.AvailableReplicas)))
+					levelToPackagesHealth(health.Workload(d, time.Now()).Level))
 			}
 		})
 	}
@@ -582,7 +628,7 @@ func collectWorkloadInputs(cache *k8s.ResourceCache, namespaces []string) ([]pac
 				noteErr("DaemonSet", ns, err)
 				for _, d := range items {
 					add("DaemonSet", d.Namespace, d.Name, d.Labels, d.Annotations,
-						daemonsetHealth(int(d.Status.DesiredNumberScheduled), int(d.Status.NumberReady)))
+						levelToPackagesHealth(health.Workload(d, time.Now()).Level))
 				}
 				return
 			}
@@ -590,7 +636,7 @@ func collectWorkloadInputs(cache *k8s.ResourceCache, namespaces []string) ([]pac
 			noteErr("DaemonSet", ns, err)
 			for _, d := range items {
 				add("DaemonSet", d.Namespace, d.Name, d.Labels, d.Annotations,
-					daemonsetHealth(int(d.Status.DesiredNumberScheduled), int(d.Status.NumberReady)))
+					levelToPackagesHealth(health.Workload(d, time.Now()).Level))
 			}
 		})
 	}
@@ -601,7 +647,7 @@ func collectWorkloadInputs(cache *k8s.ResourceCache, namespaces []string) ([]pac
 				noteErr("StatefulSet", ns, err)
 				for _, ss := range items {
 					add("StatefulSet", ss.Namespace, ss.Name, ss.Labels, ss.Annotations,
-						statefulsetHealth(int(ss.Status.Replicas), int(ss.Status.ReadyReplicas)))
+						levelToPackagesHealth(health.Workload(ss, time.Now()).Level))
 				}
 				return
 			}
@@ -609,27 +655,12 @@ func collectWorkloadInputs(cache *k8s.ResourceCache, namespaces []string) ([]pac
 			noteErr("StatefulSet", ns, err)
 			for _, ss := range items {
 				add("StatefulSet", ss.Namespace, ss.Name, ss.Labels, ss.Annotations,
-					statefulsetHealth(int(ss.Status.Replicas), int(ss.Status.ReadyReplicas)))
+					levelToPackagesHealth(health.Workload(ss, time.Now()).Level))
 			}
 		})
 	}
 	return out, errors.Join(listerErrs...)
 }
-
-func deploymentHealth(desired, available int) packages.Health {
-	if desired == 0 {
-		return packages.HealthUnknown
-	}
-	if available >= desired {
-		return packages.HealthHealthy
-	}
-	if available == 0 {
-		return packages.HealthUnhealthy
-	}
-	return packages.HealthDegraded
-}
-func daemonsetHealth(desired, ready int) packages.Health   { return deploymentHealth(desired, ready) }
-func statefulsetHealth(desired, ready int) packages.Health { return deploymentHealth(desired, ready) }
 
 // collectGitOpsDeclarations reads Argo Applications + Flux HelmReleases
 // + Flux Kustomizations cluster-wide. Missing CRDs (controller not
@@ -641,6 +672,7 @@ func collectGitOpsDeclarations(ctx context.Context, cache *k8s.ResourceCache, er
 	if items, err := cache.ListDynamicWithGroup(ctx, "Application", "", "argoproj.io"); err == nil {
 		for _, item := range items {
 			if d, ok := packages.ParseArgoApplication(item.Object); ok {
+				d.Overlay = declarationOverlay(d)
 				out = append(out, d)
 			} else {
 				log.Printf("[packages] failed to parse Argo Application %s/%s — skipping", item.GetNamespace(), item.GetName())
@@ -653,6 +685,7 @@ func collectGitOpsDeclarations(ctx context.Context, cache *k8s.ResourceCache, er
 	if items, err := cache.ListDynamicWithGroup(ctx, "HelmRelease", "", "helm.toolkit.fluxcd.io"); err == nil {
 		for _, item := range items {
 			if d, ok := packages.ParseFluxHelmRelease(item.Object); ok {
+				d.Overlay = declarationOverlay(d)
 				out = append(out, d)
 			} else {
 				log.Printf("[packages] failed to parse Flux HelmRelease %s/%s — skipping", item.GetNamespace(), item.GetName())
@@ -665,6 +698,7 @@ func collectGitOpsDeclarations(ctx context.Context, cache *k8s.ResourceCache, er
 	if items, err := cache.ListDynamicWithGroup(ctx, "Kustomization", "", "kustomize.toolkit.fluxcd.io"); err == nil {
 		for _, item := range items {
 			if d, ok := packages.ParseFluxKustomization(item.Object); ok {
+				d.Overlay = declarationOverlay(d)
 				out = append(out, d)
 			} else {
 				log.Printf("[packages] failed to parse Flux Kustomization %s/%s — skipping", item.GetNamespace(), item.GetName())

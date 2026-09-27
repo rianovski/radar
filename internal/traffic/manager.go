@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"maps"
 	"strings"
 	"sync"
 
@@ -13,6 +14,7 @@ import (
 
 	"github.com/skyhook-io/radar/internal/errorlog"
 	"github.com/skyhook-io/radar/internal/portforward"
+	"github.com/skyhook-io/radar/pkg/k8score"
 )
 
 // Manager handles traffic source detection and management
@@ -31,14 +33,80 @@ var (
 	initOnce sync.Once
 	initErr  error
 
+	// metricsConfigMu guards the configured-metrics globals below. Originally
+	// these were written only at startup (no concurrent readers), but the live
+	// "apply Prometheus URL" path now writes them at runtime while a concurrent
+	// context-switch rebuild reads them in initOnce.Do — so the access needs a
+	// lock, matching the mutex-guarded prometheus client.
+	metricsConfigMu sync.RWMutex
 	// configuredMetricsURL is the user-provided --prometheus-url flag value.
 	// Stored at package level so it persists across context-switch resets.
 	configuredMetricsURL string
+	// configuredMetricsHeaders are sent with every Prometheus query — required
+	// for auth-protected backends. Also persists across context switches.
+	configuredMetricsHeaders map[string]string
+	// configuredBeylaJobSelector overrides the default `job` label matcher used
+	// to scope Beyla's Prometheus queries; empty means use the built-in default.
+	configuredBeylaJobSelector string
 )
 
 // SetMetricsURL sets a manual Prometheus/VictoriaMetrics URL, bypassing auto-discovery.
 func SetMetricsURL(url string) {
+	metricsConfigMu.Lock()
+	defer metricsConfigMu.Unlock()
 	configuredMetricsURL = url
+}
+
+// SetMetricsHeaders sets HTTP headers attached to every Prometheus query.
+// Used for auth-protected backends (Bearer tokens, X-Scope-OrgID, etc.).
+func SetMetricsHeaders(h map[string]string) {
+	metricsConfigMu.Lock()
+	defer metricsConfigMu.Unlock()
+	configuredMetricsHeaders = copyMetricsHeaders(h)
+}
+
+// SetMetricsConfig applies URL and headers together. A source built between
+// two separate writes would pair the new URL with the old credentials (or the
+// reverse), so a live change must publish both in one step.
+func SetMetricsConfig(url string, h map[string]string) {
+	metricsConfigMu.Lock()
+	defer metricsConfigMu.Unlock()
+	configuredMetricsURL = url
+	configuredMetricsHeaders = copyMetricsHeaders(h)
+}
+
+func copyMetricsHeaders(h map[string]string) map[string]string {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(h))
+	maps.Copy(out, h)
+	return out
+}
+
+// SetBeylaJobSelector overrides the `job` label matcher fragment (e.g.
+// `job=~".*beyla.*"`) Beyla queries use to scope which Prometheus series they
+// read — for a cluster where Alloy or Beyla runs under a non-default job
+// name. Pass "" to restore the default.
+func SetBeylaJobSelector(selector string) {
+	metricsConfigMu.Lock()
+	defer metricsConfigMu.Unlock()
+	configuredBeylaJobSelector = selector
+}
+
+// BeylaJobSelector returns the configured Beyla job-label matcher fragment,
+// or "" if unset.
+func BeylaJobSelector() string {
+	metricsConfigMu.RLock()
+	defer metricsConfigMu.RUnlock()
+	return configuredBeylaJobSelector
+}
+
+// metricsConfig returns the configured URL + headers under the read lock.
+func metricsConfig() (string, map[string]string) {
+	metricsConfigMu.RLock()
+	defer metricsConfigMu.RUnlock()
+	return configuredMetricsURL, configuredMetricsHeaders
 }
 
 // Initialize sets up the traffic manager with the given K8s client
@@ -58,11 +126,14 @@ func InitializeWithConfig(client kubernetes.Interface, config *rest.Config, cont
 		// Register available sources
 		manager.sources["hubble"] = NewHubbleSource(client)
 		caretta := NewCarettaSource(client)
-		if configuredMetricsURL != "" {
-			caretta.metricsURL = configuredMetricsURL
+		metricsURL, metricsHeaders := metricsConfig()
+		if metricsURL != "" {
+			caretta.metricsURL = metricsURL
 		}
+		caretta.headers = metricsHeaders
 		manager.sources["caretta"] = caretta
 		manager.sources["istio"] = NewIstioSource(client)
+		manager.sources["beyla"] = NewBeylaSource(client)
 
 		// Set K8s clients for port-forward functionality
 		if config != nil {
@@ -97,8 +168,11 @@ func (m *Manager) DetectSources(ctx context.Context) (*SourcesResponse, error) {
 	}
 
 	// Check each registered source in deterministic priority order
-	// (hubble has deepest visibility, istio has L7 metrics, caretta is fallback)
-	sourceOrder := []string{"hubble", "istio", "caretta"}
+	// (hubble has deepest visibility, istio has L7 metrics, caretta is fallback, beyla is external eBPF)
+	sourceOrder := []string{"hubble", "istio", "caretta", "beyla"}
+	// Collected in priority order so the active source can be reconciled against
+	// what is actually available once every source has reported.
+	available := make([]TrafficSource, 0, len(sourceOrder))
 	for _, name := range sourceOrder {
 		source, ok := m.sources[name]
 		if !ok {
@@ -125,14 +199,28 @@ func (m *Manager) DetectSources(ctx context.Context) (*SourcesResponse, error) {
 				Native:  result.Native,
 				Message: result.Message,
 			})
-			// Set first available as active (deterministic priority)
-			if m.activeSource == nil {
-				m.activeSource = source
-			}
+			available = append(available, source)
+		} else if result.Present && result.Message != "" {
+			// Present but unusable — installed with the wrong feature enabled, or
+			// running but not scraped. That is a status with an explanation, which is
+			// what SourceStatus is for and what the error branch above already does;
+			// a bare name in NotDetected would flatten it into "not installed".
+			// Gated on Present so a source nobody installed stays out: the
+			// recommendation covers absence, and a row per uninstalled source would
+			// bury the one with a fixable problem.
+			response.Detected = append(response.Detected, SourceStatus{
+				Name:    name,
+				Status:  "not_found",
+				Version: result.Version,
+				Native:  result.Native,
+				Message: result.Message,
+			})
 		} else {
 			response.NotDetected = append(response.NotDetected, name)
 		}
 	}
+
+	m.reconcileActiveSource(available)
 
 	// Set active source name in response
 	if m.activeSource != nil {
@@ -158,6 +246,9 @@ func (m *Manager) detectClusterInfo(ctx context.Context) (*ClusterInfo, error) {
 	} else {
 		info.K8sVersion = version.GitVersion
 		log.Printf("[traffic] K8s version: %s", info.K8sVersion)
+		if platform := k8score.DetectPlatformFromVersion(info.K8sVersion); platform != "unknown" {
+			info.Platform = platform
+		}
 	}
 
 	// Detect platform from nodes
@@ -171,26 +262,19 @@ func (m *Manager) detectClusterInfo(ctx context.Context) (*ClusterInfo, error) {
 		providerID := node.Spec.ProviderID
 		log.Printf("[traffic] Node providerID: %q", providerID)
 
-		// Detect platform
-		switch {
-		case strings.HasPrefix(providerID, "gce://"):
-			info.Platform = "gke"
-			// Extract cluster name from labels
-			if cn, ok := node.Labels["cloud.google.com/gke-nodepool"]; ok {
-				// Parse cluster name from nodepool
-				parts := strings.Split(cn, "-")
-				if len(parts) > 0 {
-					info.ClusterName = parts[0]
+		platform := k8score.DetectNodePlatform(node)
+		if platform == "unknown" {
+			log.Printf("[traffic] Unknown node platform, platform remains generic")
+		} else if info.Platform == "generic" {
+			info.Platform = platform
+			if platform == "gke" {
+				if cn, ok := node.Labels["cloud.google.com/gke-nodepool"]; ok {
+					parts := strings.Split(cn, "-")
+					if len(parts) > 0 {
+						info.ClusterName = parts[0]
+					}
 				}
 			}
-		case strings.HasPrefix(providerID, "aws://"):
-			info.Platform = "eks"
-		case strings.HasPrefix(providerID, "azure://"):
-			info.Platform = "aks"
-		case strings.HasPrefix(providerID, "kind://"):
-			info.Platform = "kind"
-		default:
-			log.Printf("[traffic] Unknown providerID format, platform remains generic")
 		}
 	}
 
@@ -239,6 +323,14 @@ func (m *Manager) detectCNI(ctx context.Context, platform string) (string, bool)
 		log.Printf("[traffic] Found anetd DaemonSet (GKE Dataplane V2)")
 		// anetd is part of GKE Dataplane V2 which uses Cilium
 		return "cilium", hubbleEnabled
+	}
+
+	for _, name := range []string{"rke2-canal", "canal"} {
+		_, err = m.k8sClient.AppsV1().DaemonSets("kube-system").Get(ctx, name, metav1.GetOptions{})
+		if err == nil {
+			log.Printf("[traffic] Found %s DaemonSet", name)
+			return "canal", false
+		}
 	}
 
 	// Check for Calico
@@ -300,8 +392,8 @@ func (m *Manager) generateRecommendation(info *ClusterInfo, detected []SourceSta
 	for _, s := range detected {
 		if s.Name == "istio" && s.Status == "error" {
 			return &Recommendation{
-				Name:   "istio",
-				Reason: "Istio service mesh detected but Prometheus not reachable. Use --prometheus-url to point Radar to your Prometheus instance for Istio traffic visibility.",
+				Name:    "istio",
+				Reason:  "Istio service mesh detected but Prometheus not reachable. Use --prometheus-url to point Radar to your Prometheus instance for Istio traffic visibility.",
 				DocsURL: "https://istio.io/latest/docs/ops/integrations/prometheus/",
 			}
 		}
@@ -342,6 +434,14 @@ func (m *Manager) generateRecommendation(info *ClusterInfo, detected []SourceSta
 		return &Recommendation{
 			Name:      "caretta",
 			Reason:    "Caretta provides lightweight eBPF-based traffic visibility for Calico clusters.",
+			HelmChart: carettaHelmChart(),
+			DocsURL:   "https://github.com/groundcover-com/caretta",
+		}
+
+	case "canal":
+		return &Recommendation{
+			Name:      "caretta",
+			Reason:    "Caretta provides lightweight eBPF-based traffic visibility for Canal clusters.",
 			HelmChart: carettaHelmChart(),
 			DocsURL:   "https://github.com/groundcover-com/caretta",
 		}
@@ -418,6 +518,28 @@ func (m *Manager) StreamFlows(ctx context.Context, opts FlowOptions) (<-chan Flo
 	return source.StreamFlows(ctx, opts)
 }
 
+// reconcileActiveSource keeps the active source in step with what detection just
+// found. Detection used to only ever promote, so a source that stopped being
+// available stayed active: the sources response then reported it as active and
+// not_found at once, and the flows endpoint answered 200 with an empty graph and
+// no warning to explain it — the same permanently-empty view that requiring data
+// for availability exists to prevent. Clearing it makes the flows endpoint report
+// no source, which is the truth and what a freshly started Radar already says.
+func (m *Manager) reconcileActiveSource(available []TrafficSource) {
+	if m.activeSource != nil {
+		for _, s := range available {
+			if s.Name() == m.activeSource.Name() {
+				return
+			}
+		}
+		log.Printf("[traffic] Active source %s is no longer available", m.activeSource.Name())
+		m.activeSource = nil
+	}
+	if len(available) > 0 {
+		m.activeSource = available[0]
+	}
+}
+
 // SetActiveSource sets the active traffic source by name
 func (m *Manager) SetActiveSource(name string) error {
 	m.mu.Lock()
@@ -464,11 +586,15 @@ func (m *Manager) Close() error {
 // Reset cleans up for context switching
 func Reset() {
 	// Stop any active metrics port-forward first
-	portforward.Stop()
+	portforward.Stop(portforward.OwnerTraffic)
 
 	if manager != nil {
 		manager.Close()
 	}
+	// Stop again after Close: an in-flight Connect (Close blocks on the source
+	// mutex until it finishes) may have published a forward for the old cluster
+	// after the first Stop.
+	portforward.Stop(portforward.OwnerTraffic)
 	manager = nil
 	initOnce = sync.Once{}
 }
@@ -500,28 +626,47 @@ func (m *Manager) Connect(ctx context.Context) (*portforward.ConnectionInfo, err
 		}, nil
 	}
 
-	// Check if source supports Connect
-	if caretta, ok := source.(*CarettaSource); ok {
-		return caretta.Connect(ctx, contextName)
+	switch s := source.(type) {
+	case *CarettaSource:
+		return s.Connect(ctx, contextName)
+	case *HubbleSource:
+		return s.Connect(ctx, contextName)
+	case *IstioSource:
+		return s.Connect(ctx, contextName)
+	case *BeylaSource:
+		return s.Connect(ctx, contextName)
+	default:
+		// For sources without Connect support, just report connected.
+		return &portforward.ConnectionInfo{Connected: true}, nil
 	}
-
-	if hubble, ok := source.(*HubbleSource); ok {
-		return hubble.Connect(ctx, contextName)
-	}
-
-	if istio, ok := source.(*IstioSource); ok {
-		return istio.Connect(ctx, contextName)
-	}
-
-	// For sources without Connect support, just return connected
-	return &portforward.ConnectionInfo{
-		Connected: true,
-	}, nil
 }
 
-// GetConnectionInfo returns current connection status
+// ConnectionReporter is implemented by sources that can report their own live
+// connection state. Necessary because "traffic has an active port-forward" is
+// not the same thing as "traffic is connected": every source prefers a direct
+// in-cluster connection with no forward behind it, and the Prometheus-backed
+// sources (Istio, Beyla) ride the prometheus owner's forward, not traffic's.
+type ConnectionReporter interface {
+	ConnectionInfo() *portforward.ConnectionInfo
+}
+
+// GetConnectionInfo returns live traffic connection status, as reported by the
+// active source when it can (see ConnectionReporter). The registry fallback
+// deliberately does NOT report another owner's forward: a Prometheus forward
+// for the same context means Prometheus is connected, not traffic.
 func (m *Manager) GetConnectionInfo() *portforward.ConnectionInfo {
-	return portforward.GetConnectionInfo()
+	m.mu.RLock()
+	source := m.activeSource
+	m.mu.RUnlock()
+
+	if source == nil {
+		// A leftover forward with nothing querying it is not a connection.
+		return &portforward.ConnectionInfo{Connected: false}
+	}
+	if reporter, ok := source.(ConnectionReporter); ok {
+		return reporter.ConnectionInfo()
+	}
+	return portforward.GetConnectionInfo(portforward.OwnerTraffic)
 }
 
 // SetContextName updates the current context name

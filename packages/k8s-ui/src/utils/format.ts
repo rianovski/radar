@@ -13,6 +13,10 @@
  * - < 1 core: 2 decimal places (e.g., "0.05 cores")
  */
 function formatCoresValue(cores: number): string {
+  // Zero and negatives are real values (a pool over its limit has negative
+  // headroom) — collapsing them into "<0.01 cores" fabricates a near-zero.
+  if (cores === 0) return '0 cores'
+  if (cores < 0) return `-${formatCoresValue(-cores)}`
   if (cores >= 1) {
     // Round to 1 decimal
     const rounded = Math.round(cores * 10) / 10
@@ -91,6 +95,7 @@ export function formatCPUString(cpuString: string): string {
  * @returns Formatted string like "1.5 GiB" or "256 MiB"
  */
 export function formatMemoryBytes(bytes: number): string {
+  if (bytes < 0) return `-${formatMemoryBytes(-bytes)}`
   if (bytes >= 1024 * 1024 * 1024) {
     const gib = bytes / (1024 * 1024 * 1024)
     return gib >= 10 ? `${gib.toFixed(1)} GiB` : `${gib.toFixed(2)} GiB`
@@ -115,18 +120,21 @@ export function parseMemoryToBytes(memString: string): number {
   if (!memString) return 0
 
   const str = memString.trim()
-  const match = str.match(/^(\d+(?:\.\d+)?)\s*([A-Za-z]*)$/)
+  const match = str.match(/^(-?\d+(?:\.\d+)?)\s*([A-Za-z]*)$/)
   if (!match) return 0
 
   const num = parseFloat(match[1])
   const suffix = match[2]
 
-  // Binary suffixes (powers of 1024)
+  // Binary suffixes (powers of 1024). Pi/Ei are real inputs at cluster scale —
+  // an aggregate of a thousand 1TiB nodes serializes as "1Pi".
   const binarySuffixes: Record<string, number> = {
     'Ki': 1024,
     'Mi': 1024 ** 2,
     'Gi': 1024 ** 3,
     'Ti': 1024 ** 4,
+    'Pi': 1024 ** 5,
+    'Ei': 1024 ** 6,
   }
 
   // Decimal suffixes (powers of 1000)
@@ -136,6 +144,8 @@ export function parseMemoryToBytes(memString: string): number {
     'M': 1000 ** 2,
     'G': 1000 ** 3,
     'T': 1000 ** 4,
+    'P': 1000 ** 5,
+    'E': 1000 ** 6,
   }
 
   if (suffix in binarySuffixes) {
@@ -157,6 +167,80 @@ export function parseMemoryToBytes(memString: string): number {
  */
 export function formatMemoryString(memString: string): string {
   return formatMemoryBytes(parseMemoryToBytes(memString))
+}
+
+// =============================================================================
+// Quantity Parsing (counts)
+// =============================================================================
+
+/**
+ * Every suffix a `resource.Quantity` can carry, in the API's own groupings:
+ * decimal SI in powers of 1000 (including the sub-unit n/u/m), and binary SI in
+ * powers of 1024. `K` is not canonical Kubernetes — only lowercase `k` is — but
+ * it is accepted here for the same leniency `parseMemoryToBytes` already has.
+ */
+const QUANTITY_SUFFIXES: Record<string, number> = {
+  n: 1e-9,
+  u: 1e-6,
+  m: 1e-3,
+  k: 1e3,
+  K: 1e3,
+  M: 1e6,
+  G: 1e9,
+  T: 1e12,
+  P: 1e15,
+  E: 1e18,
+  Ki: 1024,
+  Mi: 1024 ** 2,
+  Gi: 1024 ** 3,
+  Ti: 1024 ** 4,
+  Pi: 1024 ** 5,
+  Ei: 1024 ** 6,
+}
+
+/**
+ * Parse a Kubernetes `resource.Quantity` into a plain number.
+ *
+ * Counts are the surface that needs this. A Quantity's canonical serialization
+ * collapses trailing zeros into an SI suffix, so a node started with
+ * `--max-pods=1000` reports `"1k"` and not `"1000"` — read as a raw integer
+ * that is 1, so a usage bar divides by 1 instead of 1000. Any count that is
+ * a multiple of 1000 hits it.
+ *
+ * Unlike `parseMemoryToBytes`, an unrecognised suffix yields 0 rather than the
+ * bare number: a Quantity this cannot read is better reported as unknown by the
+ * caller than silently turned into a plausible-looking wrong number.
+ *
+ * @param quantity - K8s quantity like "1k", "216", "3000m", "2Gi", "1e3"
+ * @returns The value as a number, or 0 when it cannot be parsed
+ */
+export function parseQuantityToNumber(quantity: string | number | null | undefined): number {
+  if (typeof quantity === 'number') return Number.isFinite(quantity) ? quantity : 0
+  if (!quantity) return 0
+
+  const str = String(quantity).trim()
+  if (!str) return 0
+
+  // Decimal-exponent form. A Quantity's suffix is either an SI suffix or an
+  // exponent, never both, so this is decided before the suffix table — which
+  // also keeps "1E3" (1000) from being read as exa (1e18).
+  const exponent = str.match(/^([+-]?\d+(?:\.\d+)?)[eE]([+-]?\d+)$/)
+  if (exponent) {
+    const value = Number(`${exponent[1]}e${exponent[2]}`)
+    return Number.isFinite(value) ? value : 0
+  }
+
+  const match = str.match(/^([+-]?\d+(?:\.\d+)?)\s*([A-Za-z]*)$/)
+  if (!match) return 0
+
+  const num = parseFloat(match[1])
+  if (!Number.isFinite(num)) return 0
+
+  const suffix = match[2]
+  if (!suffix) return num
+
+  const multiplier = QUANTITY_SUFFIXES[suffix]
+  return multiplier === undefined ? 0 : num * multiplier
 }
 
 // =============================================================================
@@ -190,6 +274,38 @@ export function formatCompactAge(value?: string): string {
   const hours = Math.floor(minutes / 60)
   if (hours < 24) return `${hours}h`
   return `${Math.floor(hours / 24)}d`
+}
+
+// Coarse "just now / Xm / Xh / Xd" buckets for freshness labels — finer-grained
+// updates add motion in the periphery without aiding any user decision.
+export function formatLastUpdatedBucket(elapsedMs: number): string {
+  const elapsedSec = Math.max(0, Math.floor(elapsedMs / 1000))
+  if (elapsedSec < 60) return 'just now'
+  const minutes = Math.floor(elapsedSec / 60)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h`
+  return `${Math.floor(hours / 24)}d`
+}
+
+// ms until the bucket produced by formatLastUpdatedBucket would change — lets a
+// ticker re-render exactly on the boundary instead of polling every second.
+export function msToNextBucket(elapsedMs: number): number {
+  const elapsed = Math.max(0, elapsedMs)
+  if (elapsed < 60_000) return 60_000 - elapsed
+  if (elapsed < 3_600_000) return 60_000 - (elapsed % 60_000)
+  if (elapsed < 86_400_000) return 3_600_000 - (elapsed % 3_600_000)
+  return 86_400_000 - (elapsed % 86_400_000)
+}
+
+// Freshness phrasing for "Updated X" indicators: just now / Xm ago / Xh ago /
+// over a day ago. An exact day count is noise for an auto-refresh signal, so
+// anything past 24h collapses to "over a day ago".
+export function formatUpdatedAgo(elapsedMs: number): string {
+  const bucket = formatLastUpdatedBucket(elapsedMs)
+  if (bucket === 'just now') return 'just now'
+  if (bucket.endsWith('d')) return 'over a day ago'
+  return `${bucket} ago`
 }
 
 export function formatRelativeAgeTime(value?: string, fallback = '-'): string {
@@ -258,4 +374,15 @@ export function formatBytes(bytes: number): string {
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
   const i = Math.floor(Math.log(bytes) / Math.log(k))
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`
+}
+
+/** Middle-ellipsis for long identifiers (image tags, pod names): keeps the
+ *  start and the differentiating suffix. Returns the input when it fits. */
+export function midTruncate(s: string, max = 24): string {
+  if (s.length <= max) return s
+  if (max <= 1) return '…'.slice(0, Math.max(0, max))
+  if (max <= 3) return `${s.slice(0, max - 1)}…`
+  const tail = Math.min(10, Math.floor(max / 2) - 1)
+  const head = max - tail - 1
+  return `${s.slice(0, head)}…${s.slice(-tail)}`
 }

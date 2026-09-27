@@ -1,0 +1,24 @@
+---
+# A `clusters` CR from a third engine. Renders the generic drawer.
+apiVersion: apps.kubeblocks.io/v1alpha1
+kind: Cluster
+metadata:
+  name: kb-mysql
+  namespace: pg
+spec:
+  clusterDefinitionRef: mysql
+  terminationPolicy: Delete
+---
+# A `backups` CR from Velero, sharing the plural with CNPG's Backup. Its status
+# is patched by the script so the row renders Velero's own column set
+# (Storage / Scope / Expires / Errors) rather than CNPG's.
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: velero-nightly-cluster
+  namespace: pg
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s

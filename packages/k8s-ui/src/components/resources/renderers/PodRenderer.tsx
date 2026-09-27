@@ -1,12 +1,31 @@
 import { useState, type ReactNode, type JSX } from 'react'
-import { Server, HardDrive, Terminal as TerminalIcon, FileText, Activity, CirclePlay, FolderOpen, List, Eye, EyeOff } from 'lucide-react'
+import { Server, HardDrive, Terminal as TerminalIcon, FileText, Activity, CirclePlay, FolderOpen, List, Eye, EyeOff, Shield } from 'lucide-react'
 import { clsx } from 'clsx'
-import { Section, PropertyList, Property, ConditionsSection, CopyHandler, AlertBanner, ResourceLink } from '../../ui/drawer-components'
-import { formatResources, formatDuration, getPodProblems, getPodPhaseDisplay, healthColors, SEVERITY_DOT_COLOR } from '../resource-utils'
+import { PolicySection } from './PolicySection'
+import type { PolicyResourceResponse } from '../../../types/policy'
+import { Section, PropertyList, Property, ConditionsSection, CopyHandler, AlertBanner, ResourceLink, useOperationalIssuesShown } from '../../ui/drawer-components'
+import { formatResources, formatDuration, getPodProblems, getPodPhaseDisplay, healthColors, SEVERITY_DOT_COLOR, getDefaultContainerName } from '../resource-utils'
 import { getResourceStatusColor, SEVERITY_BADGE_BORDERED } from '../../../utils/badge-colors'
-import type { ResolvedEnvFrom } from '../../../types'
+import {
+  rbacVerbBadgeClass,
+  rbacResourceBadgeClass,
+  rbacApiGroupBadgeClass,
+} from '../../../utils/rbac-badges'
+import { resolvedEnvFromKey } from '../../../utils/env-from'
+import { detectBlastRadius, rulePermissivenessScore } from '../../../utils/rbac-blast-radius'
+import { RBACErrorSection, isRBACUnavailable } from './RBACErrorSection'
+import { NamespaceLimitRangeLink } from './LimitRangeRenderer'
+import type {
+  PodEnvironmentResponse,
+  PodEnvironmentRevealResponse,
+  ResolvedEnvFrom,
+  RBACSubjectResponse,
+  RBACPolicyRule,
+} from '../../../types'
 import { Tooltip } from '../../ui/Tooltip'
 import { MetricsChart } from '../../ui/MetricsChart'
+import { MetricsUnavailableNotice } from './MetricsUnavailableNotice'
+import { ContainerEnvironmentSection } from './ContainerEnvironmentSection'
 
 function parseValidDate(dateStr: string): Date | null {
   const d = new Date(dateStr)
@@ -54,6 +73,10 @@ interface PodRendererProps {
   onNavigate?: (ref: { kind: string; namespace: string; name: string }) => void
   /** When provided, container-level Logs buttons call this instead of onOpenLogsPanel */
   onOpenLogs?: (podName: string, containerName: string) => void
+  /** Host-wired for pending pods on Karpenter clusters: opens the Capacity
+   *  Demand view, which groups pending pods by scheduling signature and
+   *  evaluates every NodePool against them. */
+  onEvaluateCapacity?: () => void
   // Platform capabilities
   canExec?: boolean
   canViewLogs?: boolean
@@ -65,7 +88,8 @@ interface PodRendererProps {
   renderPortAction?: (props: { namespace: string; podName: string; port: number; protocol: string; disabled?: boolean }) => ReactNode
   // Metrics data injection
   metrics?: { containers?: any[]; timestamp?: string }
-  metricsHistory?: { containers?: any[]; collectionError?: string }
+  metricsHistory?: { containers?: any[]; collectionError?: string; metricsUnavailableReason?: string; metricsUnavailableDiagnosis?: string }
+  metricsUnavailable?: boolean
   hideMetricsServer?: boolean
   // Filesystem browser render props
   renderImageBrowser?: (props: { image: string; namespace: string; podName: string; pullSecrets: string[]; onClose: () => void; onSwitchToPodFiles?: () => void }) => ReactNode
@@ -75,6 +99,25 @@ interface PodRendererProps {
    * When provided, expands ConfigMap/Secret keys inline instead of showing "(all keys)".
    */
   resolvedEnvFrom?: ResolvedEnvFrom
+  environment?: PodEnvironmentResponse
+  environmentLoading?: boolean
+  environmentError?: Error | null
+  onRevealEnvironment?: (container: string, variable: string) => Promise<PodEnvironmentRevealResponse>
+  /**
+   * RBAC reverse-lookup for the Pod's ServiceAccount. Undefined means the host
+   * didn't wire the fetch (Permissions section is omitted). Null means the
+   * fetch failed; the section renders an inline error.
+   */
+  rbacData?: RBACSubjectResponse | null
+  rbacLoading?: boolean
+  rbacError?: Error | null
+  /** Undefined means the host didn't wire the fetch; the section is omitted. */
+  policyData?: PolicyResourceResponse | null
+  policyLoading?: boolean
+  policyError?: Error | null
+  /** Names of the LimitRanges in this Pod's namespace. Absent while the lookup
+   *  is pending or unreadable, which leaves the contextual link unrendered. */
+  namespaceLimitRangeNames?: string[] | null
 }
 
 // ── Env vars section — extracted to use hooks (useState for reveal) ──────────
@@ -180,7 +223,12 @@ function EnvVarsSection({
                   const isSecret = !!ef.secretRef
                   const sourceName = ef.configMapRef?.name ?? ef.secretRef?.name ?? 'unknown'
                   const prefix = ef.configMapRef ? 'ConfigMap' : ef.secretRef ? 'Secret' : 'Source'
-                  const resolved = resolvedEnvFrom?.[sourceName]
+                  const sourceKey = ef.configMapRef
+                    ? resolvedEnvFromKey('configmap', sourceName)
+                    : ef.secretRef
+                      ? resolvedEnvFromKey('secret', sourceName)
+                      : undefined
+                  const resolved = sourceKey ? resolvedEnvFrom?.[sourceKey] : undefined
                   return (
                     <div key={i} className="mb-1">
                       <div className="flex items-center gap-1.5 text-xs font-mono py-0.5">
@@ -228,6 +276,7 @@ export function PodRenderer({
   copied,
   onNavigate,
   onOpenLogs: onOpenLogsOverride,
+  onEvaluateCapacity,
   canExec,
   canViewLogs,
   canPortForward,
@@ -236,23 +285,47 @@ export function PodRenderer({
   renderPortAction,
   metrics,
   metricsHistory,
+  metricsUnavailable,
   hideMetricsServer,
   renderImageBrowser,
   renderPodBrowser,
   resolvedEnvFrom,
+  environment,
+  environmentLoading,
+  environmentError,
+  onRevealEnvironment,
+  rbacData,
+  rbacLoading,
+  rbacError,
+  policyData,
+  policyLoading,
+  policyError,
+  namespaceLimitRangeNames,
 }: PodRendererProps) {
   const containerStatuses = data.status?.containerStatuses || []
   const containers = data.spec?.containers || []
   const initContainers = data.spec?.initContainers || []
   const initContainerStatuses = data.status?.initContainerStatuses || []
+  const hasEnvironmentDeclarations = [...initContainers, ...containers].some(
+    (container: any) => container.env?.length > 0 || container.envFrom?.length > 0,
+  )
+  const hasResolvedEnvironmentRows = environment?.containers.some(
+    container => container.rows.length > 0 || container.truncated,
+  ) ?? false
 
   const namespace = data.metadata?.namespace
   const podName = data.metadata?.name
   const isRunning = data.status?.phase === 'Running'
 
-  // Check for problems
+  // Check for problems. Suppressed when the detail already shows the dedicated
+  // Operational Issues section (the Issues pipeline covers the same pod failures,
+  // richer) — avoids showing the same crashloop twice.
+  const operationalIssuesShown = useOperationalIssuesShown()
   const podProblems = getPodProblems(data)
-  const hasProblems = podProblems.length > 0
+  const hasProblems = podProblems.length > 0 && !operationalIssuesShown
+  const showMetricsUnavailable = !!metricsUnavailable && !metricsHistory?.collectionError
+  const hasMetricsHistory = !!metricsHistory?.containers?.length
+  const currentMetrics = metricsUnavailable ? undefined : metrics
 
   // Image filesystem modal state
   const [selectedImage, setSelectedImage] = useState<string | null>(null)
@@ -262,7 +335,7 @@ export function PodRenderer({
   const [podFilesContainer, setPodFilesContainer] = useState<string | null>(null)
 
   const handleOpenTerminal = (containerName?: string) => {
-    const container = containerName || containers[0]?.name
+    const container = containerName || getDefaultContainerName(data)
     if (namespace && podName && container) {
       onOpenTerminal?.({
         namespace,
@@ -321,13 +394,28 @@ export function PodRenderer({
         <AlertBanner variant="error" title="Issues Detected">
           <ul className="text-xs space-y-1">
             {podProblems.map((p, i) => (
-              <li key={i} className="flex items-center gap-1.5">
-                <span className={clsx('w-1.5 h-1.5 rounded-full shrink-0', SEVERITY_DOT_COLOR[p.severity])} />
-                <span className="text-red-600 dark:text-red-400">{p.message}</span>
+              <li key={i} className="flex items-start gap-1.5">
+                <span className={clsx('w-1.5 h-1.5 rounded-full shrink-0 mt-1', SEVERITY_DOT_COLOR[p.severity])} />
+                <span className="min-w-0 break-words text-red-600 dark:text-red-400">
+                  {p.message}
+                  {p.detail && <span className="text-theme-text-secondary">: {p.detail}</span>}
+                </span>
               </li>
             ))}
           </ul>
         </AlertBanner>
+      )}
+
+      {onEvaluateCapacity && (
+        <div className="mb-3">
+          <button
+            type="button"
+            onClick={onEvaluateCapacity}
+            className="text-xs font-medium text-accent-text hover:underline"
+          >
+            Evaluate against Karpenter NodePools →
+          </button>
+        </div>
       )}
 
       {/* Status section */}
@@ -508,6 +596,10 @@ export function PodRenderer({
       )}
 
       {/* Container Status */}
+      {policyData !== undefined && (
+        <PolicySection data={policyData} loading={policyLoading} error={policyError} />
+      )}
+
       <Section title="Containers" icon={HardDrive} defaultExpanded>
         <div className="space-y-3">
           {containers.map((container: any) => {
@@ -521,6 +613,10 @@ export function PodRenderer({
             const lastTermination = status?.lastState?.terminated
             const currentWaiting = status?.state?.waiting
             const currentTerminated = status?.state?.terminated
+            // A container that exited 0 (a completed Job pod) is a success, not a
+            // failure — tone its badges/text sky, not red, so the drawer agrees
+            // with the calm "Completed" table badge instead of screaming red.
+            const terminatedOk = currentTerminated?.exitCode === 0
 
             return (
               <div key={container.name} className="card-inner-lg">
@@ -559,14 +655,17 @@ export function PodRenderer({
                     )}
                     <span className={clsx(
                       'badge',
-                      isReady ? SEVERITY_BADGE_BORDERED.success : SEVERITY_BADGE_BORDERED.error
+                      isReady ? SEVERITY_BADGE_BORDERED.success :
+                      terminatedOk ? SEVERITY_BADGE_BORDERED.info :
+                      SEVERITY_BADGE_BORDERED.error
                     )}>
-                      {isReady ? 'Ready' : 'Not Ready'}
+                      {isReady ? 'Ready' : terminatedOk ? 'Completed' : 'Not Ready'}
                     </span>
                     <span className={clsx(
                       'badge',
                       stateKey === 'running' ? SEVERITY_BADGE_BORDERED.success :
                       stateKey === 'waiting' ? SEVERITY_BADGE_BORDERED.warning :
+                      terminatedOk ? SEVERITY_BADGE_BORDERED.info :
                       SEVERITY_BADGE_BORDERED.error
                     )}>
                       {stateKey}
@@ -594,9 +693,10 @@ export function PodRenderer({
                       )}
                     </div>
                   )}
-                  {/* Show current terminated reason */}
+                  {/* Show current terminated reason — sky for a clean exit-0
+                      completion, red only for a genuine failure. */}
                   {currentTerminated?.reason && (
-                    <div className="text-red-400 flex items-center gap-1">
+                    <div className={clsx('flex items-center gap-1', terminatedOk ? 'text-sky-500 dark:text-sky-400' : 'text-red-400')}>
                       <span className="font-medium">Terminated: {currentTerminated.reason}</span>
                       {currentTerminated.exitCode !== undefined && currentTerminated.exitCode !== 0 && (
                         <span className="text-theme-text-tertiary">(exit code {currentTerminated.exitCode})</span>
@@ -668,10 +768,39 @@ export function PodRenderer({
             )
           })}
         </div>
+        <NamespaceLimitRangeLink
+          namespace={namespace || ''}
+          names={namespaceLimitRangeNames}
+          scope="pod"
+          onNavigate={onNavigate}
+        />
       </Section>
 
       {/* Environment Variables */}
-      {[...initContainers, ...containers].some((c: any) => c.env?.length > 0 || c.envFrom?.length > 0) && (
+      {environment && hasResolvedEnvironmentRows && (
+        <ContainerEnvironmentSection
+          environment={environment}
+          namespace={namespace}
+          onNavigate={onNavigate}
+          onReveal={onRevealEnvironment}
+          onCopy={onCopy}
+          copied={copied}
+        />
+      )}
+      {hasEnvironmentDeclarations && environmentLoading && !environment && (
+        <Section title="Environment Variables" icon={List} defaultExpanded={false}>
+          <div className="text-xs text-theme-text-tertiary">Loading variable sources…</div>
+        </Section>
+      )}
+      {hasEnvironmentDeclarations && environmentError && !environment && (
+        <Section title="Environment Variables" icon={List} defaultExpanded={false}>
+          <div className="space-y-2 text-xs">
+            <p className="text-theme-text-secondary">Variable sources could not be loaded.</p>
+            <p className="text-theme-text-tertiary">{environmentError.message}</p>
+          </div>
+        </Section>
+      )}
+      {(!environment || !hasResolvedEnvironmentRows) && !environmentLoading && !environmentError && hasEnvironmentDeclarations && (
         <EnvVarsSection
           initContainers={initContainers}
           containers={containers}
@@ -680,96 +809,128 @@ export function PodRenderer({
       )}
 
       {/* Resource Usage (from metrics-server) — hidden when Prometheus has CPU/memory data */}
-      {!hideMetricsServer && !!(metrics?.containers?.length || metricsHistory?.containers?.length || metricsHistory?.collectionError) && (
+      {!hideMetricsServer && !!(currentMetrics?.containers?.length || hasMetricsHistory || metricsHistory?.collectionError || showMetricsUnavailable) && (
         <Section title="Resource Usage" icon={Activity} defaultExpanded>
-          {metricsHistory?.collectionError && !metricsHistory?.containers?.length && (
+          {showMetricsUnavailable && (
+            <MetricsUnavailableNotice rawError={metricsHistory?.metricsUnavailableReason} diagnosis={metricsHistory?.metricsUnavailableDiagnosis} />
+          )}
+          {metricsHistory?.collectionError && (
             <div className="mb-3 rounded-lg border border-yellow-500/30 bg-yellow-500/5 px-3 py-2 text-xs text-yellow-400">
               <span className="font-medium">Metrics collection error:</span>{' '}
               <span className="break-all">{metricsHistory.collectionError}</span>
             </div>
           )}
-          <div className="space-y-4">
-            {(metricsHistory?.containers || metrics?.containers || []).map((historyContainer) => {
-              // Find current metrics for this container
-              const currentMetrics = metrics?.containers?.find(c => c.name === historyContainer.name)
-              // Find the container spec to compare against limits
-              const containerSpec = containers.find((c: any) => c.name === historyContainer.name)
-              const limits = containerSpec?.resources?.limits
-              const requests = containerSpec?.resources?.requests
+          {(hasMetricsHistory || !showMetricsUnavailable) && (
+            <div className="space-y-4">
+              {(metricsHistory?.containers || currentMetrics?.containers || []).map((historyContainer) => {
+                // Find current metrics for this container
+                const currentContainerMetrics = currentMetrics?.containers?.find(c => c.name === historyContainer.name)
+                // Find the container spec to compare against limits. Native
+                // sidecars live in initContainers (restartPolicy Always), so
+                // fall through to them or their chart shows no limit line.
+                const containerSpec = containers.find((c: any) => c.name === historyContainer.name)
+                  || initContainers.find((c: any) => c.name === historyContainer.name && c.restartPolicy === 'Always')
+                const limits = containerSpec?.resources?.limits
+                const requests = containerSpec?.resources?.requests
 
-              // Get historical data points (from history or empty)
-              const dataPoints = 'dataPoints' in historyContainer ? historyContainer.dataPoints : []
+                // Get historical data points (from history or empty)
+                const dataPoints = 'dataPoints' in historyContainer ? historyContainer.dataPoints : []
 
-              return (
-                <div key={historyContainer.name} className="card-inner-lg">
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-sm font-medium text-theme-text-primary">{historyContainer.name}</span>
+                return (
+                  <div key={historyContainer.name} className="card-inner-lg">
+                    <div className="flex items-center justify-between mb-3">
+                      <span className="text-sm font-medium text-theme-text-primary">{historyContainer.name}</span>
+                    </div>
+
+                    {dataPoints && dataPoints.length > 0 ? (
+                      <div className="grid grid-cols-2 gap-6">
+                        <div>
+                          <div className="text-xs text-theme-text-tertiary mb-2">CPU</div>
+                          <MetricsChart
+                            dataPoints={dataPoints}
+                            type="cpu"
+                            height={80}
+                            showAxis={true}
+                            limit={limits?.cpu}
+                            request={requests?.cpu}
+                          />
+                        </div>
+                        <div>
+                          <div className="text-xs text-theme-text-tertiary mb-2">Memory</div>
+                          <MetricsChart
+                            dataPoints={dataPoints}
+                            type="memory"
+                            height={80}
+                            showAxis={true}
+                            limit={limits?.memory}
+                            request={requests?.memory}
+                          />
+                        </div>
+                      </div>
+                    ) : currentContainerMetrics ? (
+                      /* Fallback to simple display if no history yet */
+                      <div className="grid grid-cols-2 gap-4 text-xs">
+                        <div>
+                          <div className="text-theme-text-tertiary mb-1">CPU</div>
+                          <div className="flex items-baseline gap-1">
+                            <span className="text-sm font-medium text-blue-400">{currentContainerMetrics.usage.cpu}</span>
+                            {limits?.cpu && (
+                              <span className="text-theme-text-tertiary">/ {limits.cpu} limit</span>
+                            )}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-theme-text-tertiary mb-1">Memory</div>
+                          <div className="flex items-baseline gap-1">
+                            <span className="text-sm font-medium text-purple-400">{currentContainerMetrics.usage.memory}</span>
+                            {limits?.memory && (
+                              <span className="text-theme-text-tertiary">/ {limits.memory} limit</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-xs text-theme-text-tertiary">Collecting metrics data...</div>
+                    )}
                   </div>
-
-                  {dataPoints && dataPoints.length > 0 ? (
-                    <div className="grid grid-cols-2 gap-6">
-                      <div>
-                        <div className="text-xs text-theme-text-tertiary mb-2">CPU</div>
-                        <MetricsChart
-                          dataPoints={dataPoints}
-                          type="cpu"
-                          height={80}
-                          showAxis={true}
-                          limit={limits?.cpu}
-                          request={requests?.cpu}
-                        />
-                      </div>
-                      <div>
-                        <div className="text-xs text-theme-text-tertiary mb-2">Memory</div>
-                        <MetricsChart
-                          dataPoints={dataPoints}
-                          type="memory"
-                          height={80}
-                          showAxis={true}
-                          limit={limits?.memory}
-                          request={requests?.memory}
-                        />
-                      </div>
-                    </div>
-                  ) : currentMetrics ? (
-                    /* Fallback to simple display if no history yet */
-                    <div className="grid grid-cols-2 gap-4 text-xs">
-                      <div>
-                        <div className="text-theme-text-tertiary mb-1">CPU</div>
-                        <div className="flex items-baseline gap-1">
-                          <span className="text-sm font-medium text-blue-400">{currentMetrics.usage.cpu}</span>
-                          {limits?.cpu && (
-                            <span className="text-theme-text-tertiary">/ {limits.cpu} limit</span>
-                          )}
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-theme-text-tertiary mb-1">Memory</div>
-                        <div className="flex items-baseline gap-1">
-                          <span className="text-sm font-medium text-purple-400">{currentMetrics.usage.memory}</span>
-                          {limits?.memory && (
-                            <span className="text-theme-text-tertiary">/ {limits.memory} limit</span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="text-xs text-theme-text-tertiary">Collecting metrics data...</div>
-                  )}
-                </div>
-              )
-            })}
-          </div>
-          {metrics?.timestamp && (
+                )
+              })}
+            </div>
+          )}
+          {!showMetricsUnavailable && currentMetrics?.timestamp && (
             <div className="mt-2 text-xs text-theme-text-tertiary">
-              Last updated: {new Date(metrics.timestamp).toLocaleTimeString()}
+              Last updated: {new Date(currentMetrics.timestamp).toLocaleTimeString()}
             </div>
           )}
         </Section>
       )}
 
-      {/* Conditions */}
-      <ConditionsSection conditions={data.status?.conditions} />
+      {/* Conditions. A completed pod's Ready/ContainersReady flip to False with
+          reason "PodCompleted" — that's expected for a finished pod, not a failure,
+          so tone it neutral (gray) instead of red. Gated on the PodCompleted reason
+          so a genuinely not-ready pod (any other reason) still reads red. */}
+      <ConditionsSection
+        conditions={data.status?.conditions}
+        getConditionTone={(cond) =>
+          cond?.status === 'False' && cond?.reason === 'PodCompleted' ? 'unknown' : undefined
+        }
+      />
+
+      {/* Permissions (via ServiceAccount) — placed below the diagnostic-
+       *  signal sections (status, containers, resource usage, conditions)
+       *  because it answers an incident/audit question ("if this Pod is
+       *  compromised, what does the attacker get?"), not a daily-browsing
+       *  one. Only renders when the host wired the RBAC fetch. */}
+      {rbacData !== undefined && (
+        <PodPermissionsSection
+          saName={data.spec?.serviceAccountName || 'default'}
+          namespace={data.metadata?.namespace || ''}
+          rbacData={rbacData}
+          loading={!!rbacLoading}
+          error={rbacError ?? null}
+          onNavigate={onNavigate}
+        />
+      )}
 
       {/* Image Filesystem Modal (via render prop) */}
       {selectedImage && renderImageBrowser && renderImageBrowser({
@@ -799,5 +960,175 @@ export function PodRenderer({
         },
       })}
     </>
+  )
+}
+
+// ============================================================================
+// POD PERMISSIONS SECTION (via ServiceAccount)
+// ============================================================================
+// Frames the SA's permissions in attacker terms — "if this Pod is compromised,
+// here's what the attacker gets". No OSS dashboard surfaces this view cleanly
+// today; the goal is to make blast radius legible without leaving the Pod page.
+
+interface PodPermissionsSectionProps {
+  saName: string
+  namespace: string
+  rbacData: RBACSubjectResponse | null
+  loading: boolean
+  error: Error | null
+  onNavigate?: (ref: { kind: string; namespace: string; name: string }) => void
+}
+
+// Verb categorization for the permissiveness scorer + blast-radius detector.
+// Badge colors come from the shared rbacVerbBadgeClass (theme-aware).
+// Blast-radius detection and scoring shared with Workload / ServiceAccount
+// renderers — see utils/rbac-blast-radius.ts.
+
+function PodPermissionsSection({
+  saName,
+  namespace,
+  rbacData,
+  loading,
+  error,
+  onNavigate,
+}: PodPermissionsSectionProps) {
+  const title = `Permissions via ServiceAccount: ${saName}`
+
+  if (loading) {
+    return (
+      <Section title={title} icon={Shield}>
+        <div className="text-sm text-theme-text-tertiary">Loading RBAC graph…</div>
+      </Section>
+    )
+  }
+  if (error) {
+    // Permissions is a bonus section here; when RBAC is simply not available
+    // (cluster-static) or forbidden, hide it rather than repeat a note on every
+    // Pod. Genuine faults still surface.
+    if (isRBACUnavailable(error)) return null
+    return <RBACErrorSection title={title} error={error} />
+  }
+  if (!rbacData) return null
+
+  const direct = rbacData.direct ?? []
+  const inheritedAll = (rbacData.inheritedFromGroups ?? []).flatMap((g) => g.bindings)
+  const inheritedCount = inheritedAll.length
+  const directCount = direct.length
+  const ruleCount = rbacData.flat?.length ?? 0
+
+  const blastReasons = detectBlastRadius(rbacData)
+
+  // Top-5 most-permissive rules across the full flat set.
+  const sortedRules = [...(rbacData.flat ?? [])].sort(
+    (a, b) => rulePermissivenessScore(b) - rulePermissivenessScore(a),
+  )
+  const previewRules = sortedRules.slice(0, 5)
+  const moreCount = Math.max(0, sortedRules.length - previewRules.length)
+
+  // Default collapsed: most operators opening a Pod want Status / Containers
+  // / Resource Usage / Events, not "what could this Pod do if compromised".
+  // That's an incident-response question, not daily-browsing. Auto-expand
+  // when something *is* risky so the page still shouts when it should.
+  const hasBlastRadius = blastReasons.length > 0
+  return (
+    <Section title={title} icon={Shield} defaultExpanded={hasBlastRadius}>
+      {/* Blast-radius alert — only when something risky was detected. */}
+      {blastReasons.length > 0 && (
+        <AlertBanner variant="warning" title="Blast radius">
+          <div className="text-xs">
+            If this Pod is compromised, the attacker inherits the
+            ServiceAccount's permissions, which include:
+          </div>
+          <ul className="mt-1.5 text-xs space-y-1">
+            {blastReasons.map((r, i) => (
+              <li key={i}>
+                <span className="text-theme-text-secondary">
+                  {r.binding.binding.kind} <span className="font-medium">{r.binding.binding.name}</span>
+                </span>{' '}
+                <span className="text-theme-text-tertiary">{r.reason}</span>
+              </li>
+            ))}
+          </ul>
+        </AlertBanner>
+      )}
+
+      {/* One-line summary */}
+      <div className="text-xs text-theme-text-tertiary mb-3">
+        {directCount} direct binding{directCount === 1 ? '' : 's'} ·{' '}
+        {inheritedCount} inherited via group
+        {inheritedCount === 1 ? '' : 's'} ·{' '}
+        {ruleCount} distinct rule{ruleCount === 1 ? '' : 's'}
+        {rbacData.truncated && <span className="text-orange-400"> (truncated)</span>}
+      </div>
+
+      {/* Top-N most-permissive rules. When the SA has zero permissions,
+       *  call that out explicitly — silence would look like a fetch error. */}
+      {previewRules.length === 0 ? (
+        <div className="text-sm text-theme-text-tertiary">
+          This ServiceAccount has no effective permissions in the cluster.
+        </div>
+      ) : (
+        <div className="space-y-1">
+          {previewRules.map((r, i) => (
+            <PodRulePreviewLine key={i} rule={r} />
+          ))}
+          {moreCount > 0 && (
+            <div className="text-xs text-theme-text-tertiary">
+              +{moreCount} more rule{moreCount === 1 ? '' : 's'} — open the
+              ServiceAccount to see the full grant.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Footer link to the SA detail page where Effective Permissions
+       *  has the per-binding provenance + full rules. */}
+      <div className="mt-3 text-xs">
+        <ResourceLink
+          name={saName}
+          kind="serviceaccounts"
+          namespace={namespace}
+          label="View full permissions →"
+          onNavigate={onNavigate}
+        />
+      </div>
+    </Section>
+  )
+}
+
+function PodRulePreviewLine({ rule }: { rule: RBACPolicyRule }) {
+  const verbs = rule.verbs ?? []
+  const resources = rule.resources ?? []
+  const nonResourceURLs = rule.nonResourceURLs ?? []
+  const groups = rule.apiGroups ?? []
+  const isNonResource = resources.length === 0 && nonResourceURLs.length > 0
+  return (
+    <div className="flex items-center gap-1 flex-wrap text-xs">
+      {verbs.map((v) => (
+        <span key={v} className={clsx('badge', rbacVerbBadgeClass(v))}>{v}</span>
+      ))}
+      <span className="text-theme-text-secondary">on</span>
+      {isNonResource ? (
+        nonResourceURLs.map((u) => (
+          <span key={u} className="badge font-mono bg-theme-elevated text-theme-text-secondary">{u}</span>
+        ))
+      ) : (
+        resources.map((r) => (
+          <span key={r} className={clsx('badge', rbacResourceBadgeClass)}>
+            {r === '*' ? '*' : r}
+          </span>
+        ))
+      )}
+      {!isNonResource && groups.length > 0 && groups.some((g) => g !== '') && (
+        <>
+          <span className="text-theme-text-secondary">in</span>
+          {groups.map((g) => (
+            <span key={g} className={clsx('badge', rbacApiGroupBadgeClass)}>
+              {g === '' ? 'core' : g}
+            </span>
+          ))}
+        </>
+      )}
+    </div>
   )
 }

@@ -125,6 +125,25 @@ func (a *topologyResourceProvider) Secrets() ([]*corev1.Secret, error) {
 	return lister.List(labels.Everything())
 }
 
+func (a *topologyResourceProvider) ServiceAccounts() ([]*corev1.ServiceAccount, error) {
+	lister := a.cache.ServiceAccounts()
+	if lister == nil {
+		if a.cache.IsDeferredPending(k8score.ServiceAccounts) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("serviceaccounts not available (RBAC not granted)")
+	}
+	return lister.List(labels.Everything())
+}
+
+func (a *topologyResourceProvider) Namespaces() ([]*corev1.Namespace, error) {
+	lister := a.cache.Namespaces()
+	if lister == nil {
+		return nil, fmt.Errorf("namespaces not available (RBAC not granted)")
+	}
+	return lister.List(labels.Everything())
+}
+
 func (a *topologyResourceProvider) PersistentVolumeClaims() ([]*corev1.PersistentVolumeClaim, error) {
 	lister := a.cache.PersistentVolumeClaims()
 	if lister == nil {
@@ -207,6 +226,10 @@ func (a *topologyDynamicProvider) List(gvr schema.GroupVersionResource, namespac
 	return a.dynCache.List(gvr, namespace)
 }
 
+func (a *topologyDynamicProvider) ListNamespaces(gvr schema.GroupVersionResource, namespaces []string) ([]*unstructured.Unstructured, error) {
+	return a.dynCache.ListNamespaces(gvr, namespaces)
+}
+
 func (a *topologyDynamicProvider) Get(gvr schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, error) {
 	return a.dynCache.Get(gvr, namespace, name)
 }
@@ -233,4 +256,8 @@ func (a *topologyDynamicProvider) GetKindForGVR(gvr schema.GroupVersionResource)
 
 func (a *topologyDynamicProvider) IsCRD(kind string) bool {
 	return a.discovery.IsCRD(kind)
+}
+
+func (a *topologyDynamicProvider) IsCRDGVR(gvr schema.GroupVersionResource) bool {
+	return a.discovery.IsCRDGVR(gvr)
 }

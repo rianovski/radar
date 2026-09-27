@@ -29,11 +29,20 @@
   --color-error-light: #F87171;
   --color-error-dark: #DC2626;
   --color-info: #3B82F6;
+  /* alert = the orange tier between warning (amber) and error (red). The
+     .status-alert class predates these tokens and inlines the same hues. */
+  --color-alert: #F97316;
+  --color-alert-light: #FB923C;
+  --color-alert-dark: #EA580C;
 
-  /* ── Backgrounds ──
-     base     = page bg, header/toolbar chrome (barely-blue cool gray)
-     surface  = sidebars, content panels, cards (near-white)
+  /* ── Backgrounds (elevation scale) ──
+     sidebar  = primary nav rail — the DEEPEST layer, its own token so the rail
+                reads as chrome on every view regardless of what content puts
+                next to it (vs. borrowing contrast from an adjacent surface pane)
+     base     = content floor, page bg, header/toolbar chrome (barely-blue gray)
+     surface  = content panels, cards, tables, facet panes (raised, near-white)
      elevated = inputs, count badges, dropdowns (very lightly blue-tinted) */
+  --bg-sidebar: light-dark(#E7ECF5, #080B16);
   --bg-base: light-dark(#F0F3F9, #0B0F1E);
   --bg-surface: light-dark(#F8FBFE, #14192A);
   --bg-elevated: light-dark(#E6ECF5, #1E2338);
@@ -45,11 +54,16 @@
   --text-secondary: light-dark(#555860, #D8DAE0);
   --text-tertiary: light-dark(#6B7080, #B0B5C0);
   --text-disabled: light-dark(#A0A4AC, #6A7080);
+  --warning-text: light-dark(#92400E, #FBBF24);
 
   /* ── Borders (lightly blue-tinted in light mode) ── */
   --border-default: light-dark(#D8E0EE, #222840);
   --border-light: light-dark(#CDD6E8, #2C324A);
   --border-subtle: light-dark(rgba(74, 100, 180, 0.07), rgba(255, 255, 255, 0.04));
+  /* Emphasis edge for the focused/expanded card in a queue — must read clearly
+     against sibling cards' --border-default, unlike --border-light's one-notch
+     step. */
+  --border-emphasis: light-dark(#96A8CA, rgba(255, 255, 255, 0.22));
   --border-focus: var(--color-brand);
 
   /* ── Accent ── */
@@ -104,6 +118,16 @@
   --group-icon-app: light-dark(#059669, #34d399);
   --group-icon-label: light-dark(#d97706, #fbbf24);
 
+  /* ── Terminal / console surface (intentionally dark in BOTH themes — it's a
+     console, not chrome). The outer border darkens on a light page and lightens
+     on a dark one so the block stays defined; the inner divider and text stay
+     light because the surface is always dark. ── */
+  --terminal-bg: #0F172A;
+  --terminal-border: light-dark(#1E293B, rgba(255, 255, 255, 0.10));
+  --terminal-divider: rgba(255, 255, 255, 0.10);
+  --terminal-label: #94A3B8;
+  --terminal-text: #CBD5E1;
+
   /* ── ANSI terminal colors (theme-aware for log viewer) ── */
   --ansi-black:   light-dark(#3b3b3b, #4c4c4c);
   --ansi-red:     light-dark(#cd3131, #cd3131);
@@ -138,6 +162,6 @@
   --shadow-sm: 0 1px 3px rgba(0,0,0,0.3), 0 1px 2px rgba(0,0,0,0.2), 0 0 0 1px rgba(255,255,255,0.06);
   --shadow-md: 0 4px 12px -2px rgba(0,0,0,0.35), 0 2px 4px rgba(0,0,0,0.15), 0 0 0 1px rgba(255,255,255,0.06);
   --shadow-lg: 0 12px 32px -6px rgba(0,0,0,0.3), 0 4px 8px rgba(0,0,0,0.1);
-  --shadow-drawer: -16px 0 60px rgba(0,0,0,0.6), -6px 0 20px rgba(0,0,0,0.4);
+  --shadow-drawer: -12px 0 36px rgba(0,0,0,0.45), -4px 0 14px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.06);
   --topology-node-shadow: 0 2px 6px rgba(0,0,0,0.2), 0 6px 16px rgba(0,0,0,0.15);
 }

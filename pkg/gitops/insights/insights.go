@@ -3,17 +3,20 @@ package insights
 import (
 	"fmt"
 	"log"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/skyhook-io/radar/pkg/resourceid"
+
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/skyhook-io/radar/pkg/gitops"
+	"github.com/skyhook-io/radar/pkg/gitops/diagnose"
 	gitopstree "github.com/skyhook-io/radar/pkg/gitops/tree"
+	"github.com/skyhook-io/radar/pkg/timeutil"
 )
 
 type Insight struct {
@@ -33,19 +36,20 @@ type Insight struct {
 }
 
 type Summary struct {
-	Tool             string `json:"tool"`
-	Kind             string `json:"kind"`
-	Namespace        string `json:"namespace"`
-	Name             string `json:"name"`
-	Sync             string `json:"sync,omitempty"`
-	Health           string `json:"health,omitempty"`
-	OperationPhase   string `json:"operationPhase,omitempty"`
-	OperationMessage string `json:"operationMessage,omitempty"`
-	Source           string `json:"source,omitempty"`
-	TargetRevision   string `json:"targetRevision,omitempty"`
-	LastRevision     string `json:"lastRevision,omitempty"`
-	LastReconcile    string `json:"lastReconcile,omitempty"`
-	PartialReason    string `json:"partialReason,omitempty"`
+	Tool                string `json:"tool"`
+	Kind                string `json:"kind"`
+	Namespace           string `json:"namespace"`
+	Name                string `json:"name"`
+	Sync                string `json:"sync,omitempty"`
+	Health              string `json:"health,omitempty"`
+	OperationPhase      string `json:"operationPhase,omitempty"`
+	OperationMessage    string `json:"operationMessage,omitempty"`
+	RawOperationMessage string `json:"rawOperationMessage,omitempty"`
+	Source              string `json:"source,omitempty"`
+	TargetRevision      string `json:"targetRevision,omitempty"`
+	LastRevision        string `json:"lastRevision,omitempty"`
+	LastReconcile       string `json:"lastReconcile,omitempty"`
+	PartialReason       string `json:"partialReason,omitempty"`
 	// AutoSyncMode is the human-readable syncPolicy chip label, e.g.
 	// "Manual", "Auto", "Auto · prune", "Auto · self-heal",
 	// "Auto · prune · self-heal", "Suspended" (Flux), or "".
@@ -59,6 +63,41 @@ type Summary struct {
 	// deletion completes. When the resource is stuck Terminating, this is
 	// the operator's first lead on which controller to investigate.
 	Finalizers []string `json:"finalizers,omitempty"`
+	// IgnoredDifferences, when non-nil, discloses the Argo Application's
+	// spec.ignoreDifferences coverage — the field exclusions that suppress
+	// drift from comparison (both Argo's own comparison and Radar's). Nil for
+	// Flux roots and for Applications that declare no exclusions.
+	IgnoredDifferences *IgnoredDifferencesSummary `json:"ignoredDifferences,omitempty"`
+	// ResourceHealthMode mirrors the tree's HealthMode for Argo roots: where
+	// Argo keeps per-resource health. "appTree" means the controller's
+	// verdicts are not in the CR and per-resource health below, if any, is
+	// Radar's own read — the UI says so.
+	ResourceHealthMode string `json:"resourceHealthMode,omitempty"`
+	// RemoteDestination: the Application or Flux object deploys to another
+	// cluster. Radar derives nothing about its resources from here.
+	RemoteDestination bool `json:"remoteDestination,omitempty"`
+	// ResourceHealthFromAPI: per-resource health came from the controller's
+	// API server, so in appTree mode the verdicts shown are still Argo's.
+	ResourceHealthFromAPI bool `json:"resourceHealthFromApi,omitempty"`
+	// ResourceHealthAPIError: the controller's API server was asked and
+	// didn't answer usefully — why, in the user's words.
+	ResourceHealthAPIError string `json:"resourceHealthApiError,omitempty"`
+}
+
+// IgnoredDifferencesSummary is the comparison-coverage disclosure for an Argo
+// Application's spec.ignoreDifferences. RuleCount is the number of exclusion
+// entries; Kinds lists the sorted unique "Group/Kind" targets (just "Kind" for
+// core resources, "group/*" for a group-wide rule that omits kind).
+//
+// UnsupportedRuleCount is the load-bearing field: Radar evaluates only
+// jsonPointer rules in its drift filter — jqPathExpressions and
+// managedFieldsManagers rules are not applied — so an Application whose
+// exclusions use those features can surface drift entries in Radar that
+// Argo's own UI suppresses. The UI uses this count to warn about that gap.
+type IgnoredDifferencesSummary struct {
+	RuleCount            int      `json:"ruleCount"`
+	UnsupportedRuleCount int      `json:"unsupportedRuleCount"`
+	Kinds                []string `json:"kinds"`
 }
 
 type Ref struct {
@@ -74,7 +113,8 @@ type Ref struct {
 // frontend dispatches on Kind to render the right button + onClick handler.
 //
 // Invariants (per Kind):
-//   RemediationCreateNamespace: Target MUST be a non-empty namespace name.
+//
+//	RemediationCreateNamespace: Target MUST be a non-empty namespace name.
 //
 // Construct via NewCreateNamespaceRemediation rather than struct literal —
 // the constructor enforces the per-Kind invariants; literal construction
@@ -121,12 +161,13 @@ func (r *Remediation) Validate() error {
 }
 
 type Issue struct {
-	Severity Severity `json:"severity"`
-	Scope    Scope    `json:"scope"`
-	Reason   string   `json:"reason"`
-	Message  string   `json:"message"`
-	Refs     []Ref    `json:"refs,omitempty"`
-	Action   string   `json:"action,omitempty"`
+	Severity   Severity `json:"severity"`
+	Scope      Scope    `json:"scope"`
+	Reason     string   `json:"reason"`
+	Message    string   `json:"message"`
+	RawMessage string   `json:"rawMessage,omitempty"`
+	Refs       []Ref    `json:"refs,omitempty"`
+	Action     string   `json:"action,omitempty"`
 	// Remediation, when set, exposes a structured one-click fix for this
 	// Issue. Frontend renders a contextual button on the failure card.
 	// Nil when no automated remedy is appropriate; the Action string still
@@ -143,6 +184,12 @@ type Issue struct {
 	// Stuck=true when retry count crosses the "no longer transient"
 	// threshold. Drives a stronger visual treatment.
 	Stuck bool `json:"stuck,omitempty"`
+	// Source is set on resource-scoped Issues: "controller" when the GitOps
+	// controller's own per-resource health produced it, "radar" when Radar's
+	// issues engine did (the controller's verdict wasn't available). The
+	// Reason vocabulary differs too — Argo's "Degraded" vs the engine's
+	// "CrashLoopBackOff" — but the field is the contract.
+	Source string `json:"source,omitempty"`
 }
 
 type Change struct {
@@ -150,11 +197,18 @@ type Change struct {
 	Category Category `json:"category"`
 	Sync     string   `json:"sync,omitempty"`
 	Health   string   `json:"health,omitempty"`
-	Message  string   `json:"message,omitempty"`
+	// HealthSource / HealthReason / HealthSeverity carry the provenance of
+	// Health (see gitopstree.Node). Message holds the health message from
+	// whichever source produced Health.
+	HealthSource   string `json:"healthSource,omitempty"`
+	HealthReason   string `json:"healthReason,omitempty"`
+	HealthSeverity string `json:"healthSeverity,omitempty"`
+	Message        string `json:"message,omitempty"`
 	// SyncError is Argo's status.resources[].syncResult message — the last
 	// sync's per-resource failure. Distinct from Message (live health) so
 	// the UI can show "degraded right now" vs "last sync errored".
-	SyncError string `json:"syncError,omitempty"`
+	SyncError    string `json:"syncError,omitempty"`
+	RawSyncError string `json:"rawSyncError,omitempty"`
 	// HookPhase identifies sync hook resources (PreSync / PostSync /
 	// SyncFail / PostDelete); empty for non-hook resources.
 	HookPhase  string `json:"hookPhase,omitempty"`
@@ -217,21 +271,42 @@ type HistoryItem struct {
 	DeployedAt  string `json:"deployedAt,omitempty"`
 	Phase       string `json:"phase,omitempty"`
 	Message     string `json:"message,omitempty"`
+	RawMessage  string `json:"rawMessage,omitempty"`
 	Source      string `json:"source,omitempty"`
 	InitiatedBy string `json:"initiatedBy,omitempty"`
 }
 
 type Capabilities struct {
-	Sync              bool     `json:"sync"`
-	Refresh           bool     `json:"refresh"`
-	Terminate         bool     `json:"terminate"`
-	Suspend           bool     `json:"suspend"`
-	Resume            bool     `json:"resume"`
-	SyncWithSource    bool     `json:"syncWithSource"`
-	SelectiveSync     bool     `json:"selectiveSync"`
-	Rollback          bool     `json:"rollback"`
-	UnsupportedReason string   `json:"unsupportedReason,omitempty"`
-	Warnings          []string `json:"warnings,omitempty"`
+	Sync           bool `json:"sync"`
+	Refresh        bool `json:"refresh"`
+	Terminate      bool `json:"terminate"`
+	Suspend        bool `json:"suspend"`
+	Resume         bool `json:"resume"`
+	SyncWithSource bool `json:"syncWithSource"`
+	SelectiveSync  bool `json:"selectiveSync"`
+	Rollback       bool `json:"rollback"`
+	// ArgoDiffAvailable reports that the Argo CD resource-diff endpoint
+	// (/api/argo/applications/{ns}/{name}/resource-diff) can serve a
+	// desired-vs-live manifest diff for this Application's managed resources.
+	// True only for Argo roots and only when the Argo CD integration is
+	// connected; the frontend gates its inline/full-screen diff affordance on
+	// it. Set by the insights HTTP handler, not by Build (which has no view of
+	// integration connectivity).
+	ArgoDiffAvailable bool `json:"argoDiffAvailable,omitempty"`
+	// ArgoConfigured reports that the Argo CD integration has settings saved
+	// (URL/token) even if a live connection isn't established — distinct from
+	// ArgoDiffAvailable, which requires a working connection. The frontend uses
+	// the pair to distinguish "not set up yet" (offer Connect) from "set up but
+	// the connection is down / token rejected" (offer Reconnect), instead of
+	// showing per-resource diff buttons that would fail.
+	ArgoConfigured bool `json:"argoConfigured,omitempty"`
+	// RevisionMetadataAvailable reports that the Argo CD revision-metadata
+	// endpoint can resolve Git commit details (author, message, signature) for
+	// this Application's deployed revisions. Same gating as ArgoDiffAvailable:
+	// Argo roots with the integration connected. Set by the HTTP handler.
+	RevisionMetadataAvailable bool     `json:"revisionMetadataAvailable,omitempty"`
+	UnsupportedReason         string   `json:"unsupportedReason,omitempty"`
+	Warnings                  []string `json:"warnings,omitempty"`
 }
 
 // Resolver supplies the cluster-state lookups insights needs beyond what's
@@ -265,6 +340,25 @@ type Resolver interface {
 	// Issue can say "argocd-application-controller is CrashLoopBackOff
 	// — start there".
 	FinalizerOwnerStatus(finalizer string, root *unstructured.Unstructured) string
+	// ResourceProblems returns the problems the cluster-wide issues engine has
+	// already classified for one managed resource — the concrete workload "why"
+	// (crashloop / oom / image-pull / unschedulable / pvc-pending) behind an
+	// Argo "Degraded"/"Missing" rollup, so the detail page can answer it inline
+	// instead of sending the operator to the drawer. Empty when nothing is
+	// classified OR the lookup is unavailable; callers must NOT treat empty as
+	// "healthy" (they keep the generic "go inspect" guidance in that case).
+	ResourceProblems(group, kind, namespace, name string) []ResourceProblem
+}
+
+// ResourceProblem is a flat, vocabulary-neutral projection of one issue the
+// cluster-wide issues engine classified for a managed resource. The insights
+// package stays free of the issuesapi wire model — the host (which owns the
+// issues engine) maps issuesapi.Issue onto these plain strings.
+type ResourceProblem struct {
+	Reason   string // e.g. CrashLoopBackOff
+	Message  string // human-readable detail
+	Category string // e.g. crashloop, oom_killed
+	Severity string // critical | warning
 }
 
 // EventSummary is a compact projection of a corev1.Event for UI display.
@@ -286,12 +380,33 @@ func Build(root *unstructured.Unstructured, resourceTree *gitopstree.ResourceTre
 		Issues:       buildIssues(root, resourceTree, tool, resolver),
 		Changes:      buildChanges(root, resourceTree, tool, resolver),
 		Plan:         buildPlan(root, resourceTree, tool),
-		History:      buildHistory(root, tool),
+		History:      BuildHistory(root),
 		Capabilities: buildCapabilities(root, tool),
 		Partial:      true,
 	}
 	out.Summary.PartialReason = "Radar shows the controller's drift assessment plus a per-resource field diff and recent events (when available). For the canonical line-by-line diff against Git, use the Argo CD UI or `argocd app diff`."
+	if resourceTree != nil {
+		out.Summary.ResourceHealthMode = string(resourceTree.HealthMode)
+		// An Application with no destination is invalid rather than remote;
+		// Argo's InvalidSpecError condition already says so.
+		out.Summary.RemoteDestination = resourceTree.RemoteDestination && (tool != "argocd" || gitops.HasArgoDestination(root))
+		out.Summary.ResourceHealthFromAPI = resourceTree.HealthFromAPI
+		out.Summary.ResourceHealthAPIError = resourceTree.HealthAPIError
+	}
 	return out
+}
+
+// pluralizeResourcesAre renders "resource is" for one and "resources are" for
+// any other count, so the degraded-resources message reads grammatically.
+func pluralizeResourcesAre(n int) string {
+	if n == 1 {
+		return "resource is"
+	}
+	return "resources are"
+}
+
+func BuildHistory(root *unstructured.Unstructured) []HistoryItem {
+	return buildHistory(root, detectTool(root))
 }
 
 func detectTool(root *unstructured.Unstructured) string {
@@ -323,7 +438,8 @@ func buildSummary(root *unstructured.Unstructured, tool string) Summary {
 		s.Sync, _, _ = unstructured.NestedString(root.Object, "status", "sync", "status")
 		s.Health, _, _ = unstructured.NestedString(root.Object, "status", "health", "status")
 		s.OperationPhase, _, _ = unstructured.NestedString(root.Object, "status", "operationState", "phase")
-		s.OperationMessage, _, _ = unstructured.NestedString(root.Object, "status", "operationState", "message")
+		opMessage, _, _ := unstructured.NestedString(root.Object, "status", "operationState", "message")
+		s.OperationMessage, s.RawOperationMessage = diagnose.CleanArgoControllerMessageWithRaw(opMessage)
 		s.TargetRevision, _, _ = unstructured.NestedString(root.Object, "status", "sync", "revision")
 		s.LastRevision, _, _ = unstructured.NestedString(root.Object, "status", "operationState", "syncResult", "revision")
 		s.LastReconcile, _, _ = unstructured.NestedString(root.Object, "status", "reconciledAt")
@@ -336,6 +452,7 @@ func buildSummary(root *unstructured.Unstructured, tool string) Summary {
 		}
 		s.Source = joinNonEmpty(gitops.StringValue(source["repoURL"]), gitops.StringValue(source["path"]), gitops.StringValue(source["chart"]))
 		s.AutoSyncMode = describeArgoAutoSync(root)
+		s.IgnoredDifferences = summarizeArgoIgnoreDifferences(root)
 		return s
 	}
 	status := fluxStatus(root)
@@ -363,6 +480,14 @@ func buildSummary(root *unstructured.Unstructured, tool string) Summary {
 // describeArgoAutoSync formats spec.syncPolicy.automated into a chip label.
 // Empty when the field can't be read; "Manual" when automated is absent.
 func describeArgoAutoSync(root *unstructured.Unstructured) string {
+	// An ApplicationSet has no sync policy of its own. Its spec.syncPolicy
+	// governs how generated Applications are created and deleted, not how
+	// anything syncs, so it never carries `automated` - reading it here would
+	// report every ApplicationSet as "Manual". The policy that does decide
+	// auto-sync lives on spec.template.spec and belongs to what it generates.
+	if root.GetKind() == "ApplicationSet" {
+		return ""
+	}
 	automated, found, _ := unstructured.NestedMap(root.Object, "spec", "syncPolicy", "automated")
 	if !found {
 		return "Manual"
@@ -379,6 +504,12 @@ func describeArgoAutoSync(root *unstructured.Unstructured) string {
 
 func buildIssues(root *unstructured.Unstructured, resourceTree *gitopstree.ResourceTree, tool string, resolver Resolver) []Issue {
 	var out []Issue
+	// Argo's app-level health is its verdict on every resource it assesses.
+	// Radar's own reads (topology fill, degraded counts) must not contradict
+	// a Healthy app with Issues. Flux roots carry no status.health, so this
+	// never gates them.
+	appHealth, _, _ := unstructured.NestedString(root.Object, "status", "health", "status")
+	appHealthy := appHealth == "Healthy"
 	// Pending deletion is appended first; the severity-stable sort below
 	// may reorder by severity-rank (e.g. a critical operation failure can
 	// land above an alert-tier lifecycle issue). The user-facing
@@ -391,8 +522,8 @@ func buildIssues(root *unstructured.Unstructured, resourceTree *gitopstree.Resou
 		out = append(out, *pd)
 	}
 	// suppressedRefs tracks resources whose own Issue is causally derivative of
-	// a parent operation failure (e.g. an OutOfSync resource issue is just
-	// the per-resource view of an apply that already failed at the operation
+	// a parent operation failure (e.g. a Missing resource issue is just the
+	// per-resource view of an apply that already failed at the operation
 	// level). Hiding these prevents the user from seeing the same root cause
 	// rendered in three different forms.
 	suppressedRefs := map[string]bool{}
@@ -400,7 +531,7 @@ func buildIssues(root *unstructured.Unstructured, resourceTree *gitopstree.Resou
 	// operationFailed gates two downstream suppressions when the parent op
 	// has parked in Failed/Error: (1) Argo's SyncError condition is a
 	// parallel encoding of the same operationState.message we already render
-	// in the failure card, and (2) per-resource Missing/OutOfSync issues
+	// in the failure card, and (2) per-resource Missing/Degraded issues
 	// for resources that can't exist because the parent failure is upstream
 	// (e.g. missing namespace) are just downstream symptoms. The user has
 	// already seen the root cause in the failure card; surfacing the
@@ -410,18 +541,27 @@ func buildIssues(root *unstructured.Unstructured, resourceTree *gitopstree.Resou
 	if tool == "argocd" {
 		if phase, _, _ := unstructured.NestedString(root.Object, "status", "operationState", "phase"); phase == "Failed" || phase == "Error" {
 			operationFailed = true
-			msg, _, _ := unstructured.NestedString(root.Object, "status", "operationState", "message")
-			parsed := parseArgoOperationError(msg)
+			opMessage, _, _ := unstructured.NestedString(root.Object, "status", "operationState", "message")
+			msg, rawMsg := diagnose.CleanArgoControllerMessageWithRaw(opMessage)
+			parsed := diagnose.ParseArgoOperationError(msg)
+			action := "Open Activity for operation details."
+			if !gitops.IsInClusterDestination(root) {
+				var remoteAction string
+				if parsed, remoteAction = diagnose.WithoutLocalRemediation(parsed); remoteAction != "" {
+					action = remoteAction
+				}
+			}
 			issue := Issue{
 				Severity:    SeverityCritical,
 				Scope:       ScopeOperation,
 				Reason:      phase,
 				Message:     fallback(msg, "Last sync operation failed"),
-				Action:      "Open Activity for operation details.",
+				RawMessage:  rawMsg,
+				Action:      action,
 				Cause:       parsed.Cause,
 				RetryCount:  parsed.RetryCount,
 				Stuck:       parsed.Stuck,
-				Remediation: parsed.Remediation,
+				Remediation: remediationFromParsed(parsed),
 			}
 			if parsed.AffectedKind != "" && parsed.AffectedName != "" {
 				ref := Ref{Kind: parsed.AffectedKind, Name: parsed.AffectedName}
@@ -436,8 +576,8 @@ func buildIssues(root *unstructured.Unstructured, resourceTree *gitopstree.Resou
 			// When the remediation pins the root cause to a single missing
 			// namespace, every resource targeting that namespace is just a
 			// downstream symptom — suppress them in the per-resource pass.
-			if parsed.Remediation != nil && parsed.Remediation.Kind == RemediationCreateNamespace {
-				suppressedNamespaces[parsed.Remediation.Target] = true
+			if parsed.RemediationKind == diagnose.RemediationCreateNamespace {
+				suppressedNamespaces[parsed.RemediationTarget] = true
 			}
 			out = append(out, issue)
 		} else if phase == "Running" {
@@ -458,6 +598,12 @@ func buildIssues(root *unstructured.Unstructured, resourceTree *gitopstree.Resou
 			// happening?" Answer: nothing is *supposed* to happen
 			// automatically.
 			out = append(out, *drift)
+		} else if drift := detectAutoDriftSelfHealOff(root); drift != nil {
+			// Auto-sync on but self-heal off: Argo deploys new Git revisions
+			// yet won't correct live drift, so an OutOfSync app sits drifted
+			// with nothing to reconcile it. Same "why isn't this fixing
+			// itself?" confusion as manual mode, different cause.
+			out = append(out, *drift)
 		}
 		// Argo Application status.conditions are how the controller signals
 		// app-level problems that aren't tied to a specific operation
@@ -475,7 +621,7 @@ func buildIssues(root *unstructured.Unstructured, resourceTree *gitopstree.Resou
 		// detection — the per-resource diff/events live on the Change
 		// objects emitted by buildChanges. Pass nil resolver here to skip
 		// the (unused) drift computation in this code path.
-		for _, change := range argoResourceChanges(root, nil) {
+		for _, change := range argoResourceChanges(root, resourceTree, nil) {
 			// Suppress a resource issue when its kind/name match a resource
 			// already named in the operation failure — same root cause, no
 			// value in showing it twice. Also suppress every resource in a
@@ -488,26 +634,69 @@ func buildIssues(root *unstructured.Unstructured, resourceTree *gitopstree.Resou
 				continue
 			}
 			if change.Health == "Degraded" || change.Health == "Missing" {
-				out = append(out, Issue{Severity: SeverityCritical, Scope: ScopeResource, Reason: change.Health, Message: fmt.Sprintf("%s %s is %s", change.Ref.Kind, change.Ref.Name, change.Health), Refs: []Ref{change.Ref}, Action: "Open the resource drawer for events, logs, and YAML."})
-			} else if change.Sync == "OutOfSync" {
-				out = append(out, Issue{Severity: SeverityWarning, Scope: ScopeResource, Reason: "OutOfSync", Message: fmt.Sprintf("%s %s is out of sync", change.Ref.Kind, change.Ref.Name), Refs: []Ref{change.Ref}, Action: "Review Changes or run sync."})
+				// Argo calling the app Healthy is its verdict on every resource
+				// it assesses; Radar's own read of a resource must not contradict
+				// that with an Issue (the node chip still shows it).
+				if change.HealthSource == string(gitopstree.HealthSourceRadar) && appHealthy {
+					continue
+				}
+				// The issues engine reads this cluster; for an app deploying
+				// elsewhere its answer would describe an unrelated local
+				// object, so the cause bridge stays off.
+				causeResolver := resolver
+				if resourceTree != nil && resourceTree.RemoteDestination {
+					causeResolver = nil
+				}
+				out = append(out, resourceHealthIssue(change, causeResolver))
+			}
+			// A resource that is merely OutOfSync (healthy, just drifted) gets
+			// no Issue. One issue per drifted resource restates the Resources
+			// table one-for-one, and on a broadly-drifted app (fresh deploy,
+			// bumped chart) it buries the genuinely diagnostic issues under
+			// dozens of identical "X is out of sync / run sync" rows. The
+			// app-level sync badge + count own "how much has drifted", the
+			// table owns "which", and the ManualDrift / StuckDriftLoop
+			// detectors own the actionable "why isn't this reconciling" cases.
+		}
+		// Argo CD 3.x no longer persists per-resource health in the
+		// Application CR by default (controller.resource.health.persist=false,
+		// status.resourceHealthSource=appTree), so status.resources[] carries
+		// no health.status for ANY kind even though Argo's own health check
+		// (built-in Lua for ClusterSecretStore and friends included) rolled
+		// the app up to Degraded. The per-resource pass above then has nothing
+		// to point at. Offer the loudest recent Warning event as a lead rather
+		// than leaving the badge unexplained. Only for an app deploying to
+		// THIS cluster: events describe local objects, and a same-named local
+		// resource is not the remote one. An informational Running/drift row
+		// is not an explanation and must not suppress this; a failed operation
+		// or a per-resource Issue is. A warning-tier per-resource finding
+		// doesn't count as explained either, but it already names a resource;
+		// stacking an events lead about the same app on top of it is noise.
+		if !degradedResourcesExplained(out) && !hasResourceFinding(out) && gitops.IsInClusterDestination(root) {
+			if health, _, _ := unstructured.NestedString(root.Object, "status", "health", "status"); health == "Degraded" {
+				if iss := degradedResourceFromEvents(root, resolver); iss != nil {
+					out = append(out, *iss)
+				}
 			}
 		}
 	} else {
 		for _, c := range conditions(root) {
 			if c.status == "False" && (c.typ == "Ready" || c.typ == "Healthy" || c.typ == "Released" || c.typ == "TestSuccess") {
-				out = append(out, Issue{Severity: SeverityCritical, Scope: ScopeCondition, Reason: fallback(c.reason, c.typ), Message: fallback(c.message, c.typ+" is false"), Action: fluxActionForReason(c.reason)})
+				out = append(out, Issue{Severity: SeverityCritical, Scope: ScopeCondition, Reason: fallback(c.reason, c.typ), Message: fallback(c.message, c.typ+" is false"), Action: diagnose.ActionForFluxReason(c.reason)})
 			}
 			if c.status == "True" && c.typ == "Stalled" {
-				out = append(out, Issue{Severity: SeverityCritical, Scope: ScopeCondition, Reason: fallback(c.reason, "Stalled"), Message: fallback(c.message, "Reconciliation is stalled"), Action: fluxActionForReason(c.reason)})
+				out = append(out, Issue{Severity: SeverityCritical, Scope: ScopeCondition, Reason: fallback(c.reason, "Stalled"), Message: fallback(c.message, "Reconciliation is stalled"), Action: diagnose.ActionForFluxReason(c.reason)})
 			}
 			if c.status == "True" && c.typ == "Reconciling" {
 				out = append(out, Issue{Severity: SeverityInfo, Scope: ScopeCondition, Reason: fallback(c.reason, "Reconciling"), Message: fallback(c.message, "Reconciliation is in progress")})
 			}
 		}
 	}
-	if resourceTree != nil && resourceTree.Summary.Degraded > 0 && len(out) == 0 {
-		out = append(out, Issue{Severity: SeverityWarning, Scope: ScopeTree, Reason: "DegradedResources", Message: fmt.Sprintf("%d managed resources are degraded", resourceTree.Summary.Degraded), Action: "Use the graph or Resources tab to inspect affected resources."})
+	// The events lead is a pointer, so the count stays next to it; a
+	// per-resource finding of any tier already names a resource, so the
+	// count would only restate it.
+	if resourceTree != nil && resourceTree.Summary.Degraded > 0 && !appHealthy && !degradedResourcesExplained(out) && !hasResourceFinding(out) {
+		out = append(out, Issue{Severity: SeverityWarning, Scope: ScopeTree, Reason: "DegradedResources", Message: fmt.Sprintf("%d managed %s degraded", resourceTree.Summary.Degraded, pluralizeResourcesAre(resourceTree.Summary.Degraded)), Action: "Use the graph or Resources tab to inspect affected resources."})
 	}
 	// Dedup by (scope, reason, message) — Flux carries the same failure
 	// reason in multiple status.conditions slots (Released=False *and*
@@ -519,6 +708,184 @@ func buildIssues(root *unstructured.Unstructured, resourceTree *gitopstree.Resou
 	out = dedupeIssues(out)
 	sort.SliceStable(out, func(i, j int) bool { return severityRank(out[i].Severity) < severityRank(out[j].Severity) })
 	return out
+}
+
+// degradedResourceFromEvents picks, from the Application's declared managed
+// resources, the one with the loudest recent Warning event, as a lead when
+// nothing else identified why the app is Degraded. Events are not a health
+// verdict (a recovered resource can keep a repeated Warning inside the event
+// TTL), so the Issue is warning-tier, says "possible cause", and never counts
+// as having explained the app's health — the degraded-resources summary
+// still shows next to it. Returns nil when no managed resource has a Warning
+// event, or when resolver is nil (tests, and any caller that opts out of
+// live enrichment).
+func degradedResourceFromEvents(root *unstructured.Unstructured, resolver Resolver) *Issue {
+	if resolver == nil {
+		return nil
+	}
+	raw, _, _ := unstructured.NestedSlice(root.Object, "status", "resources")
+	var (
+		best      Ref
+		bestEvent EventSummary
+		// -1, not 0: a real, single-occurrence Warning event commonly reports
+		// Count == 0 on modern clusters (events.k8s.io/v1 only sets a count at
+		// all once an event has repeated into a series) — starting the
+		// sentinel at 0 would make that genuine signal indistinguishable from
+		// "no Warning event found," and the function would silently return no
+		// issue for exactly the first-occurrence case it exists to catch.
+		bestCount int32 = -1
+	)
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		ref := Ref{
+			Group:     gitops.StringValue(m["group"]),
+			Kind:      gitops.StringValue(m["kind"]),
+			Namespace: gitops.StringValue(m["namespace"]),
+			Name:      gitops.StringValue(m["name"]),
+		}
+		if ref.Kind == "" || ref.Name == "" {
+			continue
+		}
+		for _, ev := range resolver.RecentEvents(ref.Group, ref.Kind, ref.Namespace, ref.Name) {
+			if ev.Type != "Warning" {
+				continue
+			}
+			if ev.Count > bestCount {
+				bestCount = ev.Count
+				best = ref
+				bestEvent = ev
+			}
+		}
+	}
+	if bestCount < 0 {
+		return nil
+	}
+	return &Issue{
+		Severity:   SeverityWarning,
+		Scope:      ScopeResource,
+		Reason:     "PossibleCause",
+		Message:    fmt.Sprintf("%s %s has recent Warning events", best.Kind, best.Name),
+		RawMessage: bestEvent.Message,
+		Refs:       []Ref{best},
+		Action:     "Open the resource drawer to confirm.",
+		Cause:      fallback(bestEvent.Message, bestEvent.Reason),
+	}
+}
+
+// resourceHealthIssue turns a Degraded/Missing managed resource into an
+// Issue. When the controller produced the health, the Issue speaks Argo's
+// vocabulary ("Deployment web is Degraded") and the issues engine is asked
+// for the concrete cause behind it. When Radar's engine produced the health
+// (the controller's verdict wasn't available), the Issue IS the engine's
+// finding — its reason, message and severity — and says so via Source, so a
+// warning-tier finding never gets promoted to a critical Issue by the Argo
+// path's framing.
+func resourceHealthIssue(change Change, resolver Resolver) Issue {
+	if change.HealthSource == string(gitopstree.HealthSourceRadar) && change.HealthReason != "" {
+		severity := SeverityWarning
+		if change.HealthSeverity == "critical" {
+			severity = SeverityCritical
+		}
+		message := fmt.Sprintf("%s %s is %s", change.Ref.Kind, change.Ref.Name, change.Health)
+		if change.Message != "" {
+			message = fmt.Sprintf("%s %s: %s", change.Ref.Kind, change.Ref.Name, change.Message)
+		}
+		return Issue{
+			Severity: severity,
+			Scope:    ScopeResource,
+			Reason:   change.HealthReason,
+			Message:  message,
+			Refs:     []Ref{change.Ref},
+			Action:   "Open the resource drawer for events, logs, and YAML.",
+			Source:   change.HealthSource,
+		}
+	}
+	// Radar's own topology read with no classified reason is a live-state
+	// observation, not a verdict: warning tier. The controller's Degraded /
+	// Missing is the verdict and stays critical.
+	severity := SeverityCritical
+	if change.HealthSource == string(gitopstree.HealthSourceRadar) {
+		severity = SeverityWarning
+	}
+	iss := Issue{
+		Severity: severity,
+		Scope:    ScopeResource,
+		Reason:   change.Health,
+		Message:  fmt.Sprintf("%s %s is %s", change.Ref.Kind, change.Ref.Name, change.Health),
+		Refs:     []Ref{change.Ref},
+		Action:   "Open the resource drawer for events, logs, and YAML.",
+		Source:   fallback(change.HealthSource, string(gitopstree.HealthSourceController)),
+	}
+	// Bridge to the cluster-wide issues engine for the concrete workload
+	// cause (crashloop / oom / image-pull / unschedulable …) behind Argo's
+	// coarse "Degraded"/"Missing". Empty result keeps the generic guidance
+	// above — it never implies the resource is healthy.
+	if resolver != nil {
+		if cause := resourceProblemCause(resolver.ResourceProblems(change.Ref.Group, change.Ref.Kind, change.Ref.Namespace, change.Ref.Name)); cause != "" {
+			iss.Cause = cause
+		}
+	}
+	return iss
+}
+
+// degradedResourcesExplained reports whether the Issues so far already
+// account for degraded managed resources: a critical per-resource Issue
+// names one, a failed sync operation is the upstream cause of all of them.
+// Informational rows (sync Running) and drift detectors (StuckDriftLoop,
+// ManualDrift — sync signals, not health) explain nothing, and neither
+// does the warning-tier events lead — it points, it doesn't conclude.
+// hasResourceFinding reports a per-resource Issue that names a problem on a
+// specific resource — any tier, but not the Warning-event lead, which only
+// points at one.
+func hasResourceFinding(issues []Issue) bool {
+	for _, iss := range issues {
+		if iss.Scope == ScopeResource && iss.Reason != "PossibleCause" {
+			return true
+		}
+	}
+	return false
+}
+
+func degradedResourcesExplained(issues []Issue) bool {
+	for _, iss := range issues {
+		if iss.Scope == ScopeResource && iss.Severity == SeverityCritical {
+			return true
+		}
+		if iss.Scope == ScopeOperation && (iss.Reason == "Failed" || iss.Reason == "Error") {
+			return true
+		}
+	}
+	return false
+}
+
+// resourceProblemCause renders a single cause line from the workload problems
+// the issues engine classified for a managed resource — the worst (critical
+// over warning, else first) one's detail. Returns "" for no problems so the
+// caller keeps its generic guidance.
+func resourceProblemCause(problems []ResourceProblem) string {
+	best, ok := WorstResourceProblem(problems)
+	if !ok {
+		return ""
+	}
+	return fallback(best.Message, best.Reason)
+}
+
+// WorstResourceProblem picks the problem to speak for a resource: critical
+// over warning, else the first. False when there are none.
+func WorstResourceProblem(problems []ResourceProblem) (ResourceProblem, bool) {
+	if len(problems) == 0 {
+		return ResourceProblem{}, false
+	}
+	best := problems[0]
+	for _, p := range problems[1:] {
+		if best.Severity != "critical" && p.Severity == "critical" {
+			best = p
+		}
+	}
+	return best, true
 }
 
 // dedupeIssues removes Issues that share the same (scope, reason, message,
@@ -538,13 +905,16 @@ func dedupeIssues(in []Issue) []Issue {
 	out := make([]Issue, 0, len(in))
 	for _, i := range in {
 		// Refs differentiate per-resource issues; include the first ref's
-		// kind+name in the dedup key so a class of resource-level issues
-		// isn't silently collapsed into one. Empty refs (operation/
-		// condition/lifecycle scopes) collapse correctly because their
-		// ref-suffix is "" identically.
+		// namespace+kind+name in the dedup key so a class of resource-level
+		// issues isn't silently collapsed into one. Namespace is load-bearing:
+		// two genuinely distinct Degraded resources that share a kind+name across
+		// namespaces (an ApplicationSet fanning out an identically-named workload)
+		// must both survive — dropping the second would hide a real problem.
+		// Empty refs (operation/condition/lifecycle scopes) collapse correctly
+		// because their ref-suffix is "" identically.
 		var refKey string
 		if len(i.Refs) > 0 {
-			refKey = i.Refs[0].Kind + "/" + i.Refs[0].Name
+			refKey = i.Refs[0].Namespace + "/" + i.Refs[0].Kind + "/" + i.Refs[0].Name
 		}
 		k := string(i.Scope) + "|" + i.Reason + "|" + i.Message + "|" + refKey
 		if _, ok := seen[k]; ok {
@@ -557,7 +927,13 @@ func dedupeIssues(in []Issue) []Issue {
 }
 func buildChanges(root *unstructured.Unstructured, resourceTree *gitopstree.ResourceTree, tool string, live Resolver) []Change {
 	if tool == "argocd" {
-		return argoResourceChanges(root, live)
+		// Drift diffs and recent events come from this cluster; for an app
+		// deploying elsewhere they would describe unrelated same-named local
+		// objects, so a remote app's rows carry CR data only.
+		if resourceTree != nil && resourceTree.RemoteDestination {
+			live = nil
+		}
+		return argoResourceChanges(root, resourceTree, live)
 	}
 	if resourceTree == nil {
 		return nil
@@ -668,12 +1044,137 @@ func (r argoIgnoreRule) matches(ref Ref) bool {
 	return true
 }
 
-func argoResourceChanges(root *unstructured.Unstructured, resolver Resolver) []Change {
+// summarizeArgoIgnoreDifferences builds the comparison-coverage disclosure for
+// an Argo Application by walking spec.ignoreDifferences directly. This is a
+// deliberately separate pass from parseArgoIgnoreDifferences (which feeds the
+// drift filter and retains only jsonPointer rules): the summary needs the raw
+// entry count, the jq-rule count, and the target kinds — data the parser
+// discards. Returns nil when the Application declares no exclusions so the UI
+// renders nothing.
+func summarizeArgoIgnoreDifferences(root *unstructured.Unstructured) *IgnoredDifferencesSummary {
+	raw, _, _ := unstructured.NestedSlice(root.Object, "spec", "ignoreDifferences")
+	if len(raw) == 0 {
+		return nil
+	}
+	out := &IgnoredDifferencesSummary{}
+	seen := map[string]struct{}{}
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		out.RuleCount++
+		jq, _, _ := unstructured.NestedStringSlice(m, "jqPathExpressions")
+		mfm, _, _ := unstructured.NestedStringSlice(m, "managedFieldsManagers")
+		if len(jq) > 0 || len(mfm) > 0 {
+			out.UnsupportedRuleCount++
+		}
+		label := ignoreDifferenceKindLabel(gitops.StringValue(m["group"]), gitops.StringValue(m["kind"]))
+		if _, dup := seen[label]; !dup {
+			seen[label] = struct{}{}
+			out.Kinds = append(out.Kinds, label)
+		}
+	}
+	if out.RuleCount == 0 {
+		return nil
+	}
+	sort.Strings(out.Kinds)
+	return out
+}
+
+// ignoreDifferenceKindLabel formats an ignoreDifferences rule's (group, kind)
+// into a display token: "group/kind", or just "kind" for core resources
+// (empty group). A rule that omits kind is a group-wide wildcard in Argo's
+// matching semantics, rendered as "group/*" (or "*" when group is empty too).
+// Literal "*" values the operator wrote are passed through unchanged.
+func ignoreDifferenceKindLabel(group, kind string) string {
+	if kind == "" {
+		kind = "*"
+	}
+	if group == "" {
+		return kind
+	}
+	return group + "/" + kind
+}
+
+// ManagedResourceRow is the minimal projection of one Argo Application
+// status.resources entry — just enough for a host to decide which resources
+// deserve a live-state fetch (drift is only meaningful where the controller
+// reports the row as not cleanly Synced) without building full Changes.
+type ManagedResourceRow struct {
+	Ref          Ref
+	Sync         string
+	HasSyncError bool
+}
+
+// ManagedResourceRows parses status.resources into rows. Same source and
+// filtering as the Changes builder (rows without kind+name are dropped);
+// hosts use it to schedule the Resolver's live-state prefetch before Build.
+func ManagedResourceRows(root *unstructured.Unstructured) []ManagedResourceRow {
+	if root == nil {
+		return nil
+	}
+	raw, _, _ := unstructured.NestedSlice(root.Object, "status", "resources")
+	out := make([]ManagedResourceRow, 0, len(raw))
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		ref := Ref{
+			Group:     gitops.StringValue(m["group"]),
+			Kind:      gitops.StringValue(m["kind"]),
+			Namespace: gitops.StringValue(m["namespace"]),
+			Name:      gitops.StringValue(m["name"]),
+		}
+		if ref.Kind == "" || ref.Name == "" {
+			continue
+		}
+		row := ManagedResourceRow{Ref: ref, Sync: gitops.StringValue(m["status"])}
+		if sr, ok := m["syncResult"].(map[string]any); ok {
+			status := gitops.StringValue(sr["status"])
+			if status != "Synced" && status != "Pruned" && gitops.StringValue(sr["message"]) != "" {
+				row.HasSyncError = true
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// OperationPhase returns status.operationState.phase ("" when absent).
+// Hosts use it to skip live-state enrichment while a sync is in flight —
+// the 2s progress poll should be a cache read, not an apiserver fan-out,
+// and mid-apply drift is churn rather than signal.
+func OperationPhase(root *unstructured.Unstructured) string {
+	if root == nil {
+		return ""
+	}
+	phase, _, _ := unstructured.NestedString(root.Object, "status", "operationState", "phase")
+	return phase
+}
+
+// argoResourceChanges lists the Application's managed resources with their
+// resolved health. Health comes from the CR entry when Argo persisted it;
+// otherwise from the resource tree's node, which carries whatever Radar could
+// establish (topology status, or a host-overlaid issues-engine finding) with
+// its provenance. Reading the tree here rather than the CR twice keeps the
+// Changes table, the per-resource Issues and the tree summary on one
+// authority.
+func argoResourceChanges(root *unstructured.Unstructured, resourceTree *gitopstree.ResourceTree, resolver Resolver) []Change {
 	raw, _, _ := unstructured.NestedSlice(root.Object, "status", "resources")
 	// Pre-parse the Application's spec.ignoreDifferences so each resource's
 	// drift computation can filter out operator-declared exemptions before
 	// they reach the UI.
 	ignoreRules := parseArgoIgnoreDifferences(root)
+	treeHealth := map[string]gitopstree.Node{}
+	if resourceTree != nil {
+		for _, n := range resourceTree.Nodes {
+			if n.Health != "" {
+				treeHealth[healthRefKey(n.Ref.Group, n.Ref.Kind, n.Ref.Namespace, n.Ref.Name)] = n
+			}
+		}
+	}
 	out := make([]Change, 0, len(raw))
 	for _, item := range raw {
 		m, ok := item.(map[string]any)
@@ -693,6 +1194,23 @@ func argoResourceChanges(root *unstructured.Unstructured, resolver Resolver) []C
 		if hm, ok := m["health"].(map[string]any); ok {
 			health = gitops.StringValue(hm["status"])
 		}
+		healthSource, healthReason, healthSeverity := "", "", ""
+		message := nestedMessage(m["health"])
+		// When the host filled the tree from the controller's API, that is
+		// the current verdict; a value the CR still carries inline is older.
+		fromAPI := resourceTree != nil && resourceTree.HealthFromAPI
+		if fromAPI {
+			health, message = "", ""
+		}
+		if health != "" {
+			healthSource = string(gitopstree.HealthSourceController)
+		} else if n, ok := treeHealth[healthRefKey(ref.Group, ref.Kind, ref.Namespace, ref.Name)]; ok {
+			health = n.Health
+			healthSource = string(n.HealthSource)
+			healthReason = n.HealthReason
+			healthSeverity = n.HealthSeverity
+			message = fallback(n.HealthMessage, message)
+		}
 		sync := gitops.StringValue(m["status"])
 		category := categorizeArgoChange(sync, health)
 		// Argo records per-resource sync failures under a syncResult sibling
@@ -701,26 +1219,31 @@ func argoResourceChanges(root *unstructured.Unstructured, resolver Resolver) []C
 		// Empty status counts as "unknown — show the message" because Argo
 		// can write a pre-apply failure message before stamping a status.
 		syncError := ""
+		rawSyncError := ""
 		hookPhase := ""
 		if sr, ok := m["syncResult"].(map[string]any); ok {
 			status := gitops.StringValue(sr["status"])
 			if status != "Synced" && status != "Pruned" {
-				syncError = gitops.StringValue(sr["message"])
+				syncError, rawSyncError = diagnose.CleanArgoControllerMessageWithRaw(gitops.StringValue(sr["message"]))
 			}
 			hookPhase = gitops.StringValue(sr["hookPhase"])
 		}
 		change := Change{
-			Ref:         ref,
-			Category:    category,
-			Sync:        sync,
-			Health:      health,
-			Message:     nestedMessage(m["health"]),
-			SyncError:   syncError,
-			HookPhase:   hookPhase,
-			HasDesired:  false,
-			HasLive:     true,
-			Partial:     true,
-			PartialNote: "Argo reports resource status here; desired manifest content is not available in Radar yet.",
+			Ref:            ref,
+			Category:       category,
+			Sync:           sync,
+			Health:         health,
+			HealthSource:   healthSource,
+			HealthReason:   healthReason,
+			HealthSeverity: healthSeverity,
+			Message:        message,
+			SyncError:      syncError,
+			RawSyncError:   rawSyncError,
+			HookPhase:      hookPhase,
+			HasDesired:     false,
+			HasLive:        true,
+			Partial:        true,
+			PartialNote:    "Argo reports resource status here; desired manifest content is not available in Radar yet.",
 		}
 		// Enrich from live cluster state when a resolver is wired. The
 		// drift diff turns the bare "OutOfSync" badge into a concrete
@@ -741,6 +1264,10 @@ func argoResourceChanges(root *unstructured.Unstructured, resolver Resolver) []C
 	}
 	sortChanges(out)
 	return out
+}
+
+func healthRefKey(group, kind, namespace, name string) string {
+	return group + "|" + kind + "|" + namespace + "|" + name
 }
 
 func buildPlan(root *unstructured.Unstructured, resourceTree *gitopstree.ResourceTree, tool string) []PlanItem {
@@ -868,9 +1395,11 @@ func buildHistory(root *unstructured.Unstructured, tool string) []HistoryItem {
 			if deployedAt == "" {
 				deployedAt = gitops.StringValue(op["startedAt"])
 			}
+			msg, rawMsg := diagnose.CleanArgoControllerMessageWithRaw(gitops.StringValue(op["message"]))
 			out = append(out, HistoryItem{
 				Phase:       gitops.StringValue(op["phase"]),
-				Message:     gitops.StringValue(op["message"]),
+				Message:     msg,
+				RawMessage:  rawMsg,
 				DeployedAt:  deployedAt,
 				Revision:    nestedString(op, "syncResult", "revision"),
 				InitiatedBy: initiatedBy,
@@ -954,36 +1483,8 @@ type fluxState struct {
 }
 
 func fluxStatus(root *unstructured.Unstructured) fluxState {
-	if suspended, _, _ := unstructured.NestedBool(root.Object, "spec", "suspend"); suspended {
-		return fluxState{sync: "Unknown", health: "Suspended"}
-	}
-	ready := ""
-	reconciling := false
-	stalled := false
-	for _, c := range conditions(root) {
-		if c.typ == "Ready" {
-			ready = c.status
-		}
-		if c.typ == "Reconciling" && c.status == "True" {
-			reconciling = true
-		}
-		if c.typ == "Stalled" && c.status == "True" {
-			stalled = true
-		}
-	}
-	if reconciling {
-		return fluxState{sync: "Reconciling", health: "Progressing"}
-	}
-	if stalled {
-		return fluxState{sync: "OutOfSync", health: "Degraded"}
-	}
-	if ready == "True" {
-		return fluxState{sync: "Synced", health: "Healthy"}
-	}
-	if ready == "False" {
-		return fluxState{sync: "OutOfSync", health: "Degraded"}
-	}
-	return fluxState{sync: "Unknown", health: "Unknown"}
+	st := gitops.FluxStatus(root)
+	return fluxState{sync: st.Sync, health: st.Health}
 }
 
 func nestedRef(root *unstructured.Unstructured, fields ...string) (Ref, bool) {
@@ -996,7 +1497,7 @@ func nestedRef(root *unstructured.Unstructured, fields ...string) (Ref, bool) {
 	if name == "" || kind == "" {
 		return Ref{}, false
 	}
-	return Ref{Group: gitops.GroupFromAPIVersion(gitops.StringValue(m["apiVersion"])), Kind: kind, Namespace: firstNonEmpty(gitops.StringValue(m["namespace"]), root.GetNamespace()), Name: name}, true
+	return Ref{Group: resourceid.GroupFromAPIVersion(gitops.StringValue(m["apiVersion"])), Kind: kind, Namespace: firstNonEmpty(gitops.StringValue(m["namespace"]), root.GetNamespace()), Name: name}, true
 }
 
 func refFromTree(ref gitopstree.ResourceRef) Ref {
@@ -1165,23 +1666,6 @@ func phaseFromHook(hook string) string {
 	return hook
 }
 
-func fluxActionForReason(reason string) string {
-	switch reason {
-	case "DependencyNotReady":
-		return "Inspect the dependency chain in the graph."
-	case "ArtifactFailed":
-		return "Inspect the Flux source and reconcile it."
-	case "BuildFailed":
-		return "Check the source path and rendered manifests."
-	case "HealthCheckFailed":
-		return "Open unhealthy managed resources for events and status."
-	case "InstallFailed", "UpgradeFailed", "TestFailed":
-		return "Inspect HelmRelease conditions and controller events."
-	default:
-		return "Review conditions and reconcile after fixing the source of failure."
-	}
-}
-
 func parseWave(value string) (int, bool) {
 	if value == "" {
 		return 0, false
@@ -1318,114 +1802,18 @@ func suppressionKey(r Ref) string {
 	return r.Kind + "/" + r.Name
 }
 
-// parsedFailure carries fields extracted from an Argo operationState.message.
-// Unparsed parts of the original message remain available to the UI as the
-// raw error — the parser only adds structure, never replaces or hides text.
-type parsedFailure struct {
-	Cause        string // plain-English root cause; empty if unrecognized
-	AffectedKind string
-	AffectedName string
-	RetryCount   int
-	Stuck        bool
-	// Remediation, when set, exposes a structured fix the UI can render as
-	// a contextual button. Only populated for patterns where the next step
-	// is unambiguous and safe (e.g. create a missing namespace).
-	Remediation *Remediation
+// remediationFromParsed adapts the vocabulary-neutral remediation primitives
+// from pkg/gitops/diagnose onto the insights Remediation wire type. Returns nil
+// when no structured remediation was parsed (the common case) or when the
+// target is empty (NewCreateNamespaceRemediation enforces that invariant).
+func remediationFromParsed(p diagnose.ParsedFailure) *Remediation {
+	switch p.RemediationKind {
+	case diagnose.RemediationCreateNamespace:
+		return NewCreateNamespaceRemediation(p.RemediationTarget, p.RemediationHint)
+	default:
+		return nil
+	}
 }
-
-// stuckRetryThreshold is the retry count at which we stop calling a failure
-// "transient" and start calling it stuck. Argo retries with backoff up to 5
-// times by default; reaching that ceiling means the controller has given up
-// hoping for self-recovery, which is exactly when the user needs the
-// stronger visual.
-const stuckRetryThreshold = 5
-
-// Capture group: <Kind>(.<group>...)? "<name>". Examples this matches:
-//
-//	CustomResourceDefinition.apiextensions.k8s.io "scaledjobs.keda.sh"
-//	Deployment.apps "billing"
-//	Service "billing"
-//
-// We don't need the group; the leading kind + quoted name is what users read.
-var argoAffectedRefRE = regexp.MustCompile(`([A-Z][A-Za-z0-9]+)(?:\.[A-Za-z0-9.\-]+)?\s+"([^"]+)"`)
-
-// "(retried N times)" suffix Argo appends when its retry policy has fired.
-var argoRetryRE = regexp.MustCompile(`\(retried (\d+) times?\)`)
-
-// `namespaces "<name>" not found` — fires when the Application targets a
-// namespace that doesn't exist and CreateNamespace=false. The most common
-// "why won't this sync" case for new environments. Captured separately so
-// the parser can populate a structured Remediation (Create namespace button)
-// rather than relying on the generic affected-ref regex.
-var argoMissingNamespaceRE = regexp.MustCompile(`namespaces "([^"]+)" not found`)
-
-// Pattern table: ordered list of (matcher, plain-English cause). First match
-// wins. Keep patterns specific — generic catch-alls would mask more useful
-// matches. Cases below cover the failure modes operators see most: validation
-// limits, admission rejection, RBAC, conflicts, registration, connectivity.
-var argoErrorPatterns = []struct {
-	match *regexp.Regexp
-	cause string
-}{
-	// Missing namespace pattern: keep this first so a more specific
-	// match wins over the generic "not found" message.
-	{regexp.MustCompile(`namespaces "[^"]+" not found`), "The destination namespace does not exist. Create it, or enable CreateNamespace=true in the Application's syncOptions so Argo creates it on sync."},
-	{regexp.MustCompile(`metadata\.annotations:\s*Too long`), "An annotation on the desired manifest exceeds Kubernetes' 256 KB metadata limit. Switch to server-side apply (Sync options → Server-side apply) or shrink the offending annotation."},
-	{regexp.MustCompile(`metadata\.labels:\s*Too long`), "Labels exceed Kubernetes' 64-character-per-key limit. Shorten label keys or values."},
-	// Hook patterns come BEFORE webhook patterns: Argo's hook failure
-	// messages can include the substring "webhook" coincidentally (e.g.
-	// "validating-webhook-hook"), and the more-specific hook framing is
-	// what the operator needs first.
-	{regexp.MustCompile(`(?i)\b(presync|postsync|sync(?:fail)?|postdelete|skipdryrun)\b.*?(?:hook|phase).*?(?:failed|error)`), "A sync hook failed. Inspect the hook resource (Job/Pod) for events and logs to see why it errored."},
-	{regexp.MustCompile(`(?i)hook .*? failed`), "A sync hook failed. Open Activity for the hook's exit reason; the failed hook resource itself usually has events that explain it."},
-	{regexp.MustCompile(`admission webhook ".*?" denied the request`), "An admission webhook rejected the apply. Check the webhook's policy or its target server."},
-	{regexp.MustCompile(`is forbidden:\s*User`), "RBAC denied this operation. The Argo controller's ServiceAccount lacks the required permissions."},
-	{regexp.MustCompile(`already exists`), "A resource with this name already exists in the cluster. It may have been created outside of GitOps or owned by a different application."},
-	{regexp.MustCompile(`no matches for kind`), "The CustomResourceDefinition for this kind isn't registered in the cluster. Install or wait for the operator that owns this CRD."},
-	{regexp.MustCompile(`(?i)dial tcp.*(?:i/o timeout|connection refused|no route to host)`), "Cluster unreachable from the Argo controller. Check API server connectivity and network policies."},
-	{regexp.MustCompile(`field is immutable`), "Tried to change a field Kubernetes treats as immutable. Recreate the resource (delete + reapply) or revert the change."},
-	{regexp.MustCompile(`unable to recognize`), "The manifest references an API version the cluster doesn't recognize. Check apiVersion against the installed CRDs."},
-	{regexp.MustCompile(`Operation cannot be fulfilled.*the object has been modified`), "The resource was modified concurrently between Argo's read and write. The next sync attempt should resolve it; investigate if it persists."},
-}
-
-func parseArgoOperationError(msg string) parsedFailure {
-	if msg == "" {
-		return parsedFailure{}
-	}
-	out := parsedFailure{}
-	for _, p := range argoErrorPatterns {
-		if p.match.MatchString(msg) {
-			out.Cause = p.cause
-			break
-		}
-	}
-	if m := argoAffectedRefRE.FindStringSubmatch(msg); len(m) == 3 {
-		out.AffectedKind = m[1]
-		out.AffectedName = m[2]
-	}
-	if m := argoRetryRE.FindStringSubmatch(msg); len(m) == 2 {
-		if n, err := strconv.Atoi(m[1]); err == nil {
-			out.RetryCount = n
-			out.Stuck = n >= stuckRetryThreshold
-		}
-	}
-	// Structured remediation: only the missing-namespace pattern offers a
-	// one-click fix in v1. Other patterns surface diagnosis-only via Cause.
-	if m := argoMissingNamespaceRE.FindStringSubmatch(msg); len(m) == 2 {
-		out.Remediation = NewCreateNamespaceRemediation(m[1], "Creates the missing namespace and re-triggers reconciliation.")
-	}
-	// Telemetry: when nothing matched (no Cause, no AffectedRef), log once
-	// so operators can grep server logs for "operation errors that escaped
-	// the recognizer" and tune the pattern table. The dedup is necessary
-	// because the GitOps detail page polls every 2s during a running op —
-	// a single unrecognized failure would otherwise spam the log.
-	if out.Cause == "" && out.AffectedKind == "" {
-		logUnrecognizedOpError(msg)
-	}
-	return out
-}
-
-var unrecognizedOpErrorLogged sync.Map
 
 // jqIgnoreLogged deduplicates the "jq-only ignoreDifferences" warning so it
 // fires once per (group, kind) over the process lifetime — Argo Application
@@ -1439,19 +1827,6 @@ func logJQIgnoreOnce(group, kind string) {
 		return
 	}
 	log.Printf("[gitops/drift] ignoreDifferences rule for %s/%s uses jqPathExpressions which Radar doesn't evaluate; some drift entries Argo's UI suppresses may appear here", group, kind)
-}
-
-func logUnrecognizedOpError(msg string) {
-	// Truncate at 200 chars: typical Argo error messages are short; outlier
-	// stack-trace dumps would otherwise flood the log line.
-	key := msg
-	if len(key) > 200 {
-		key = key[:200]
-	}
-	if _, loaded := unrecognizedOpErrorLogged.LoadOrStore(key, struct{}{}); loaded {
-		return
-	}
-	log.Printf("[gitops/insights] unrecognized argo operation error (no pattern matched): %q", key)
 }
 
 // detectPendingDeletion returns an Issue when the GitOps root resource has
@@ -1502,7 +1877,7 @@ func detectPendingDeletion(root *unstructured.Unstructured, resolver Resolver) *
 	if age < 0 {
 		age = 0
 	}
-	rel := formatAgeShort(age)
+	rel := timeutil.FormatAgeShort(age)
 
 	severity := SeverityInfo
 	reason := "Terminating"
@@ -1570,31 +1945,6 @@ func detectPendingDeletion(root *unstructured.Unstructured, resolver Resolver) *
 	}
 }
 
-// formatAgeShort renders a duration as a compact relative string used in
-// Issue messages: "3s", "12m", "4h", "21d".
-//
-// keep in sync: pkg/audit/checks.go::formatDurationShort (byte-identical)
-// and web/src/components/gitops/GitOpsView.tsx::formatRelativeAge
-// (TypeScript). Adding a new tier (e.g. "weeks") in one and not the
-// others would let the lifecycle banner, the chip tooltip, the audit
-// finding, and the fleet "Pending Nago" cell disagree on the same
-// duration. Worth consolidating into a shared package eventually.
-func formatAgeShort(d time.Duration) string {
-	if d < 0 {
-		d = 0
-	}
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh", int(d.Hours()))
-	default:
-		return fmt.Sprintf("%dd", int(d.Hours()/24))
-	}
-}
-
 // detectStuckDriftLoop emits a critical issue when an Argo Application is
 // in the "applied successfully but still drifted" state — the case where
 // the user stares at the OutOfSync badge for hours wondering why nothing
@@ -1621,7 +1971,11 @@ func detectStuckDriftLoop(root *unstructured.Unstructured) *Issue {
 	if phase != "Succeeded" {
 		return nil
 	}
-	if describeArgoAutoSync(root) == "Manual" {
+	// Self-heal must be ON for this to be a *loop*: the premise is that Argo
+	// keeps applying and the resource keeps reverting. With self-heal off, a
+	// persistent post-sync drift is expected (Argo won't re-correct it) —
+	// that's detectAutoDriftSelfHealOff's case, not a webhook fighting Argo.
+	if _, selfHeal := argoAutoSync(root); !selfHeal {
 		return nil
 	}
 	reconciledAt, _, _ := unstructured.NestedString(root.Object, "status", "reconciledAt")
@@ -1663,10 +2017,9 @@ func detectManualDriftWithoutAutoSync(root *unstructured.Unstructured) *Issue {
 	if sync != "OutOfSync" {
 		return nil
 	}
-	// Only fire when auto-sync is genuinely off. "Auto" with selfHeal off
-	// is a separate (more nuanced) case — Argo would still apply on a
-	// new Git revision, just not on manual drift; we leave that for a
-	// future refinement rather than risk a false-positive banner here.
+	// Only fire when auto-sync is genuinely off. "Auto" with self-heal off is
+	// the adjacent case — Argo applies on a new Git revision but won't correct
+	// live drift — and is owned by detectAutoDriftSelfHealOff.
 	if describeArgoAutoSync(root) != "Manual" {
 		return nil
 	}
@@ -1676,6 +2029,46 @@ func detectManualDriftWithoutAutoSync(root *unstructured.Unstructured) *Issue {
 		Reason:   "ManualDrift",
 		Message:  "Application is OutOfSync and auto-sync is disabled — nothing will reconcile until you click Sync.",
 		Action:   "Open Changes to review the per-resource diff, then click Sync to apply. Enable auto-sync if you want this to fix itself going forward.",
+	}
+}
+
+// argoAutoSync reports whether spec.syncPolicy.automated is present and, if so,
+// whether selfHeal is enabled within it. The two booleans distinguish the three
+// drift-reconciliation postures: manual (!automated), auto-deploy-only
+// (automated && !selfHeal), and auto-heal (automated && selfHeal).
+func argoAutoSync(root *unstructured.Unstructured) (automated, selfHeal bool) {
+	m, found, _ := unstructured.NestedMap(root.Object, "spec", "syncPolicy", "automated")
+	if !found {
+		return false, false
+	}
+	v, _ := m["selfHeal"].(bool)
+	return true, v
+}
+
+// detectAutoDriftSelfHealOff emits a warning when an Argo Application is
+// OutOfSync with auto-sync configured but self-heal disabled. In that posture
+// Argo deploys new Git revisions but never corrects drift in the live cluster,
+// so the app sits OutOfSync indefinitely with nothing to reconcile it. Without
+// this the operator sees drift under "auto-sync" and reasonably assumes it will
+// self-correct — it won't. Manual mode is owned by detectManualDriftWithoutAutoSync;
+// self-heal on is owned by detectStuckDriftLoop (or reconciles on its own).
+//
+// Returns nil when conditions don't match — caller appends only on hit.
+func detectAutoDriftSelfHealOff(root *unstructured.Unstructured) *Issue {
+	sync, _, _ := unstructured.NestedString(root.Object, "status", "sync", "status")
+	if sync != "OutOfSync" {
+		return nil
+	}
+	automated, selfHeal := argoAutoSync(root)
+	if !automated || selfHeal {
+		return nil
+	}
+	return &Issue{
+		Severity: SeverityWarning,
+		Scope:    ScopeOperation,
+		Reason:   "SelfHealDisabled",
+		Message:  "Application is OutOfSync and self-heal is disabled — auto-sync deploys new Git revisions but won't correct drift in the live cluster, so it will stay OutOfSync until you sync.",
+		Action:   "Open Changes to review the per-resource diff, then click Sync. Enable self-heal on the sync policy if you want Argo to auto-correct drift going forward.",
 	}
 }
 
@@ -1710,38 +2103,24 @@ func argoApplicationConditions(root *unstructured.Unstructured) []Issue {
 			continue
 		}
 		typ := gitops.StringValue(m["type"])
-		msg := gitops.StringValue(m["message"])
+		msg, rawMsg := diagnose.CleanArgoControllerMessageWithRaw(gitops.StringValue(m["message"]))
 		if typ == "" && msg == "" {
 			continue
 		}
 		severity := SeverityInfo
-		switch {
-		case strings.HasSuffix(typ, "Error"):
+		switch tok, _ := diagnose.SeverityForConditionType(typ); tok {
+		case "critical":
 			severity = SeverityCritical
-		case strings.HasSuffix(typ, "Warning"):
+		case "warning":
 			severity = SeverityWarning
 		}
-		action := ""
-		switch typ {
-		case "ComparisonError":
-			action = "Verify the repo URL, branch/tag, and credentials. Check argocd-repo-server logs for fetch errors."
-		case "InvalidSpecError":
-			action = "Fix the Application spec — check destination, source, and project references."
-		case "OrphanedResourceWarning":
-			action = "Resources exist in the destination namespace that aren't part of any application. Add to an app or label them as ignored."
-		case "RepeatedResourceWarning":
-			action = "The same resource is declared by multiple Argo Applications. Remove the duplicate declaration."
-		case "ExcludedResourceWarning":
-			action = "A managed resource is excluded by the Argo controller's resource.exclusions. Adjust controller config or remove the resource."
-		case "SharedResourceWarning":
-			action = "This resource is also tracked by another Application. Move it to a single owner."
-		}
 		out = append(out, Issue{
-			Severity: severity,
-			Scope:    ScopeCondition,
-			Reason:   fallback(typ, "Condition"),
-			Message:  fallback(msg, typ),
-			Action:   action,
+			Severity:   severity,
+			Scope:      ScopeCondition,
+			Reason:     fallback(typ, "Condition"),
+			Message:    fallback(msg, typ),
+			RawMessage: rawMsg,
+			Action:     diagnose.ActionForCondition(typ),
 		})
 	}
 	return out

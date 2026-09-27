@@ -13,6 +13,16 @@ type DetectionResult = pkgtraffic.DetectionResult
 type FlowOptions = pkgtraffic.FlowOptions
 type Flow = pkgtraffic.Flow
 type Endpoint = pkgtraffic.Endpoint
+type PolicyVerdict = pkgtraffic.PolicyVerdict
+type PolicyRef = pkgtraffic.PolicyRef
+
+const (
+	EndpointKindPod      = pkgtraffic.EndpointKindPod
+	EndpointKindExternal = pkgtraffic.EndpointKindExternal
+	EndpointKindHost     = pkgtraffic.EndpointKindHost
+	EndpointKindUnknown  = pkgtraffic.EndpointKindUnknown
+)
+
 type FlowsResponse = pkgtraffic.FlowsResponse
 type AggregatedFlow = pkgtraffic.AggregatedFlow
 type HTTPPathStat = pkgtraffic.HTTPPathStat
@@ -23,6 +33,13 @@ type Recommendation = pkgtraffic.Recommendation
 type HelmChartInfo = pkgtraffic.HelmChartInfo
 type SourcesResponse = pkgtraffic.SourcesResponse
 
+// Re-export FlowsResponse.WarningKind values from pkg/traffic.
+const (
+	WarningTransient = pkgtraffic.WarningTransient
+	WarningPartial   = pkgtraffic.WarningPartial
+)
+
 // Re-export functions from pkg/traffic.
 var AggregateFlows = pkgtraffic.AggregateFlows
+var RoundRate = pkgtraffic.RoundRate
 var DefaultFlowOptions = pkgtraffic.DefaultFlowOptions

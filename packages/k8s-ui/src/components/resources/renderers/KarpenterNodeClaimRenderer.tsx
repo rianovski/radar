@@ -1,6 +1,6 @@
 import { Server, Cpu, Settings } from 'lucide-react'
 import { clsx } from 'clsx'
-import { Section, PropertyList, Property, ConditionsSection, AlertBanner, ResourceLink } from '../../ui/drawer-components'
+import { Section, PropertyList, Property, ConditionsSection, AlertBanner, ResourceLink, useOperationalIssuesShown } from '../../ui/drawer-components'
 import { kindToPlural } from '../../../utils/navigation'
 import { CAPACITY_TYPE_BADGE, BADGE_INACTIVE } from '../../../utils/badge-colors'
 import {
@@ -40,6 +40,7 @@ export function KarpenterNodeClaimRenderer({ data, onNavigate }: KarpenterNodeCl
 
   const claimStatus = getNodeClaimStatus(data)
   const isNotReady = claimStatus.level === 'unhealthy'
+  const operationalIssuesShown = useOperationalIssuesShown()
   const readyCond = conditions.find((c: any) => c.type === 'Ready')
   const capacity = getNodeClaimCapacity(data)
   const requirements = getNodeClaimRequirements(data)
@@ -61,7 +62,7 @@ export function KarpenterNodeClaimRenderer({ data, onNavigate }: KarpenterNodeCl
   return (
     <>
       {/* Problem alert */}
-      {isNotReady && (
+      {isNotReady && !operationalIssuesShown && (
         <AlertBanner
           variant="error"
           title="NodeClaim Not Ready"
@@ -185,9 +186,9 @@ export function KarpenterNodeClaimRenderer({ data, onNavigate }: KarpenterNodeCl
                 <span
                   className={clsx(
                     'w-5 h-5 rounded-full flex items-center justify-center text-xs shrink-0',
-                    isComplete && 'bg-green-500/20 text-green-400',
-                    isCurrent && 'bg-blue-500/20 text-blue-400',
-                    isFailed && 'bg-red-500/20 text-red-400',
+                    isComplete && 'status-green',
+                    isCurrent && 'status-blue',
+                    isFailed && 'status-red',
                     isPending && !isCurrent && BADGE_INACTIVE
                   )}
                 >

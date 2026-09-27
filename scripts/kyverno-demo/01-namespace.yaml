@@ -1,0 +1,9 @@
+# The label is load-bearing: require-run-as-nonroot scopes itself to it via
+# matchConstraints.namespaceSelector, so the Deny path only fires here and
+# doesn't block unrelated workloads elsewhere in the cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: policy-demo
+  labels:
+    policy-demo: "true"

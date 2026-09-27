@@ -1,52 +1,49 @@
 package k8s
 
 import (
+	"maps"
 	"sync"
+	"time"
 
 	"github.com/skyhook-io/radar/pkg/k8score"
+	"github.com/skyhook-io/radar/pkg/policyreports"
+	batchv1 "k8s.io/api/batch/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	fakeclientset "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 )
 
-// InitTestResourceCache creates a resource cache from a fake or test client,
-// bypassing RBAC checks and the normal Initialize/InitResourceCache flow.
-// All resource types are enabled. Call ResetTestState to clean up.
+// InitLoadTestResourceCache creates a resource cache from a fake client using
+// the live path's deferred-informer split, so the critical/deferred phases and
+// the warmup window they drive actually exist. InitTestResourceCache syncs
+// everything at once, which is what unit tests want and makes it useless for
+// measuring anything that depends on startup phases.
 //
-// This is intended for integration tests only.
-func InitTestResourceCache(client kubernetes.Interface) error {
+// Intended for load-test harnesses, not unit tests.
+func InitLoadTestResourceCache(client kubernetes.Interface) error {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
 
-	enabled := map[string]bool{
-		"pods":                     true,
-		"services":                 true,
-		"deployments":              true,
-		"daemonsets":               true,
-		"statefulsets":             true,
-		"replicasets":              true,
-		"ingresses":                true,
-		"configmaps":               true,
-		"secrets":                  true,
-		"events":                   true,
-		"persistentvolumeclaims":   true,
-		"nodes":                    true,
-		"namespaces":               true,
-		"jobs":                     true,
-		"cronjobs":                 true,
-		"horizontalpodautoscalers": true,
-		"persistentvolumes":        true,
-		"storageclasses":           true,
-		"poddisruptionbudgets":     true,
-		"roles":                    true,
-		"clusterroles":             true,
-		"rolebindings":             true,
-		"clusterrolebindings":      true,
-	}
+	enabled := allTestResourceTypes()
+	deferred := make(map[string]bool, len(deferredResources))
+	maps.Copy(deferred, deferredResources)
 
+	secretWriteTimes := newSecretDataManagerWriteIndex()
+	cronJobScheduleObservations := newCronJobScheduleObservationTracker()
 	cfg := k8score.CacheConfig{
 		Client:        client,
 		ResourceTypes: enabled,
-		// No deferred types for tests — all sync immediately
-		DeferredTypes: map[string]bool{},
+		DeferredTypes: deferred,
+		OnTransform: func(obj any) {
+			secretWriteTimes.capture(obj)
+		},
+		OnObservedChange: func(change k8score.ResourceChange, obj, _ any) {
+			secretWriteTimes.reconcile(change, obj)
+			if cj, ok := obj.(*batchv1.CronJob); ok {
+				cronJobScheduleObservations.observe(change.Operation, cj)
+			}
+		},
 	}
 
 	core, err := k8score.NewResourceCache(cfg)
@@ -54,18 +51,222 @@ func InitTestResourceCache(client kubernetes.Interface) error {
 		return err
 	}
 
-	initialSyncComplete = true
+	initialSyncComplete.Store(core.IsSyncComplete())
 
-	resourceCache = &ResourceCache{
-		ResourceCache:  core,
-		secretsEnabled: true,
+	resourceCache.Store(&ResourceCache{
+		ResourceCache:               core,
+		secretsEnabled:              true,
+		cronJobScheduleObservations: cronJobScheduleObservations,
+		secretWriteTimes:            secretWriteTimes,
+	})
+
+	cacheOnce = new(sync.Once)
+	cacheOnce.Do(func() {})
+
+	return nil
+}
+
+// InitTestPromotedSyncingCache builds a cache whose Phase-1 wait returns via
+// the patience/minimal-set path while some critical kinds are still syncing
+// (delay their informer start via syncDelays), promoting them at runtime — the
+// state a SyncTimeout produces in production. syncTimeout bounds Phase 1 and
+// deferredSyncTimeout bounds the promoted kinds' background sync, so a test
+// can walk the full progressive contract: kind_sync_pending -> kind_sync_failed
+// -> served after a late sync. Call ResetResourceCache to clean up.
+//
+// This is intended for integration tests only.
+func InitTestPromotedSyncingCache(client kubernetes.Interface, syncTimeout, deferredSyncTimeout time.Duration, syncDelays map[string]time.Duration) error {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+
+	secretWriteTimes := newSecretDataManagerWriteIndex()
+	cronJobScheduleObservations := newCronJobScheduleObservationTracker()
+	cfg := k8score.CacheConfig{
+		Client:              client,
+		ResourceTypes:       allTestResourceTypes(),
+		DeferredTypes:       map[string]bool{},
+		PatienceWindow:      20 * time.Millisecond,
+		MinimalSet:          map[string]bool{"services": true},
+		SyncTimeout:         syncTimeout,
+		DeferredSyncTimeout: deferredSyncTimeout,
+		// Delaying the informer START is the only safe way to hold a kind
+		// unsynced against a fake clientset: a blocking list reactor wedges
+		// every other kind too (reactors run under the fake's lock).
+		DebugSyncDelays: syncDelays,
 	}
+
+	core, err := k8score.NewResourceCache(cfg)
+	if err != nil {
+		return err
+	}
+
+	initialSyncComplete.Store(core.IsSyncComplete())
+	resourceCache.Store(&ResourceCache{
+		ResourceCache:               core,
+		secretsEnabled:              true,
+		cronJobScheduleObservations: cronJobScheduleObservations,
+		secretWriteTimes:            secretWriteTimes,
+	})
+	cacheOnce = new(sync.Once)
+	cacheOnce.Do(func() {})
+	return nil
+}
+
+// InitTestResourceCache creates a resource cache from a fake or test client,
+// bypassing RBAC checks and the normal Initialize/InitResourceCache flow.
+// All resource types are enabled. Call ResetTestState to clean up.
+//
+// This is intended for integration tests only.
+func InitTestResourceCache(client kubernetes.Interface) error {
+	return initTestResourceCache(client, nil)
+}
+
+// InitScopedTestResourceCache is InitTestResourceCache with per-kind scopes,
+// the shape probe-based RBAC gating produces when a kind cannot be listed
+// cluster-wide. It is what lets a test reach the paths that must refuse to
+// read an informer covering other namespaces.
+func InitScopedTestResourceCache(client kubernetes.Interface, scopes map[string]k8score.ResourceScope) error {
+	return initTestResourceCache(client, scopes)
+}
+
+func initTestResourceCache(client kubernetes.Interface, scopes map[string]k8score.ResourceScope) error {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+
+	enabled := allTestResourceTypes()
+	if scopes != nil {
+		enabled = map[string]bool{}
+		for kind, scope := range scopes {
+			if scope.Enabled {
+				enabled[kind] = true
+			}
+		}
+	}
+
+	secretWriteTimes := newSecretDataManagerWriteIndex()
+	cronJobScheduleObservations := newCronJobScheduleObservationTracker()
+	cfg := k8score.CacheConfig{
+		Client:        client,
+		ResourceTypes: enabled,
+		// No deferred types for tests — all sync immediately
+		DeferredTypes:  map[string]bool{},
+		ResourceScopes: scopes,
+		OnTransform: func(obj any) {
+			secretWriteTimes.capture(obj)
+		},
+		OnObservedChange: func(change k8score.ResourceChange, obj, _ any) {
+			secretWriteTimes.reconcile(change, obj)
+			if cj, ok := obj.(*batchv1.CronJob); ok {
+				cronJobScheduleObservations.observe(change.Operation, cj)
+			}
+		},
+	}
+
+	core, err := k8score.NewResourceCache(cfg)
+	if err != nil {
+		return err
+	}
+
+	initialSyncComplete.Store(true)
+
+	resourceCache.Store(&ResourceCache{
+		ResourceCache:               core,
+		secretsEnabled:              true,
+		cronJobScheduleObservations: cronJobScheduleObservations,
+		secretWriteTimes:            secretWriteTimes,
+	})
 
 	// Mark cacheOnce as "already executed" so InitResourceCache is a no-op.
 	cacheOnce = new(sync.Once)
 	cacheOnce.Do(func() {})
 
+	waitForInformerStatuses(resourceCache.Load())
+
 	return nil
+}
+
+// waitForInformerStatuses blocks until every informer's InformerSyncStatus
+// reports synced.
+//
+// NewResourceCache returns as soon as the informers themselves report synced,
+// but InformerSyncStatus.Synced is a mirror of that, flipped by a goroutine per
+// informer. Nothing in the product waits on the mirror, so the gap is invisible
+// there — but IsKindReady reads it, and the missing-reference detectors gate on
+// IsKindReady and fail toward silence, so a test that queries on the next line
+// can see a fully-populated cache report nothing at all.
+//
+// The gap is normally sub-millisecond and closes on its own; it only widens
+// when the machine is loaded enough to delay scheduling those goroutines, which
+// is why this reproduced in CI and never locally.
+//
+// Best-effort: on timeout the caller proceeds and its own assertions report the
+// real problem, rather than this returning an error that every call site would
+// have to handle.
+func waitForInformerStatuses(rc *ResourceCache) {
+	if rc == nil {
+		return
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		st := rc.GetSyncStatus()
+		if len(st.PendingCritical) == 0 && len(st.PendingDeferred) == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// InitTestDynamicResourceCache wires the dynamic resource cache and discovery
+// singletons against test fakes. Pass a dynamic client (typically from
+// dynamicfake.NewSimpleDynamicClientWithCustomListKinds) and the set of
+// APIResources to register in discovery. Each registered resource gets a GVR
+// entry that group-qualified lookups (GetGVRWithGroup) and dynamic informers
+// can resolve.
+//
+// Callers should defer ResetTestDynamicState — without it, the dynamic
+// singletons leak into other tests that share TestMain state.
+//
+// This is intended for integration tests only.
+func InitTestDynamicResourceCache(dynClient dynamic.Interface, resources []APIResource) error {
+	clientMu.Lock()
+	dynamicClient = dynClient
+	clientMu.Unlock()
+
+	// Bootstrap discovery from a fake clientset so NewResourceDiscovery has a
+	// non-nil discovery client; AddAPIResource then registers the test-only
+	// GVRs (e.g. serving.knative.dev/Service) the test depends on.
+	fakeDisc := fakeclientset.NewSimpleClientset().Discovery()
+	core, err := k8score.NewResourceDiscovery(fakeDisc)
+	if err != nil {
+		clientMu.Lock()
+		dynamicClient = nil
+		clientMu.Unlock()
+		return err
+	}
+	for _, r := range resources {
+		core.AddAPIResource(r)
+	}
+
+	// Installing the singleton directly is what marks discovery initialized —
+	// InitResourceDiscovery returns early when it is already set. The binding
+	// marks it valid for whatever client the test environment has (usually
+	// nil): the singleton is served only while that binding stays current.
+	discoveryMu.Lock()
+	resourceDiscovery = &ResourceDiscovery{ResourceDiscovery: core}
+	resourceDiscoveryClient = GetDiscoveryClient()
+	discoveryMu.Unlock()
+
+	return InitDynamicResourceCache(nil)
+}
+
+// ResetTestDynamicState tears down the dynamic cache + discovery singletons
+// and clears the dynamic client. Pairs with InitTestDynamicResourceCache.
+func ResetTestDynamicState() {
+	ResetDynamicResourceCache()
+	ResetResourceDiscovery()
+	clientMu.Lock()
+	dynamicClient = nil
+	clientMu.Unlock()
 }
 
 // SetTestContextName is a test-only helper that overrides the package-level
@@ -80,23 +281,189 @@ func SetTestContextName(name string) string {
 	return prev
 }
 
+// SetTestLocalMode makes IsInCluster report local mode and returns a restore func.
+func SetTestLocalMode() func() {
+	clientMu.Lock()
+	previousInitializationStarted := initializationStarted
+	previousKubeconfigMode := kubeconfigMode
+	previousForceInCluster := ForceInCluster
+	initializationStarted = true
+	kubeconfigMode = "single"
+	ForceInCluster = false
+	clientMu.Unlock()
+
+	return func() {
+		clientMu.Lock()
+		initializationStarted = previousInitializationStarted
+		kubeconfigMode = previousKubeconfigMode
+		ForceInCluster = previousForceInCluster
+		clientMu.Unlock()
+	}
+}
+
+// SetTestRegistryEntry is a test-only helper that registers one context in the
+// isolated-load registry, so callers can exercise resolution against a
+// multi-kubeconfig layout. Returns a restore func.
+func SetTestRegistryEntry(qualifiedName, sourceFile, inFileName string) func() {
+	clientMu.Lock()
+	prev := contextRegistry
+	next := make(map[string]contextEntry, len(prev)+1)
+	for k, v := range prev {
+		next[k] = v
+	}
+	next[qualifiedName] = contextEntry{SourceFile: sourceFile, InFileName: inFileName}
+	contextRegistry = next
+	clientMu.Unlock()
+	return func() {
+		clientMu.Lock()
+		contextRegistry = prev
+		clientMu.Unlock()
+	}
+}
+
+// SetTestContextNamespace is a test-only helper that overrides the package-level
+// kubeconfig context namespace. Returns the previous value so callers can
+// restore it on cleanup.
+func SetTestContextNamespace(ns string) string {
+	clientMu.Lock()
+	prev := contextNamespace
+	contextNamespace = ns
+	clientMu.Unlock()
+	return prev
+}
+
+// SetTestContextUsesExec overrides whether the current context uses exec auth
+// and returns the previous value so callers can restore it on cleanup.
+func SetTestContextUsesExec(enabled bool) bool {
+	clientMu.Lock()
+	prev := contextUsesExec
+	contextUsesExec = enabled
+	clientMu.Unlock()
+	return prev
+}
+
+// SetTestClient overrides the package-level client and returns the previous
+// value so tests in other packages can restore it.
+func SetTestClient(c *kubernetes.Clientset) *kubernetes.Clientset {
+	clientMu.Lock()
+	prev := k8sClient
+	k8sClient = c
+	clientMu.Unlock()
+	return prev
+}
+
+// SetTestPolicyReportIndex publishes a PolicyReport index directly, bypassing
+// CRD discovery and the informer warmup that normally build it.
+//
+// Publishing an index is also what makes GetPolicyReportStatus report Ready, so
+// this is the whole seam: the policy surfaces read exactly these two together.
+// Without it the per-policy handlers return their empty response before any of
+// the authorization logic runs, and a test against them would assert nothing
+// while appearing to cover the endpoint.
+//
+// Returns the previous index so a test can restore it.
+//
+// This is intended for integration tests only.
+// SetTestConfig publishes a rest.Config directly, so a handler that resolves a
+// per-request config can run without a real cluster connection. SetTestClient
+// publishes the clientset but not the config, and a handler that needs both
+// bails out early with "cluster client not available" if only one is set.
+//
+// Returns the previous config so a test can restore it.
+//
+// This is intended for integration tests only.
+func SetTestConfig(c *rest.Config) *rest.Config {
+	clientMu.Lock()
+	prev := k8sConfig
+	k8sConfig = c
+	clientMu.Unlock()
+	return prev
+}
+
+func SetTestPolicyReportIndex(idx *policyreports.Index) *policyreports.Index {
+	prev := policyReportIndex.Load()
+	policyReportIndex.Store(idx)
+	return prev
+}
+
 // ResetTestState tears down the resource cache and resets all package-level
 // state so the next test starts clean.
 //
 // This is intended for integration tests only.
 func ResetTestState() {
+	// Join the old recovery worker before replacing hooks or state it may still use.
+	runtimeAuthRecoveryOwed.Store(false)
+	deadline := time.Now().Add(connectionTestOperationTimeout() + time.Second)
+	for runtimeAuthRecoveryActive.Load() {
+		select {
+		case runtimeAuthRecoveryNudge <- struct{}{}:
+		default:
+		}
+		if time.Now().After(deadline) {
+			panic("runtime authentication recovery worker did not stop during test cleanup")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-runtimeAuthRecoveryNudge:
+	default:
+	}
+
+	policyReportIndex.Store(nil)
+
 	// Reset resource cache
 	ResetResourceCache()
 
 	// Reset connection state
 	connectionStatusMu.Lock()
 	connectionStatus = ConnectionStatus{}
+	clusterLivenessProbe = defaultClusterLivenessProbe
 	connectionStatusMu.Unlock()
 
 	// Reset connection callbacks
 	connectionCallbacksMu.Lock()
 	connectionCallbacks = nil
 	connectionCallbacksMu.Unlock()
+
+	contextSwitchMu.Lock()
+	beforeContextSwitchCallbacks = nil
+	contextSwitchCallbacks = nil
+	namespaceRescopeCallbacks = nil
+	contextSwitchProgressCallbacks = nil
+	contextSwitchMu.Unlock()
+
+	runtimeAuthChecksMu.Lock()
+	runtimeAuthChecks = make(map[uint64]struct{})
+	runtimeAuthCooldownGeneration = 0
+	runtimeAuthProbeNotBefore = time.Time{}
+	runtimeAuthInconclusiveStreak = 0
+	runtimeAuthProbe = TestClusterConnection
+	runtimeAuthEndpointProbe = defaultRuntimeAuthEndpointProbe
+	runtimeAuthReconnect = nil
+	runtimeAuthRecoveryInitialInterval = defaultRuntimeAuthRecoveryInitialInterval
+	runtimeAuthRecoveryMaxInterval = defaultRuntimeAuthRecoveryMaxInterval
+	runtimeAuthRecoveryHungInterval = defaultRuntimeAuthRecoveryHungInterval
+	runtimeAuthChecksMu.Unlock()
+	activeContextOperations.Store(0)
+	clientMu.Lock()
+	k8sConfig = nil
+	k8sClient = nil
+	discoveryClient = nil
+	dynamicClient = nil
+	activeClientGeneration = 0
+	kubeconfigMode = ""
+	contextBinding = ""
+	activeSourceFile = ""
+	activeSourceName = ""
+	activeSourceConfig = nil
+	initializationStarted = false
+	kubeconfigDirectoryFileCount = 0
+	kubeconfigDirectoryPaths = nil
+	kubeconfigEnvWasIgnored = false
+	kubeconfigEnvIgnoredReason = ""
+	capiKubeconfigs = make(map[string]string)
+	preCapiPromotion = nil
+	clientMu.Unlock()
 
 	// Reset capabilities cache
 	capabilitiesMu.Lock()
@@ -107,7 +474,45 @@ func ResetTestState() {
 	resourcePermsMu.Lock()
 	cachedPermResult = nil
 	resourcePermsMu.Unlock()
+	ForceNamespaceScope = false
+	SetFallbackNamespace("")
+	ClearNamespaceScopeOverride()
+	SetNamespaceScopePreferenceResolver(nil)
 
 	// Reset operation context so stale cancellations don't leak between tests
 	CancelOngoingOperations()
+}
+
+// allTestResourceTypes enables every kind the typed cache knows about.
+func allTestResourceTypes() map[string]bool {
+	return map[string]bool{
+		"pods":                     true,
+		"services":                 true,
+		"deployments":              true,
+		"daemonsets":               true,
+		"statefulsets":             true,
+		"replicasets":              true,
+		"ingresses":                true,
+		"configmaps":               true,
+		"secrets":                  true,
+		"events":                   true,
+		"persistentvolumeclaims":   true,
+		"resourcequotas":           true,
+		"nodes":                    true,
+		"namespaces":               true,
+		"jobs":                     true,
+		"cronjobs":                 true,
+		"horizontalpodautoscalers": true,
+		"persistentvolumes":        true,
+		"storageclasses":           true,
+		"poddisruptionbudgets":     true,
+		"roles":                    true,
+		"clusterroles":             true,
+		"rolebindings":             true,
+		"clusterrolebindings":      true,
+		"serviceaccounts":          true,
+		"ingressclasses":           true,
+		"networkpolicies":          true,
+		"limitranges":              true,
+	}
 }
