@@ -1,4 +1,4 @@
-import { useMemo, useEffect, useState, useCallback, useRef } from 'react'
+import { useMemo, useEffect, useState, useCallback, useRef, type MutableRefObject } from 'react'
 import {
   ReactFlow,
   Background,
@@ -20,8 +20,10 @@ import type { AggregatedFlow } from '../../types'
 import { clsx } from 'clsx'
 import { X, ArrowRight, Globe, Server, Activity, Puzzle } from 'lucide-react'
 import { isClusterAddon, type AddonMode } from './TrafficView'
-import { SEVERITY_BADGE, SEVERITY_TEXT } from '@skyhook-io/k8s-ui/utils/badge-colors'
+import { SEVERITY_BADGE, SEVERITY_DOT, SEVERITY_TEXT } from '@skyhook-io/k8s-ui/utils/badge-colors'
 import { getNamespaceColor } from '../../utils/traffic-colors'
+import { Tooltip } from '../ui/Tooltip'
+import { isRateBasedSource, isExternalKind } from './trafficFilters'
 
 const elk = new ELK()
 
@@ -86,10 +88,10 @@ function latencyColor(ms: number): string {
 }
 
 const STATUS_COLORS: Record<string, { bg: string; text: string }> = {
-  '2xx': { bg: 'bg-emerald-500', text: SEVERITY_TEXT.success },
-  '3xx': { bg: 'bg-amber-500', text: SEVERITY_TEXT.neutral },
-  '4xx': { bg: 'bg-amber-500', text: SEVERITY_TEXT.warning },
-  '5xx': { bg: 'bg-red-500', text: SEVERITY_TEXT.error },
+  '2xx': { bg: SEVERITY_DOT.success, text: SEVERITY_TEXT.success },
+  '3xx': { bg: SEVERITY_DOT.info, text: SEVERITY_TEXT.info },
+  '4xx': { bg: SEVERITY_DOT.warning, text: SEVERITY_TEXT.warning },
+  '5xx': { bg: SEVERITY_DOT.error, text: SEVERITY_TEXT.error },
 }
 
 const VERDICT_BADGE: Record<string, string> = {
@@ -170,7 +172,7 @@ const MAX_VISIBLE_PORTS = 4 // Maximum ports to show before "+N more"
 
 // Custom node component
 function TrafficNode({ data }: { data: TrafficNodeData }) {
-  const isExternal = data.kind.toLowerCase() === 'external'
+  const isExternal = isExternalKind(data.kind)
   const isInternet = data.kind === 'Internet'
   const isAddonInternet = data.kind === 'AddonInternet' // Separate internet for addon traffic
   const isAddon = data.kind === 'Addon'
@@ -279,16 +281,21 @@ function TrafficNode({ data }: { data: TrafficNodeData }) {
               )}>
                 :{portInfo.port}
               </span>
-              <span className={clsx(
-                'truncate',
-                data.isHotPath
-                  ? 'text-orange-400'
-                  : (hasNamespaceColor || isAddonNode)
-                    ? 'text-white/60'
-                    : 'text-theme-text-tertiary'
-              )}>
-                {formatConnections(portInfo.connections)}
-              </span>
+              {/* A port serving traffic with no HTTP has no request rate to show, and
+                  "0" beside the port reads as an idle port rather than an unmeasured
+                  one. The port itself is still worth listing. */}
+              {portInfo.connections > 0 && (
+                <span className={clsx(
+                  'truncate',
+                  data.isHotPath
+                    ? 'text-orange-400'
+                    : (hasNamespaceColor || isAddonNode)
+                      ? 'text-white/60'
+                      : 'text-theme-text-tertiary'
+                )}>
+                  {formatConnections(portInfo.connections)}{data.connLabel === 'req/s' ? '/s' : ''}
+                </span>
+              )}
             </div>
           ))}
           {data.ports.filter(p => p.port !== 0).length > MAX_VISIBLE_PORTS && (
@@ -302,7 +309,7 @@ function TrafficNode({ data }: { data: TrafficNodeData }) {
         </div>
       )}
       {/* Total connections (only if no ports shown, or all ports are 0) */}
-      {(!data.ports || data.ports.filter(p => p.port !== 0).length === 0) && data.totalConnections && data.totalConnections > 0 && (
+      {(!data.ports || data.ports.filter(p => p.port !== 0).length === 0) && data.totalConnections != null && data.totalConnections > 0 && (
         <div className="mt-1">
           <span className={clsx(
             'text-xs truncate',
@@ -337,6 +344,19 @@ function TrafficLegend() {
             <line x1="0" y1="4" x2="24" y2="4" stroke="#3b82f6" strokeWidth="2" />
           </svg>
           <span className="text-theme-text-secondary">HTTP / gRPC</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <svg width="24" height="8" className="shrink-0" aria-hidden="true">
+            <line x1="0" y1="4" x2="20" y2="4" stroke="currentColor" strokeWidth="2" className="text-theme-text-tertiary" />
+            <polygon points="20,1 24,4 20,7" className="fill-theme-text-tertiary" />
+          </svg>
+          <span className="text-theme-text-secondary">Arrow = who opened it</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <svg width="24" height="8" className="shrink-0" aria-hidden="true">
+            <line x1="0" y1="4" x2="24" y2="4" stroke="currentColor" strokeWidth="2" className="text-theme-text-tertiary" />
+          </svg>
+          <span className="text-theme-text-secondary">No arrow = direction unknown</span>
         </div>
         <div className="flex items-center gap-2">
           <svg width="24" height="8" className="shrink-0">
@@ -401,12 +421,14 @@ function DetailsPanel({
   selection,
   onClose,
   flows,
-  isIstio,
+  isRateBased,
 }: {
   selection: Selection
   onClose: () => void
   flows: AggregatedFlow[]
-  isIstio: boolean
+  // True for sources that measure a rate rather than counting connections —
+  // Istio and Beyla both do. Changes the wording and the /s suffix.
+  isRateBased: boolean
 }) {
   if (!selection) return null
 
@@ -493,7 +515,7 @@ function DetailsPanel({
               <Globe className="h-4 w-4 text-sky-400" />
             ) : nodeData?.kind === 'Addon' ? (
               <Server className="h-4 w-4 text-purple-400" />
-            ) : nodeData?.kind.toLowerCase() === 'external' ? (
+            ) : nodeData && isExternalKind(nodeData.kind) ? (
               <Globe className="h-4 w-4 text-yellow-500" />
             ) : (
               <Server className="h-4 w-4 text-blue-500" />
@@ -532,7 +554,7 @@ function DetailsPanel({
                     ? 'bg-sky-500/20 text-sky-400'
                     : nodeData.kind === 'Addon'
                       ? 'bg-purple-500/20 text-purple-400'
-                      : nodeData.kind.toLowerCase() === 'external'
+                      : isExternalKind(nodeData.kind)
                         ? 'bg-yellow-500/20 text-yellow-400'
                         : 'bg-blue-500/20 text-blue-400'
                 )}>{nodeData.kind === 'Addon' ? 'Cluster Addons' : nodeData.kind}</span>
@@ -547,10 +569,10 @@ function DetailsPanel({
                   Service: <span className="text-theme-text-primary capitalize">{nodeData.serviceCategory}</span>
                 </div>
               )}
-              {nodeData.totalConnections && (
+              {nodeData.totalConnections != null && nodeData.totalConnections > 0 && (
                 <div className="text-xs text-theme-text-secondary">
-                  {isIstio ? 'Total request rate' : 'Total connections'}: <span className="text-theme-text-primary font-medium">
-                    {formatConnections(nodeData.totalConnections)}{isIstio ? '/s' : ''}
+                  {isRateBased ? 'Total request rate' : 'Total connections'}: <span className="text-theme-text-primary font-medium">
+                    {formatConnections(nodeData.totalConnections)}{isRateBased ? '/s' : ''}
                   </span>
                 </div>
               )}
@@ -604,7 +626,7 @@ function DetailsPanel({
                         .map(([proto, count]) => (
                           <span key={proto} className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-theme-bg text-theme-text-secondary">
                             <span className="font-medium">{proto}</span>
-                            <span className="text-theme-text-tertiary">{formatConnections(count)}</span>
+                            <span className="text-theme-text-tertiary">{formatConnections(count)}{isRateBased ? '/s' : ''}</span>
                           </span>
                         ))}
                     </div>
@@ -671,7 +693,15 @@ function DetailsPanel({
                         <span className="text-theme-text-primary truncate flex-1">
                           {flow.source.name}
                         </span>
-                        <ArrowRight className="h-3 w-3 text-theme-text-tertiary shrink-0" />
+                        {/* Same rule as the canvas and the edge panel: an edge nobody
+                            could orient is not drawn with an arrow. */}
+                        {flow.directionUnknown ? (
+                          <Tooltip content="Neither end was reported as the initiator">
+                            <span className="text-theme-text-tertiary shrink-0">&mdash;</span>
+                          </Tooltip>
+                        ) : (
+                          <ArrowRight className="h-3 w-3 text-theme-text-tertiary shrink-0" />
+                        )}
                         {flow.port !== 0 && (
                           <span className="text-blue-400 font-mono">:{flow.port}</span>
                         )}
@@ -680,17 +710,19 @@ function DetailsPanel({
                         <span className="px-1 py-0.5 rounded bg-theme-bg text-theme-text-tertiary uppercase">
                           {flow.protocol || 'tcp'}
                         </span>
-                        <span className="text-theme-text-secondary">
-                          {formatConnections(flow.connections)} {isIstio ? 'req/s' : 'conn'}
-                        </span>
+                        {flow.connections > 0 && (
+                          <span className="text-theme-text-secondary">
+                            {formatConnections(flow.connections)} {isRateBased ? 'req/s' : 'conn'}
+                          </span>
+                        )}
                         {(flow.bytesSent > 0 || flow.bytesRecv > 0) && (
                           <span className="text-theme-text-tertiary">
                             {formatBytes(flow.bytesSent + flow.bytesRecv)}
                           </span>
                         )}
-                        {flow.errorCount && flow.errorCount > 0 && (
+                        {flow.errorCount != null && flow.errorCount > 0 && (
                           <span className="text-red-400">
-                            {formatConnections(flow.errorCount)} err
+                            {formatConnections(flow.errorCount)} err{isRateBased ? '/s' : ''}
                           </span>
                         )}
                       </div>
@@ -712,7 +744,13 @@ function DetailsPanel({
                     .map((flow, i) => (
                     <div key={i} className="text-xs p-2 rounded bg-theme-elevated space-y-1">
                       <div className="flex items-center gap-1.5">
-                        <ArrowRight className="h-3 w-3 text-theme-text-tertiary shrink-0" />
+                        {flow.directionUnknown ? (
+                          <Tooltip content="Neither end was reported as the initiator">
+                            <span className="text-theme-text-tertiary shrink-0">&mdash;</span>
+                          </Tooltip>
+                        ) : (
+                          <ArrowRight className="h-3 w-3 text-theme-text-tertiary shrink-0" />
+                        )}
                         <span className="text-theme-text-primary truncate flex-1">
                           {flow.destination.name}
                         </span>
@@ -724,17 +762,19 @@ function DetailsPanel({
                         <span className="px-1 py-0.5 rounded bg-theme-bg text-theme-text-tertiary uppercase">
                           {flow.protocol || 'tcp'}
                         </span>
-                        <span className="text-theme-text-secondary">
-                          {formatConnections(flow.connections)} {isIstio ? 'req/s' : 'conn'}
-                        </span>
+                        {flow.connections > 0 && (
+                          <span className="text-theme-text-secondary">
+                            {formatConnections(flow.connections)} {isRateBased ? 'req/s' : 'conn'}
+                          </span>
+                        )}
                         {(flow.bytesSent > 0 || flow.bytesRecv > 0) && (
                           <span className="text-theme-text-tertiary">
                             {formatBytes(flow.bytesSent + flow.bytesRecv)}
                           </span>
                         )}
-                        {flow.errorCount && flow.errorCount > 0 && (
+                        {flow.errorCount != null && flow.errorCount > 0 && (
                           <span className="text-red-400">
-                            {formatConnections(flow.errorCount)} err
+                            {formatConnections(flow.errorCount)} err{isRateBased ? '/s' : ''}
                           </span>
                         )}
                       </div>
@@ -752,7 +792,16 @@ function DetailsPanel({
             <div className="space-y-2">
               <div className="flex items-center gap-2 text-sm">
                 <span className="text-theme-text-primary truncate">{edgeData.source.split('/').pop()}</span>
-                <ArrowRight className="h-4 w-4 text-theme-text-tertiary shrink-0" />
+                {edgeData.flow?.directionUnknown ? (
+                  // The graph omits the arrowhead on this edge because nothing
+                  // established which end opened the conversation. An arrow here
+                  // would assert exactly what the graph is declining to claim.
+                  <Tooltip content="Neither end was reported as the initiator">
+                    <span className="text-theme-text-tertiary shrink-0">&mdash;</span>
+                  </Tooltip>
+                ) : (
+                  <ArrowRight className="h-4 w-4 text-theme-text-tertiary shrink-0" />
+                )}
                 <span className="text-theme-text-primary truncate">{edgeData.target.split('/').pop()}</span>
               </div>
 
@@ -771,12 +820,17 @@ function DetailsPanel({
                       : edgeData.protocol}
                   </div>
                 </div>
-                <div className="p-2 rounded bg-theme-elevated">
-                  <div className="text-theme-text-tertiary">{isIstio ? 'Request Rate' : 'Connections'}</div>
-                  <div className="text-theme-text-primary font-medium">
-                    {formatConnections(edgeData.connections)}{isIstio ? '/s' : ''}
+                {(!isRateBased || edgeData.connections > 0) && (
+                  // A rate-based source reports no request rate for traffic with no
+                  // HTTP, and "0/s" beside a data figure in megabytes reads as "no
+                  // traffic" rather than "not measured".
+                  <div className="p-2 rounded bg-theme-elevated">
+                    <div className="text-theme-text-tertiary">{isRateBased ? 'Request Rate' : 'Connections'}</div>
+                    <div className="text-theme-text-primary font-medium">
+                      {formatConnections(edgeData.connections)}{isRateBased ? '/s' : ''}
+                    </div>
                   </div>
-                </div>
+                )}
                 {edgeData.flow && (edgeData.flow.bytesSent > 0 || edgeData.flow.bytesRecv > 0) && (
                   <div className="p-2 rounded bg-theme-elevated">
                     <div className="text-theme-text-tertiary">Data</div>
@@ -785,7 +839,7 @@ function DetailsPanel({
                     </div>
                   </div>
                 )}
-                {edgeData.flow?.requestCount && edgeData.flow.requestCount > 0 && (
+                {edgeData.flow?.requestCount != null && edgeData.flow.requestCount > 0 && (
                   <div className="p-2 rounded bg-theme-elevated">
                     <div className="text-theme-text-tertiary">Requests</div>
                     <div className="text-theme-text-primary font-medium">
@@ -793,12 +847,12 @@ function DetailsPanel({
                     </div>
                   </div>
                 )}
-                {edgeData.flow?.errorCount && edgeData.flow.errorCount > 0 && (
+                {edgeData.flow?.errorCount != null && edgeData.flow.errorCount > 0 && (
                   <div className="p-2 rounded bg-red-500/10 border border-red-500/30">
                     <div className="text-red-400">Errors (5xx)</div>
                     <div className="text-red-400 font-medium">
                       {formatConnections(edgeData.flow.errorCount)}/s
-                      {edgeData.flow.requestCount && edgeData.flow.requestCount > 0 && (
+                      {edgeData.flow.requestCount != null && edgeData.flow.requestCount > 0 && (
                         <span className="text-red-300 ml-1">
                           ({((edgeData.flow.errorCount / edgeData.flow.requestCount) * 100).toFixed(1)}%)
                         </span>
@@ -845,7 +899,9 @@ function DetailsPanel({
                     {edgeData.flow.topHTTPPaths.map((p, i) => (
                       <div key={i} className="flex items-center gap-1.5 text-[10px]">
                         <span className={clsx('shrink-0 px-1 py-0.5 rounded badge font-medium', SEVERITY_BADGE.info)}>{p.method}</span>
-                        <span className="text-theme-text-primary truncate flex-1" title={p.path}>{p.path || '/'}</span>
+                        <Tooltip content={p.path} wrapperClassName="min-w-0 flex-1">
+                        <span className="text-theme-text-primary truncate flex-1">{p.path || '/'}</span>
+                        </Tooltip>
                         <span className="shrink-0 text-theme-text-secondary">{p.count}</span>
                         {p.avgMs ? <span className="shrink-0 text-theme-text-tertiary">{formatLatency(p.avgMs)}</span> : null}
                         {p.errorPct ? <span className={clsx('shrink-0', p.errorPct > 10 ? SEVERITY_TEXT.error : SEVERITY_TEXT.warning)}>{p.errorPct.toFixed(0)}%err</span> : null}
@@ -862,7 +918,9 @@ function DetailsPanel({
                   <div className="space-y-1 max-h-40 overflow-y-auto">
                     {edgeData.flow.topDNSQueries.map((q, i) => (
                       <div key={i} className="flex items-center gap-1.5 text-[10px]">
-                        <span className="text-theme-text-primary truncate flex-1" title={q.query}>{q.query}</span>
+                        <Tooltip content={q.query} wrapperClassName="min-w-0 flex-1">
+                        <span className="text-theme-text-primary truncate flex-1">{q.query}</span>
+                        </Tooltip>
                         <span className="shrink-0 text-theme-text-secondary">{q.count}</span>
                         {q.nxCount ? <span className={clsx('shrink-0', SEVERITY_TEXT.warning)}>NX:{q.nxCount}</span> : null}
                         {q.avgTTL ? <span className="shrink-0 text-theme-text-tertiary">TTL:{q.avgTTL}s</span> : null}
@@ -905,17 +963,23 @@ function DetailsPanel({
               {edgeData.flow && (
                 <div className="space-y-1 pt-2 border-t border-theme-border">
                   <div className="text-xs text-theme-text-secondary">
-                    Source: <span className="text-theme-text-primary">{edgeData.flow.source.name}</span>
+                    {edgeData.flow.directionUnknown ? 'Endpoint' : 'Source'}: <span className="text-theme-text-primary">{edgeData.flow.source.name}</span>
                     {edgeData.flow.source.namespace && (
                       <span className="text-theme-text-tertiary"> ({edgeData.flow.source.namespace})</span>
                     )}
                   </div>
                   <div className="text-xs text-theme-text-secondary">
-                    Destination: <span className="text-theme-text-primary">{edgeData.flow.destination.name}</span>
+                    {edgeData.flow.directionUnknown ? 'Endpoint' : 'Destination'}: <span className="text-theme-text-primary">{edgeData.flow.destination.name}</span>
                     {edgeData.flow.destination.namespace && (
                       <span className="text-theme-text-tertiary"> ({edgeData.flow.destination.namespace})</span>
                     )}
                   </div>
+                  {edgeData.flow.directionUnknown && (
+                    <div className="text-xs text-theme-text-tertiary mt-1">
+                      Which endpoint opened this conversation was not reported, so the
+                      two are listed in a fixed order rather than as caller and callee.
+                    </div>
+                  )}
                   {edgeData.flow.destination.kind.toLowerCase() === 'external' && (
                     <div className="text-xs text-yellow-400 mt-1">
                       External service
@@ -966,9 +1030,47 @@ const nodeTypes = {
   addonGroup: AddonGroupNode,
 }
 
+// Fits the view once nodes have been laid out. Module-scope (not defined inside
+// TrafficGraph's render) so it keeps a stable identity — otherwise it remounts
+// every render and its effect churns. Must render inside <ReactFlow> for the
+// useReactFlow() context; the trigger state is passed in as props.
+function FitViewOnChange({
+  shouldFitViewRef,
+  layoutedNodes,
+}: {
+  shouldFitViewRef: MutableRefObject<boolean>
+  layoutedNodes: Node<TrafficNodeData>[]
+}) {
+  const { fitView } = useReactFlow()
+
+  useEffect(() => {
+    if (shouldFitViewRef.current && layoutedNodes.length > 0) {
+      // Small delay to ensure nodes are rendered
+      const timer = setTimeout(() => {
+        fitView({ padding: 0.2, duration: 200 })
+        shouldFitViewRef.current = false
+      }, 50)
+      return () => clearTimeout(timer)
+    }
+  }, [fitView, layoutedNodes, shouldFitViewRef])
+
+  return null
+}
+
+// A pair can carry both oriented and unoriented traffic at the same port, and the
+// backend keeps those as separate aggregates because no single answer about the
+// direction is right for both. Without the suffix they would share an edge id and
+// one would silently replace the other. Only unoriented edges are suffixed, so
+// every id a source that always orients its flows produces is unchanged.
+function trafficEdgeId(sourceId: string, destId: string, flow: AggregatedFlow): string {
+  return `${sourceId}->${destId}:${flow.port}${flow.directionUnknown ? ':unoriented' : ''}`
+}
+
 export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups = false, serviceCategories, addonMode = 'show', trafficSource = '', onSelectionChange }: TrafficGraphProps) {
-  const isIstio = trafficSource === 'istio'
-  const connLabel = isIstio ? 'req/s' : 'conn'
+  // Beyla is rate-based too: its Connections field carries requests per second,
+  // not a connection count, so it needs the same label Istio gets.
+  const isRateBased = isRateBasedSource(trafficSource)
+  const connLabel = isRateBased ? 'req/s' : 'conn'
   const [layoutedNodes, setLayoutedNodes] = useState<Node<TrafficNodeData>[]>([])
   const [layoutedEdges, setLayoutedEdges] = useState<Edge[]>([])
   const [selection, setSelection] = useState<Selection | null>(null)
@@ -983,7 +1085,7 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
       const destId = flow.destination.namespace
         ? `${flow.destination.namespace}/${flow.destination.name}`
         : flow.destination.name
-      const edgeId = `${sourceId}->${destId}:${flow.port}`
+      const edgeId = trafficEdgeId(sourceId, destId, flow)
       map.set(edgeId, flow)
     })
     return map
@@ -1090,7 +1192,7 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
             namespaceColor: showNamespaceGroups && !sourceIsAddon ? getNamespaceColor(flow.source.namespace) : undefined,
             isHotPath: hotNodes.has(sourceId),
             isAddonNode: sourceIsAddon, // AddonInternet is NOT an addon node
-            serviceCategory: flow.source.kind.toLowerCase() === 'external' ? serviceCategories?.get(flow.source.name) : undefined,
+            serviceCategory: isExternalKind(flow.source.kind) ? serviceCategories?.get(flow.source.name) : undefined,
             nodeHeight: NODE_BASE_HEIGHT,
             connLabel,
           },
@@ -1152,7 +1254,7 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
             namespaceColor: showNamespaceGroups && !destIsAddon ? getNamespaceColor(flow.destination.namespace) : undefined,
             isHotPath: hotNodes.has(destId),
             isAddonNode: destIsAddon,
-            serviceCategory: flow.destination.kind.toLowerCase() === 'external' ? serviceCategories?.get(flow.destination.name) : undefined,
+            serviceCategory: isExternalKind(flow.destination.kind) ? serviceCategories?.get(flow.destination.name) : undefined,
             ports: destPorts,
             nodeHeight: getNodeHeight(destPorts),
             connLabel,
@@ -1166,7 +1268,7 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
       }
 
       // Create edge with visual encoding (Phase 2.1, 2.2, 2.3)
-      const edgeId = `${sourceId}->${destId}:${flow.port}`
+      const edgeId = trafficEdgeId(sourceId, destId, flow)
       const isHotEdge = flow.connections >= hotPathThreshold && hotPathThreshold > 0
       const hasErrors = (flow.errorCount ?? 0) > 0
 
@@ -1186,20 +1288,34 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
       const strokeWidth = getEdgeWidth(flow.connections)
 
       // Phase 2.2: Edge label - connection count with unit suffix + L7 details
-      const connStr = isIstio
+      const connStr = isRateBased
         ? `${formatConnections(flow.connections)}/s`
         : formatConnections(flow.connections)
       const l7Label = flow.l7Protocol ? `${flow.l7Protocol} · ` : ''
       const latencyLabel = flow.latencyP50Ms ? ` · ${formatLatency(flow.latencyP50Ms)}` : ''
+      // errorCount is a rate for a rate-based source, exactly like connections above.
+      // Without the suffix a destination failing once a second reads as one error.
       const errorLabel = hasErrors
-        ? ` · ${formatConnections(flow.errorCount ?? 0)} err`
+        ? ` · ${formatConnections(flow.errorCount ?? 0)} err${isRateBased ? '/s' : ''}`
         : ''
-      const edgeLabel = `${l7Label}${connStr}${latencyLabel}${errorLabel}`
+      // A source that measures rates has no count for an edge with no requests on
+      // it — a plain TCP conversation, or one whose direction is unknown. Printing
+      // "0/s" there reads as no traffic, on an edge that may be carrying megabytes.
+      const countLabel = isRateBased && !flow.connections ? '' : connStr
+      const edgeLabel = [l7Label + countLabel, latencyLabel, errorLabel]
+        .join('')
+        .replace(/^ · /, '')
 
       edgeList.push({
         id: edgeId,
         source: sourceId,
         target: destId,
+        // React Flow's default is "Edge from A to B", which states a direction this
+        // edge is deliberately drawn without. Assistive technology should hear the
+        // same uncertainty the missing arrowhead conveys.
+        ariaLabel: flow.directionUnknown
+          ? `Connection between ${sourceId} and ${destId}, direction unknown`
+          : `Edge from ${sourceId} to ${destId}`,
         type: 'smoothstep',
         animated: isHotEdge, // Animate hot paths
         label: edgeLabel,
@@ -1217,12 +1333,20 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
           stroke: strokeColor,
           ...(hasDrops && { strokeDasharray: '6 3' }),
         },
-        markerEnd: {
-          type: MarkerType.ArrowClosed,
-          width: 16,
-          height: 16,
-          color: strokeColor,
-        },
+        // No arrowhead when the initiator is unknown. Beyla labels both halves of a
+        // UDP conversation the same way, so an arrow would be asserting something
+        // the data does not say; the edge still carries the traffic in both
+        // directions.
+        ...(flow.directionUnknown
+          ? {}
+          : {
+              markerEnd: {
+                type: MarkerType.ArrowClosed,
+                width: 16,
+                height: 16,
+                color: strokeColor,
+              },
+            }),
       })
     })
 
@@ -1232,7 +1356,7 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
       addonGroupEdge, // Pass this for adding after group is created
       addonGroupOutEdge, // Pass this for adding group → kubernetes edge
     }
-  }, [flows, hotPathThreshold, showNamespaceGroups, serviceCategories, addonMode, isIstio, connLabel])
+  }, [flows, hotPathThreshold, showNamespaceGroups, serviceCategories, addonMode, isRateBased, connLabel])
 
   // Apply ELK layout
   const applyLayout = useCallback(async () => {
@@ -1264,9 +1388,13 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
     try {
       const layoutResult = await elk.layout(elkGraph)
 
+      // Index ELK's positioned children by id once — a .find() per node here is
+      // O(nodes²) and bites on dense traffic graphs.
+      const elkPositions = new Map((layoutResult.children ?? []).map(n => [n.id, n]))
+
       // Apply positions from ELK to nodes
       let positionedNodes = rawNodes.map(node => {
-        const elkNode = layoutResult.children?.find(n => n.id === node.id)
+        const elkNode = elkPositions.get(node.id)
         return {
           ...node,
           position: {
@@ -1339,7 +1467,7 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
       }
 
       // Build final edges list
-      let finalEdges = [...rawEdges]
+      const finalEdges = [...rawEdges]
 
       // Add edge from addon-internet to addon-group if we have one
       if (addonMode === 'group' && groupEdgeInfo) {
@@ -1353,7 +1481,7 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
           target: 'addon-group',
           type: 'smoothstep',
           animated: isHotEdge,
-          label: formatConnections(connections),
+          label: isRateBased ? `${formatConnections(connections)}/s` : formatConnections(connections),
           labelBgStyle: {
             fill: '#581c87', // purple-900
             fillOpacity: 0.9,
@@ -1387,7 +1515,7 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
           target: targetId,
           type: 'smoothstep',
           animated: isHotEdge,
-          label: formatConnections(connections),
+          label: isRateBased ? `${formatConnections(connections)}/s` : formatConnections(connections),
           labelBgStyle: {
             fill: '#581c87', // purple-900
             fillOpacity: 0.9,
@@ -1426,7 +1554,7 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
       setLayoutedNodes(positionedNodes)
       setLayoutedEdges(rawEdges)
     }
-  }, [rawNodes, rawEdges, addonMode, addonGroupEdge, addonGroupOutEdge, hotPathThreshold])
+  }, [rawNodes, rawEdges, addonMode, addonGroupEdge, addonGroupOutEdge, hotPathThreshold, isRateBased])
 
   // Run layout when flows change
   useEffect(() => {
@@ -1483,24 +1611,6 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
     onSelectionChange?.(null)
   }, [onSelectionChange])
 
-  // FitView handler component - must be inside ReactFlow
-  const FitViewOnChange = () => {
-    const { fitView } = useReactFlow()
-
-    useEffect(() => {
-      if (shouldFitViewRef.current && layoutedNodes.length > 0) {
-        // Small delay to ensure nodes are rendered
-        const timer = setTimeout(() => {
-          fitView({ padding: 0.2, duration: 200 })
-          shouldFitViewRef.current = false
-        }, 50)
-        return () => clearTimeout(timer)
-      }
-    }, [fitView, layoutedNodes])
-
-    return null
-  }
-
   return (
     <div className="w-full h-full relative">
       <ReactFlow
@@ -1526,7 +1636,7 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
       >
         <Background />
         <Controls />
-        <FitViewOnChange />
+        <FitViewOnChange shouldFitViewRef={shouldFitViewRef} layoutedNodes={layoutedNodes} />
       </ReactFlow>
 
       {/* Legend */}
@@ -1538,7 +1648,7 @@ export function TrafficGraph({ flows, hotPathThreshold = 0, showNamespaceGroups 
           selection={selection}
           onClose={() => setSelection(null)}
           flows={flows}
-          isIstio={isIstio}
+          isRateBased={isRateBased}
         />
       )}
     </div>

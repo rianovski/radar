@@ -1,0 +1,21 @@
+# Supersession fixture - applied in filename order with a pause between
+# each, so creationTimestamps are distinct. See the script's
+# assert_supersession_ordering: identical timestamps would make the
+# ordering test pass on the name tie-break instead of on time.
+---
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: adhoc-preupgrade
+  namespace: velero
+spec:
+  includedNamespaces:
+    - "*"
+  storageLocation: default
+  ttl: 720h0m0s
+status:
+  completionTimestamp: "@now-1809m"
+  errors: 3
+  failureReason: timed out waiting for all PodVolumeBackups to complete
+  phase: Failed
+  startTimestamp: "@now-1810m"

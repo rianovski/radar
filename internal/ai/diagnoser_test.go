@@ -1,0 +1,848 @@
+package ai
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/skyhook-io/radar/internal/investigationrefs"
+
+	"github.com/skyhook-io/radar/pkg/investigation"
+)
+
+func testEvidenceRef(scope, nonce byte) string {
+	return "ev_" + strings.Repeat(string(scope), 26) + "_" + strings.Repeat(string(nonce), 26)
+}
+
+func TestInvestigationEvidenceValidatorUsesAndClearsFullProducerResult(t *testing.T) {
+	scope := strings.Repeat("a", 26)
+	refs := investigationrefs.NewRegistry()
+	lease, err := refs.Begin(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	ref, issued := refs.Issue(scope, `{"kind":"Pod"}`)
+	if !issued {
+		t.Fatal("could not issue fixture reference")
+	}
+	largePayload := strings.Repeat("x", maxToolPayload+500)
+	largeRef, issued := refs.Issue(scope, largePayload)
+	if !issued {
+		t.Fatal("could not issue capped fixture reference")
+	}
+	validator := investigationEvidenceValidator{
+		registry: refs,
+		scope:    scope,
+		claimed:  make(map[string]struct{}),
+	}
+	event := func(ref, result string, producerResult *string, prefilled bool) StreamEvent {
+		return StreamEvent{Type: "step", Step: &StepInfo{
+			ID: "call", Tool: "get_resource", Status: "done",
+			EvidenceRef: ref, Result: result, RadarEvidence: prefilled,
+			producerResult: producerResult,
+		}}
+	}
+	validate := func(event StreamEvent) StreamEvent {
+		t.Helper()
+		validated := validator.validate(event)
+		if validated.Step != nil && validated.Step.producerResult != nil {
+			t.Fatal("uncapped producer result survived evidence validation")
+		}
+		return validated
+	}
+
+	podPayload := `{"kind":"Pod"}`
+	spoofed := validate(event("", podPayload, &podPayload, true))
+	if spoofed.Step.RadarEvidence {
+		t.Fatal("adapter-authored provenance survived without a private reference")
+	}
+	missingProducerResult := validate(event(ref, podPayload, nil, true))
+	if missingProducerResult.Step.RadarEvidence {
+		t.Fatal("retained result received Radar provenance without its transient producer result")
+	}
+	deploymentPayload := `{"kind":"Deployment"}`
+	substituted := validate(event(ref, deploymentPayload, &deploymentPayload, true))
+	if substituted.Step.RadarEvidence {
+		t.Fatal("substituted payload received Radar provenance")
+	}
+	cappedResult, truncated := capPayload(largePayload)
+	if !truncated {
+		t.Fatal("oversized fixture was not capped")
+	}
+	tamperedCappedEvent := event(largeRef, "tampered retained result", &largePayload, true)
+	tamperedCappedEvent.Step.Truncated = true
+	if got := validate(tamperedCappedEvent); got.Step.RadarEvidence {
+		t.Fatal("uncapped ledger match overrode a tampered retained result")
+	}
+	cappedEvent := event(largeRef, cappedResult, &largePayload, false)
+	cappedEvent.Step.Truncated = true
+	validatedCapped := validate(cappedEvent)
+	if !validatedCapped.Step.RadarEvidence {
+		t.Fatal("exact uncapped private result did not validate after its retained preview was capped")
+	}
+	legitimate := validate(event(ref, podPayload, &podPayload, false))
+	if !legitimate.Step.RadarEvidence {
+		t.Fatal("exact first private result did not receive Radar provenance")
+	}
+	replayed := validate(event(ref, podPayload, &podPayload, false))
+	if replayed.Step.RadarEvidence {
+		t.Fatal("a repeated marker was accepted by more than one step")
+	}
+
+	applyValidator := investigationEvidenceValidator{
+		registry: refs,
+		claimed:  make(map[string]struct{}),
+	}
+	applyEvent := applyValidator.validate(event(ref, podPayload, &podPayload, true))
+	if applyEvent.Step.RadarEvidence {
+		t.Fatal("adapter-authored provenance survived on a write-enabled apply turn")
+	}
+	if applyEvent.Step.producerResult != nil {
+		t.Fatal("uncapped producer result survived apply-turn validation")
+	}
+}
+
+type captureTurnAgent struct {
+	spec       turnSpec
+	refs       *investigationrefs.Registry
+	issuedRef  string
+	payload    string
+	commandErr error
+}
+
+func (*captureTurnAgent) Name() string      { return "claude" }
+func (*captureTurnAgent) Path() string      { return "printf" }
+func (*captureTurnAgent) SigninCmd() string { return "claude auth login" }
+func (agent *captureTurnAgent) command(ctx context.Context, spec turnSpec) (*exec.Cmd, func(), error) {
+	agent.spec = spec
+	if spec.apply {
+		return exec.CommandContext(ctx, "printf", ""), func() {}, nil
+	}
+	u, err := url.Parse(spec.mcpURL)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	agent.payload = `{"kind":"Pod","status":"Running"}`
+	issuedRef, issued := agent.refs.Issue(u.Query().Get("scope"), agent.payload)
+	if !issued {
+		return nil, func() {}, fmt.Errorf("test agent could not issue evidence")
+	}
+	agent.issuedRef = issuedRef
+	if agent.commandErr != nil {
+		return nil, func() {}, agent.commandErr
+	}
+	content, _ := json.Marshal(
+		investigation.RefMarker(issuedRef) + agent.payload,
+	)
+	stream := strings.Join([]string{
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"radar-read","name":"mcp__radar__get_resource","input":{"kind":"Pod","namespace":"shop","name":"api"}}]}}`,
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"radar-read","content":` + string(content) + `}]}}`,
+		`{"type":"result","result":"` + "```json\\n{\\\"root_cause\\\":\\\"bad tag\\\"}\\n```" + `"}`,
+	}, "\n")
+	return exec.CommandContext(ctx, "printf", "%s\n", stream), func() {}, nil
+}
+
+func TestDiagnoseStreamUsesListenerAddress(t *testing.T) {
+	for _, address := range []string{"192.0.2.10:9280", "[::1]:9280", "[2001:db8::10]:9280"} {
+		for _, apply := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/apply=%t", address, apply), func(t *testing.T) {
+				refs := investigationrefs.NewRegistry()
+				agent := &captureTurnAgent{refs: refs}
+				diagnoser := &Diagnoser{agents: map[string]Agent{"claude": agent}, defName: "claude", evidenceRefs: refs}
+				scope := strings.Repeat("a", 26)
+				_, err := diagnoser.DiagnoseStream(context.Background(), Request{
+					Kind: "Pod", Namespace: "shop", Name: "api", MCPAddress: address,
+					MCPBasePath: "/radar", EvidenceScope: scope, Apply: apply,
+				}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := "http://" + address + "/radar/mcp"
+				if !apply {
+					want += "-investigation?scope=" + scope
+				}
+				if agent.spec.mcpURL != want {
+					t.Fatalf("agent MCP URL = %q, want %q", agent.spec.mcpURL, want)
+				}
+			})
+		}
+	}
+}
+
+func TestDiagnoseStreamClosesEvidenceScopeOnEarlyAgentFailure(t *testing.T) {
+	scope := strings.Repeat("a", 26)
+	refs := investigationrefs.NewRegistry()
+	agent := &captureTurnAgent{refs: refs, commandErr: errors.New("fixture command failure")}
+	diagnoser := &Diagnoser{
+		agents:       map[string]Agent{"claude": agent},
+		defName:      "claude",
+		evidenceRefs: refs,
+	}
+	_, err := diagnoser.DiagnoseStream(context.Background(), Request{
+		Kind: "Pod", Namespace: "shop", Name: "api", MCPAddress: "localhost:9280",
+		EvidenceScope: scope,
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "fixture command failure") {
+		t.Fatalf("error = %v, want fixture command failure", err)
+	}
+	if refs.Active(scope) {
+		t.Fatal("turn scope remained active after early agent failure")
+	}
+	if _, issued := refs.Issue(scope, "late payload"); issued {
+		t.Fatal("failed turn accepted late evidence issuance")
+	}
+}
+func (*captureTurnAgent) parseStream(reader io.Reader, onEvent func(StreamEvent)) Diagnosis {
+	return parseStream(reader, onEvent)
+}
+
+type adapterAuthoredEvidenceAgent struct {
+	event StreamEvent
+}
+
+func (*adapterAuthoredEvidenceAgent) Name() string      { return "claude" }
+func (*adapterAuthoredEvidenceAgent) Path() string      { return "printf" }
+func (*adapterAuthoredEvidenceAgent) SigninCmd() string { return "claude auth login" }
+func (*adapterAuthoredEvidenceAgent) command(ctx context.Context, _ turnSpec) (*exec.Cmd, func(), error) {
+	return exec.CommandContext(ctx, "printf", ""), func() {}, nil
+}
+func (agent *adapterAuthoredEvidenceAgent) parseStream(_ io.Reader, onEvent func(StreamEvent)) Diagnosis {
+	onEvent(agent.event)
+	return Diagnosis{Verdict: investigation.Verdict{RootCause: "apply completed"}}
+}
+
+func TestDiagnoseStreamClearsAdapterProvenanceOnApplyTurn(t *testing.T) {
+	agent := &adapterAuthoredEvidenceAgent{event: StreamEvent{Type: "step", Step: &StepInfo{
+		ID: "foreign-write", Tool: "patch_resource", Status: "done",
+		Result: `{"patched":true}`, EvidenceRef: testEvidenceRef('a', 'b'), RadarEvidence: true,
+	}}}
+	diagnoser := &Diagnoser{
+		agents:  map[string]Agent{"claude": agent},
+		defName: "claude",
+	}
+	var delivered *StepInfo
+	_, err := diagnoser.DiagnoseStream(context.Background(), Request{
+		Kind: "Deployment", Namespace: "shop", Name: "api", MCPAddress: "localhost:9280",
+		Apply: true,
+	}, func(event StreamEvent) {
+		if event.Step != nil {
+			delivered = event.Step
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivered == nil || delivered.RadarEvidence {
+		t.Fatalf("apply event retained adapter-authored provenance: %+v", delivered)
+	}
+}
+
+func TestDiagnoseStreamUsesPerTurnScopedInvestigationMount(t *testing.T) {
+	refs := investigationrefs.NewRegistry()
+	agent := &captureTurnAgent{refs: refs}
+	diagnoser := &Diagnoser{
+		agents:       map[string]Agent{"claude": agent},
+		defName:      "claude",
+		evidenceRefs: refs,
+	}
+	scope := strings.Repeat("a", 26)
+	var evidenceStep *StepInfo
+	diagnosis, err := diagnoser.DiagnoseStream(context.Background(), Request{
+		Kind: "Pod", Namespace: "shop", Name: "api", MCPAddress: "localhost:9280",
+		MCPBasePath: "/radar", EvidenceScope: scope,
+	}, func(event StreamEvent) {
+		if event.Step != nil && event.Step.Status == "done" {
+			evidenceStep = event.Step
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantURL := "http://localhost:9280/radar/mcp-investigation?scope=" + scope
+	if agent.spec.mcpURL != wantURL {
+		t.Fatalf("mcp URL = %q, want %q", agent.spec.mcpURL, wantURL)
+	}
+	if diagnosis.evidenceScope != scope {
+		t.Fatalf("diagnosis scope = %q, want %q", diagnosis.evidenceScope, scope)
+	}
+	if payload := diagnosis.issuedEvidence[agent.issuedRef]; payload != agent.payload {
+		t.Fatalf("issued payload = %q, want exact %q", payload, agent.payload)
+	}
+	if evidenceStep == nil || !evidenceStep.RadarEvidence ||
+		evidenceStep.EvidenceRef != agent.issuedRef || evidenceStep.Result != agent.payload {
+		t.Fatalf("validated evidence step = %+v", evidenceStep)
+	}
+	if refs.Active(scope) {
+		t.Fatal("turn scope remained active after DiagnoseStream returned")
+	}
+	if _, issued := refs.Issue(scope, "late payload"); issued {
+		t.Fatal("closed turn accepted late evidence issuance")
+	}
+}
+
+// TestParseStream_FormatPin locks the claude stream-json schema we depend on,
+// including the cost/turns fields on the terminal result event.
+func TestParseStream_FormatPin(t *testing.T) {
+	ref := testEvidenceRef('a', 'b')
+	stream := strings.Join([]string{
+		`{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"mcp__radar__diagnose","input":{"name":"x"}}]}}`,
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"[[radar:evidence-ref=` + ref + `]]\ncrashloop"}]}}`,
+		`{"type":"result","result":"bad tag.\n\n` + "```json\\n" + `{\"root_cause\":\"bad tag\"}` + "\\n```" + `","num_turns":2,"total_cost_usd":0.42}`,
+	}, "\n")
+
+	var running, done bool
+	var doneIsError *bool
+	var thinking, doneResult, doneEvidenceRef string
+	diag := parseStream(strings.NewReader(stream), func(ev StreamEvent) {
+		switch ev.Type {
+		case "thinking":
+			thinking += ev.Token
+		case "step":
+			if ev.Step != nil && ev.Step.Status == "running" {
+				running = true
+				if ev.Step.Tool != "diagnose" {
+					t.Errorf("tool prefix not stripped: %q", ev.Step.Tool)
+				}
+			}
+			if ev.Step != nil && ev.Step.Status == "done" {
+				done = true
+				doneResult = ev.Step.Result
+				doneEvidenceRef = ev.Step.EvidenceRef
+				doneIsError = ev.Step.IsError
+			}
+		}
+	})
+	if !running || !done {
+		t.Errorf("expected running+done steps; running=%v done=%v", running, done)
+	}
+	if thinking != "hmm" {
+		t.Errorf("expected thinking event %q, got %q", "hmm", thinking)
+	}
+	if doneResult == "" {
+		t.Errorf("expected tool result preview on done step")
+	}
+	if doneEvidenceRef != ref || strings.Contains(doneResult, "radar:evidence-ref") {
+		t.Errorf("marker extraction result=%q ref=%q", doneResult, doneEvidenceRef)
+	}
+	if doneIsError == nil || *doneIsError {
+		t.Errorf("Claude's omitted tool_result.is_error must be a confirmed success, got %v", doneIsError)
+	}
+	if diag.RootCause != "bad tag" {
+		t.Errorf("root cause not parsed: %q", diag.RootCause)
+	}
+	if diag.CostUSD == nil || *diag.CostUSD != 0.42 || diag.Turns != 2 {
+		t.Errorf("usage not parsed: cost=%v turns=%d", diag.CostUSD, diag.Turns)
+	}
+}
+
+func TestParseStreamPreservesUncappedProducerResultForValidation(t *testing.T) {
+	ref := testEvidenceRef('a', 'b')
+	payload := strings.Repeat("x", maxToolPayload+500)
+	marked, err := json.Marshal(
+		investigation.RefMarker(ref) + payload,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"large","content":` + string(marked) + `}]}}`
+
+	var step *StepInfo
+	parseStream(strings.NewReader(stream), func(event StreamEvent) {
+		if event.Step != nil {
+			step = event.Step
+		}
+	})
+	if step == nil || !step.Truncated || step.EvidenceRef != ref {
+		t.Fatalf("oversized Claude result step = %+v", step)
+	}
+	if step.producerResult == nil || *step.producerResult != payload {
+		t.Fatal("Claude adapter did not retain the exact uncapped producer result for validation")
+	}
+	wantResult, _ := capPayload(payload)
+	if step.Result != wantResult {
+		t.Fatal("Claude adapter retained an unexpected capped result")
+	}
+}
+
+func TestStepInfoIsErrorJSON(t *testing.T) {
+	transient := "must-not-serialize"
+	confirmedFalse, confirmedTrue := false, true
+	cases := []struct {
+		name      string
+		isError   *bool
+		wantField string
+	}{
+		{name: "confirmed success", isError: &confirmedFalse, wantField: `"isError":false`},
+		{name: "confirmed failure", isError: &confirmedTrue, wantField: `"isError":true`},
+		{name: "unknown", isError: nil, wantField: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(StepInfo{
+				ID: "t1", Status: "done", IsError: tc.isError,
+				producerResult: &transient,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(b)
+			if strings.Contains(got, transient) {
+				t.Fatalf("transient producer result leaked into JSON: %s", got)
+			}
+			if tc.wantField == "" {
+				if strings.Contains(got, `"isError"`) {
+					t.Fatalf("unknown result must omit isError: %s", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.wantField) {
+				t.Fatalf("JSON = %s, want %s", got, tc.wantField)
+			}
+		})
+	}
+}
+
+func TestClaudeToolResultErrorState(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"ok","content":"ok"}]}}`,
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"bad","content":"denied","is_error":true}]}}`,
+	}, "\n")
+
+	got := map[string]*bool{}
+	parseStream(strings.NewReader(stream), func(ev StreamEvent) {
+		if ev.Step != nil {
+			got[ev.Step.ID] = ev.Step.IsError
+		}
+	})
+	if got["ok"] == nil || *got["ok"] {
+		t.Errorf("omitted is_error = %v, want confirmed false", got["ok"])
+	}
+	if got["bad"] == nil || !*got["bad"] {
+		t.Errorf("is_error:true = %v, want confirmed true", got["bad"])
+	}
+}
+
+// TestReadTools_ExcludeWrites is the fail-closed guard: the read allowlist must
+// never contain a Radar write tool.
+// TestDetectAgents_OnlyKnownNames ensures detection never reports a binary
+// outside the fixed known list (we only ever exec literal known names).
+func TestDetectAgents_OnlyKnownNames(t *testing.T) {
+	known := map[string]bool{}
+	for _, n := range knownAgents {
+		known[n] = true
+	}
+	for _, a := range DetectAgents(context.Background(), false) {
+		if !known[a.Name] {
+			t.Errorf("detected unknown agent name %q (would mean we ran an unexpected binary)", a.Name)
+		}
+	}
+}
+
+// TestAgentExitError_Classifies pins the best-effort error taxonomy: common
+// actionable failures get a plain-language lead; the rest get a generic line.
+func TestAgentExitError_Classifies(t *testing.T) {
+	cases := []struct{ detail, want string }{
+		{"Error: Not logged in. Please run claude login", "isn't signed in"},
+		{"invalid API key", "check its API credentials"},
+		{"API error 429: rate limit exceeded", "rate-limited"},
+		{"overloaded_error: server is overloaded", "rate-limited"},
+		{"reached max turns", "step limit"},
+		{"panic: nil pointer", "stopped unexpectedly"},
+	}
+	for _, c := range cases {
+		if got := agentExitError("claude", "claude auth login", c.detail, "").Error(); !strings.Contains(got, c.want) {
+			t.Errorf("detail %q → %q, want substring %q", c.detail, got, c.want)
+		}
+	}
+	if got := agentExitError("claude", "claude auth login", "Not logged in", "incidental warning").Error(); !strings.Contains(got, "claude auth login") {
+		t.Errorf("expected sign-in command in message, got %q", got)
+	}
+	got := agentExitError("claude", "claude auth login", "request failed: 401 unauthorized", "provider rejected the token").Error()
+	if !strings.Contains(got, "stopped unexpectedly") || !strings.Contains(got, "401 unauthorized") || !strings.Contains(got, "provider rejected the token") {
+		t.Errorf("ambiguous auth failure should preserve both details, got %q", got)
+	}
+}
+
+// TestClaudeResultText covers the tool_result.content shapes: a plain JSON string
+// (pinned in the format test), an MCP content array, multipart text, and a raw
+// JSON object passed through.
+func TestClaudeResultText(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{`"crashloop"`, "crashloop"},                                             // JSON string content
+		{`[{"type":"text","text":"hello"}]`, "hello"},                            // single content block
+		{`[{"type":"text","text":"a"},{"type":"text","text":"b"}]`, "ab"},        // multipart
+		{`{"apiVersion":"v1","kind":"Pod"}`, `{"apiVersion":"v1","kind":"Pod"}`}, // object → raw
+	}
+	for _, c := range cases {
+		if got := claudeResultText([]byte(c.raw)); got != c.want {
+			t.Errorf("claudeResultText(%s) = %q, want %q", c.raw, got, c.want)
+		}
+	}
+}
+
+func TestCapPayload(t *testing.T) {
+	if s, trunc := capPayload("short"); trunc || s != "short" {
+		t.Errorf("short payload should not truncate, got %q trunc=%v", s, trunc)
+	}
+	big := strings.Repeat("x", maxToolPayload+500)
+	s, trunc := capPayload(big)
+	if !trunc {
+		t.Error("oversized payload should be flagged truncated")
+	}
+	if len([]rune(s)) > maxToolPayload+2 {
+		t.Errorf("truncated payload not capped: %d runes", len([]rune(s)))
+	}
+}
+
+func TestCapPayloadPreservesProducerBoundedDiagnoseEnvelope(t *testing.T) {
+	payloadBytes, err := json.Marshal(map[string]any{
+		"resource": map[string]any{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata":   map[string]any{"namespace": "shop", "name": "api-config"},
+			"data":       map[string]string{"application.yaml": strings.Repeat("c", 16<<10)},
+		},
+		"resourceContext": map[string]any{
+			"tier": "basic",
+			"statusSummary": map[string]any{
+				"conditions": []map[string]string{{"type": "Available", "status": "False", "message": strings.Repeat("m", 4<<10)}},
+			},
+		},
+		"logsCurrent": []map[string]any{{
+			"pod":       "api-abc",
+			"container": "api",
+			"logs": map[string]any{
+				"lines":        []string{strings.Repeat("l", (32<<10)-1)},
+				"totalLines":   1,
+				"matchedLines": 1,
+				"fallback":     false,
+			},
+		}},
+		"events": []map[string]any{{
+			"reason":  "BackOff",
+			"message": strings.Repeat("e", 4<<10),
+			"type":    "Warning",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal diagnose envelope: %v", err)
+	}
+	payload := string(payloadBytes)
+	if len([]rune(payload)) <= 32<<10 {
+		t.Fatalf("fixture must exceed the former transcript cap, got %d runes", len([]rune(payload)))
+	}
+	if len([]rune(payload)) > maxToolPayload {
+		t.Fatalf("producer-bounded fixture exceeds transcript cap: %d > %d runes", len([]rune(payload)), maxToolPayload)
+	}
+
+	got, truncated := capPayload(payload)
+	if truncated {
+		t.Fatal("bounded diagnose evidence envelope was unexpectedly truncated")
+	}
+	if got != payload {
+		t.Fatal("bounded diagnose evidence envelope changed")
+	}
+}
+
+// TestParseStream_InterleavesNarration pins the Claude treatment: interim text
+// (followed by more activity) becomes an interleaved narration ("thinking") event;
+// the FINAL text (the report, equal to the result) is NOT emitted as narration —
+// it surfaces via the result card.
+func TestParseStream_InterleavesNarration(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"Let me check the deployment."}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"mcp__radar__get_resource","input":{"name":"x"}}]}}`,
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"The root cause is the bad image."}]}}`,
+		`{"type":"result","result":"The root cause is the bad image.","num_turns":1}`,
+	}, "\n")
+
+	var narrations []string
+	var toolSeen bool
+	parseStream(strings.NewReader(stream), func(ev StreamEvent) {
+		switch ev.Type {
+		case "thinking":
+			narrations = append(narrations, ev.Token)
+		case "step":
+			if ev.Step != nil && ev.Step.Status == "running" {
+				toolSeen = true
+			}
+		}
+	})
+
+	if len(narrations) != 1 || narrations[0] != "Let me check the deployment." {
+		t.Errorf("expected the interim narration interleaved, got %v", narrations)
+	}
+	for _, n := range narrations {
+		if strings.Contains(n, "root cause") {
+			t.Errorf("the final report must not appear as narration, got %q", n)
+		}
+	}
+	if !toolSeen {
+		t.Error("expected the tool step")
+	}
+}
+
+// TestDiagnoseStream_NonzeroExit pins the failure-honesty contract: a nonzero
+// agent exit is forgiven only when a STRUCTURED conclusion parsed (the trailing
+// JSON block) — free-text alone means the process died mid-stream and must
+// surface as an error, never as a calm "done".
+func TestDiagnoseStream_ProcessAndStreamErrors(t *testing.T) {
+	mkCLI := func(t *testing.T, resultLine, exitCode string) string {
+		t.Helper()
+		dir := t.TempDir()
+		bin := dir + "/claude"
+		// printf %s, not echo — sh's echo may expand \n escapes inside the JSON.
+		script := "#!/bin/sh\nprintf '%s\\n' '" + resultLine + "'\nexit " + exitCode + "\n"
+		if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return bin
+	}
+	run := func(t *testing.T, bin string) (Diagnosis, error) {
+		t.Helper()
+		refs := investigationrefs.NewRegistry()
+		d, err := New(bin, refs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scope := strings.Repeat("a", 26)
+		diagnosis, diagnoseErr := d.DiagnoseStream(context.Background(), Request{
+			Kind: "Pod", Namespace: "ns", Name: "p", MCPAddress: "localhost:1",
+			EvidenceScope: scope,
+		}, nil)
+		if refs.Active(scope) {
+			t.Fatal("turn scope leaked after DiagnoseStream exit")
+		}
+		return diagnosis, diagnoseErr
+	}
+
+	freeText := `{"type":"result","result":"got halfway through checking the pod","num_turns":1}`
+	if _, err := run(t, mkCLI(t, freeText, "3")); err == nil {
+		t.Error("nonzero exit with free-text-only output must return an error")
+	}
+
+	authErr := `{"type":"result","result":"Not logged in · Please run /login","is_error":true,"num_turns":1}`
+	for _, exitCode := range []string{"0", "3"} {
+		_, err := run(t, mkCLI(t, authErr, exitCode))
+		if err == nil {
+			t.Fatalf("is_error result with exit %s must return an error", exitCode)
+		}
+		if !strings.Contains(err.Error(), "isn't signed in") {
+			t.Errorf("auth failure with exit %s should surface the sign-in hint, got: %v", exitCode, err)
+		}
+	}
+
+	emptyMaxTurnsErr := `{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":1}`
+	_, err := run(t, mkCLI(t, emptyMaxTurnsErr, "0"))
+	if err == nil {
+		t.Fatal("is_error result without result text must return an error")
+	}
+	if !strings.Contains(err.Error(), "step limit") || !strings.Contains(err.Error(), "error_max_turns") {
+		t.Errorf("empty max-turns error should classify and preserve its subtype, got: %v", err)
+	}
+
+	structured := "{\"type\":\"result\",\"result\":\"```json\\n{\\\"root_cause\\\":\\\"bad tag\\\",\\\"remediation\\\":[\\\"fix it\\\"]}\\n```\",\"num_turns\":1}"
+	diag, err := run(t, mkCLI(t, structured, "3"))
+	if err != nil {
+		t.Fatalf("nonzero exit with a complete structured conclusion should be forgiven, got %v", err)
+	}
+	if diag.RootCause != "bad tag" {
+		t.Errorf("structured conclusion not preserved: %q", diag.RootCause)
+	}
+}
+
+// TestParseStream_InitReportsAgentReady pins the Claude Code system/init line:
+// the resolved model, the Radar tool count by MCP prefix, and every MCP
+// server's status, including a failed one the UI must surface as a warning.
+func TestParseStream_InitReportsAgentReady(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"type":"system","subtype":"hook_started","hook_name":"SessionStart:startup","session_id":"s1"}`,
+		`{"type":"system","subtype":"init","session_id":"s1","tools":["Bash","mcp__radar__diagnose","mcp__radar__get_resource","mcp__other__ping"],"mcp_servers":[{"name":"radar","status":"connected"},{"name":"other","status":"failed"}],"model":"claude-opus-5[1m]"}`,
+		`{"type":"result","result":"done","num_turns":1}`,
+	}, "\n")
+	var ready []StreamEvent
+	parseStream(strings.NewReader(stream), func(ev StreamEvent) {
+		if ev.Type == "phase" {
+			ready = append(ready, ev)
+		}
+	})
+	if len(ready) != 1 || ready[0].Phase != "ready" {
+		t.Fatalf("phase events = %+v, want exactly one ready phase", ready)
+	}
+	got := ready[0]
+	if got.Model != "claude-opus-5[1m]" {
+		t.Errorf("model = %q", got.Model)
+	}
+	if got.ToolCount == nil || *got.ToolCount != 2 {
+		t.Errorf("radar tool count = %v, want 2", got.ToolCount)
+	}
+	want := []MCPServerStatus{{Name: "radar", Status: "connected"}, {Name: "other", Status: "failed"}}
+	if len(got.MCPServers) != len(want) {
+		t.Fatalf("mcp servers = %+v, want %+v", got.MCPServers, want)
+	}
+	for i := range want {
+		if got.MCPServers[i] != want[i] {
+			t.Errorf("mcp server %d = %+v, want %+v", i, got.MCPServers[i], want[i])
+		}
+	}
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"toolCount":2`, `"mcpServers":[`, `"model":"claude-opus-5[1m]"`} {
+		if !strings.Contains(string(raw), field) {
+			t.Errorf("serialized ready phase %s lacks %s", raw, field)
+		}
+	}
+	zero := agentReadyEvent("m", nil, nil)
+	if raw, _ := json.Marshal(zero); !strings.Contains(string(raw), `"toolCount":0`) {
+		t.Errorf("a zero Radar tool count must serialize, got %s", raw)
+	}
+}
+
+// TestDiagnoseStreamReportsHandshakeOnce pins the agent-agnostic "connected"
+// phase: the private mount's handshake produces exactly one event per turn, no
+// matter how many times the scope is marked, and it lands before the stream ends.
+func TestDiagnoseStreamReportsHandshakeOnce(t *testing.T) {
+	dir := t.TempDir()
+	flag := filepath.Join(dir, "handshake-observed")
+	bin := filepath.Join(dir, "claude")
+	resultLine := `{"type":"result","result":"` + "```json\\n{\\\"healthy\\\":true}\\n```" + `","num_turns":1}`
+	script := "#!/bin/sh\nwhile [ ! -f '" + flag + "' ]; do sleep 0.02; done\n" +
+		"printf '%s\\n' '" + resultLine + "'\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	refs := investigationrefs.NewRegistry()
+	d, err := New(bin, refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := strings.Repeat("d", 26)
+	started := make(chan struct{})
+	var mu sync.Mutex
+	var phases []string
+	type outcome struct {
+		diag Diagnosis
+		err  error
+	}
+	finished := make(chan outcome, 1)
+	go func() {
+		diag, err := d.DiagnoseStream(context.Background(), Request{
+			Kind: "Pod", Namespace: "ns", Name: "p", MCPAddress: "localhost:1", EvidenceScope: scope,
+		}, func(ev StreamEvent) {
+			if ev.Type != "phase" {
+				return
+			}
+			mu.Lock()
+			phases = append(phases, ev.Phase)
+			mu.Unlock()
+			if ev.Phase == "investigating" {
+				close(started)
+			}
+		})
+		finished <- outcome{diag, err}
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("agent never started")
+	}
+	if !refs.MarkConnected(scope) || !refs.MarkConnected(scope) {
+		t.Fatal("live turn scope rejected its handshake")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		seen := len(phases) >= 2
+		mu.Unlock()
+		if seen || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := os.WriteFile(flag, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var result outcome
+	select {
+	case result = <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("DiagnoseStream did not finish")
+	}
+	if result.err != nil || !result.diag.Healthy {
+		t.Fatalf("diagnosis = %+v, err = %v", result.diag, result.err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(phases, ",") != "investigating,connected" {
+		t.Fatalf("phases = %v, want investigating then exactly one connected", phases)
+	}
+}
+
+// handshakeAgent completes the private-mount handshake from inside command()
+// and exits at once, so the stream can end in the same instant the scope is
+// marked connected.
+type handshakeAgent struct {
+	refs *investigationrefs.Registry
+}
+
+func (*handshakeAgent) Name() string      { return "claude" }
+func (*handshakeAgent) Path() string      { return "printf" }
+func (*handshakeAgent) SigninCmd() string { return "claude auth login" }
+func (a *handshakeAgent) parseStream(r io.Reader, onEvent func(StreamEvent)) Diagnosis {
+	return parseStream(r, onEvent)
+}
+func (a *handshakeAgent) command(ctx context.Context, spec turnSpec) (*exec.Cmd, func(), error) {
+	u, err := url.Parse(spec.mcpURL)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	if !a.refs.MarkConnected(u.Query().Get("scope")) {
+		return nil, func() {}, fmt.Errorf("test agent could not mark the scope connected")
+	}
+	stream := `{"type":"result","result":"` + "```json\\n{\\\"healthy\\\":true}\\n```" + `","num_turns":1}`
+	return exec.CommandContext(ctx, "printf", "%s\n", stream), func() {}, nil
+}
+
+// TestDiagnoseStreamReportsHandshakeOnShortTurn pins that a handshake which
+// lands as the stream ends is still reported exactly once, before the turn
+// returns, rather than lost to a select that happens to observe the end first.
+func TestDiagnoseStreamReportsHandshakeOnShortTurn(t *testing.T) {
+	refs := investigationrefs.NewRegistry()
+	diagnoser := &Diagnoser{
+		agents:       map[string]Agent{"claude": &handshakeAgent{refs: refs}},
+		defName:      "claude",
+		evidenceRefs: refs,
+	}
+	for i := 0; i < 20; i++ {
+		var phases []string
+		diag, err := diagnoser.DiagnoseStream(context.Background(), Request{
+			Kind: "Pod", Namespace: "ns", Name: "p", MCPAddress: "localhost:1",
+			EvidenceScope: strings.Repeat("e", 26),
+		}, func(ev StreamEvent) {
+			if ev.Type == "phase" {
+				phases = append(phases, ev.Phase)
+			}
+		})
+		if err != nil || !diag.Healthy {
+			t.Fatalf("diagnosis = %+v, err = %v", diag, err)
+		}
+		if strings.Join(phases, ",") != "investigating,connected" {
+			t.Fatalf("run %d phases = %v, want investigating then exactly one connected", i, phases)
+		}
+	}
+}

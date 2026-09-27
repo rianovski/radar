@@ -11,12 +11,18 @@
 //
 // Two compile entry points:
 //
-//   CompileObjectFilter — bindings shaped to a K8s object:
-//     kind, apiVersion, metadata, spec, status, labels, annotations
+//	CompileObjectFilter — bindings shaped to a K8s object:
+//	  kind, apiVersion, metadata, spec, status, labels, annotations
 //
-//   CompileIssueFilter — bindings shaped to an issues.Issue:
-//     severity, source, kind, group, namespace, name, reason, message,
-//     count, last_seen, cluster
+//	CompileIssueFilter — bindings shaped to an issues.Issue:
+//	  severity, source, category, category_group, kind, group, ns,
+//	  name, reason, message, count, first_seen, onset_unknown,
+//	  onset_coverage_unknown, resource_created_at, last_seen,
+//	  grouping_scope,
+//	  restart_count, last_terminated_reason, cause, action,
+//	  remediation_kind, remediation_target, operation_retry_count, stuck,
+//	  issue_timing, issue_timing_basis
+//	  (full list is authoritative in pkg/issuesapi.CELBindings)
 //
 // Both return a Filter whose Match(activation) yields (bool, error).
 // Compile errors are returned verbatim (CEL's parser produces
@@ -32,6 +38,7 @@ import (
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/types"
+	"github.com/skyhook-io/radar/pkg/issuesapi"
 )
 
 // Filter is a compiled boolean predicate.
@@ -93,22 +100,22 @@ var envObject = mustNewEnv(
 // short form rather than fight cel-go's reservation list; `ns:` is
 // also the short modifier in the search query parser, so the two
 // surfaces stay parallel.
-var envIssue = mustNewEnv(
-	cel.Variable("severity", cel.StringType),
-	cel.Variable("source", cel.StringType),
-	cel.Variable("kind", cel.StringType),
-	cel.Variable("group", cel.StringType),
-	cel.Variable("ns", cel.StringType),
-	cel.Variable("name", cel.StringType),
-	cel.Variable("reason", cel.StringType),
-	cel.Variable("message", cel.StringType),
-	cel.Variable("count", cel.IntType),
-	cel.Variable("cluster", cel.StringType),
-	// last_seen is provided as an int unix-second timestamp so the
-	// agent can write `last_seen > timestamp("2025-01-01T00:00:00Z")`
-	// or compare against a "now - 1h" delta passed by the caller.
-	cel.Variable("last_seen", cel.IntType),
-)
+var envIssue = mustNewEnv(issueCELVariables()...)
+
+func issueCELVariables() []cel.EnvOption {
+	out := make([]cel.EnvOption, 0, len(issuesapi.CELBindings))
+	for _, b := range issuesapi.CELBindings {
+		switch b.Type {
+		case issuesapi.BindingString:
+			out = append(out, cel.Variable(b.Name, cel.StringType))
+		case issuesapi.BindingInt:
+			out = append(out, cel.Variable(b.Name, cel.IntType))
+		case issuesapi.BindingBool:
+			out = append(out, cel.Variable(b.Name, cel.BoolType))
+		}
+	}
+	return out
+}
 
 func mustNewEnv(opts ...cel.EnvOption) *cel.Env {
 	env, err := cel.NewEnv(opts...)
@@ -127,7 +134,8 @@ func CompileObjectFilter(expr string) (*Filter, error) {
 }
 
 // CompileIssueFilter compiles a CEL expression against the Issue
-// row bindings (severity, source, kind, …, count, last_seen).
+// row bindings (severity, source, kind, …, first_seen, resource_created_at,
+// last_seen).
 func CompileIssueFilter(expr string) (*Filter, error) {
 	return compileWith(envIssue, expr)
 }
@@ -264,4 +272,3 @@ func CachedIssueFilter(expr string) (*Filter, error) {
 	defaultCache.put(key, f)
 	return f, nil
 }
-

@@ -1,0 +1,54 @@
+# Workloads for the background scanner to evaluate.
+#
+# Without subjects there are no PolicyReports, and without reports the
+# PolicyReport index, the per-resource policySummary rollup and the whole
+# engine-taxonomy story have nothing to show. The scanner also evaluates
+# kube-system's existing workloads, so a bootstrapped cluster lands around
+# 40 reports across several `source` values.
+#
+# One passes and one fails on purpose, so reports contain a mix rather than
+# all-green.
+---
+# Fails: no `team` label (audit-require-labels warns at admission), containers
+# lack runAsNonRoot and resource limits.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-web
+  namespace: policy-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: demo-web }
+  template:
+    metadata:
+      labels: { app: demo-web }
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27
+---
+# Passes the pod-level policies: runAsNonRoot set, limits declared.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-api
+  namespace: policy-demo
+  labels:
+    team: platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: demo-api }
+  template:
+    metadata:
+      labels: { app: demo-api }
+    spec:
+      containers:
+        - name: api
+          image: nginx:1.27
+          resources:
+            limits: { cpu: 100m, memory: 128Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000

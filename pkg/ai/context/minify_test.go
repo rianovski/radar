@@ -2,15 +2,86 @@ package context
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 )
+
+func TestMinifyGeneration(t *testing.T) {
+	for _, level := range []VerbosityLevel{LevelDetail, LevelCompact} {
+		for _, generation := range []int64{0, 7} {
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test", Generation: generation}}
+			dynamic := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "example.io/v1", "kind": "Example",
+				"metadata": map[string]any{"name": "test"},
+			}}
+			if generation != 0 {
+				dynamic.SetGeneration(generation)
+			}
+			for _, obj := range []runtime.Object{pod, dynamic} {
+				before := obj.DeepCopyObject()
+				var result any
+				if u, ok := obj.(*unstructured.Unstructured); ok {
+					result = MinifyUnstructured(u, level)
+				} else {
+					var err error
+					result, err = Minify(obj, level)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				data, err := json.Marshal(result)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var wire struct{ Metadata map[string]any }
+				if err := json.Unmarshal(data, &wire); err != nil {
+					t.Fatal(err)
+				}
+				got, exists := wire.Metadata["generation"]
+				if (generation == 0 && exists) || (generation != 0 && got != float64(generation)) {
+					t.Errorf("%T level %d: generation = %v (present %v), source %d", obj, level, got, exists, generation)
+				}
+				if !reflect.DeepEqual(obj, before) {
+					t.Errorf("%T level %d: minification mutated source", obj, level)
+				}
+			}
+		}
+	}
+}
+
+func TestMinifyGenerationDoesNotExpandFlatRepresentations(t *testing.T) {
+	for _, obj := range []runtime.Object{
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod"}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "secret"}, Data: map[string][]byte{"password": []byte("private")}},
+	} {
+		for _, level := range []VerbosityLevel{LevelSummary, LevelDetail, LevelCompact} {
+			if _, secret := obj.(*corev1.Secret); !secret && level != LevelSummary {
+				continue
+			}
+			without, err := Minify(obj, level)
+			if err != nil {
+				t.Fatal(err)
+			}
+			withGeneration := obj.DeepCopyObject()
+			withGeneration.(metav1.Object).SetGeneration(7)
+			with, err := Minify(withGeneration, level)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(without, with) {
+				t.Errorf("%T level %d: generation changed flat representation", obj, level)
+			}
+		}
+	}
+}
 
 func TestMinifyResource_Pod(t *testing.T) {
 	pod := &corev1.Pod{
@@ -23,8 +94,8 @@ func TestMinifyResource_Pod(t *testing.T) {
 			Labels:          map[string]string{"app": "web"},
 			Annotations: map[string]string{
 				"kubectl.kubernetes.io/last-applied-configuration": `{"big":"json"}`,
-				"kubernetes.io/ingress.class":                     "nginx",
-				"some-random-annotation":                          "value",
+				"kubernetes.io/ingress.class":                      "nginx",
+				"some-random-annotation":                           "value",
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{Kind: "ReplicaSet", Name: "my-rs"},
@@ -83,15 +154,14 @@ func TestMinifyResource_Pod(t *testing.T) {
 		t.Errorf("Expected namespace=default, got %v", meta["namespace"])
 	}
 
-	// Should strip uid, resourceVersion, generation
 	if _, exists := meta["uid"]; exists {
 		t.Error("uid should be stripped")
 	}
 	if _, exists := meta["resourceVersion"]; exists {
 		t.Error("resourceVersion should be stripped")
 	}
-	if _, exists := meta["generation"]; exists {
-		t.Error("generation should be stripped")
+	if meta["generation"] != float64(3) {
+		t.Errorf("generation = %v, want 3", meta["generation"])
 	}
 
 	// Should keep ingress annotation, strip random ones
@@ -285,6 +355,145 @@ func TestMinify_Detail_EnvValueRedaction(t *testing.T) {
 	}
 }
 
+func TestMinify_Detail_RedactsSensitiveEnvNamesAcrossPodContainerTypes(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-redaction", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: "app",
+				Env: []corev1.EnvVar{
+					{Name: "API_PASSWORD", Value: "secret-one"},
+					{Name: "APP_MODE", Value: "production"},
+					{Name: "EMPTY_VALUE"},
+					{Name: "CONFIG_FROM", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "app-credentials"},
+						Key:                  "password",
+					}}},
+				},
+			}},
+			InitContainers: []corev1.Container{{
+				Name: "init",
+				Env:  []corev1.EnvVar{{Name: "CLIENT_SECRET", Value: "opaque"}},
+			}},
+			EphemeralContainers: []corev1.EphemeralContainer{{
+				EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+					Name: "debug",
+					Env:  []corev1.EnvVar{{Name: "AUTH_TOKEN", Value: "short"}},
+				},
+			}},
+		},
+	}
+
+	raw, err := Minify(pod, LevelDetail)
+	if err != nil {
+		t.Fatalf("Minify failed: %v", err)
+	}
+	data, _ := json.Marshal(raw)
+	output := string(data)
+	for _, leaked := range []string{"secret-one", "opaque", "short"} {
+		if contains(output, leaked) {
+			t.Errorf("sensitive env value %q leaked: %s", leaked, output)
+		}
+	}
+	for _, preserved := range []string{"production", "app-credentials", `"key":"password"`} {
+		if !contains(output, preserved) {
+			t.Errorf("expected safe/reference value %q to survive: %s", preserved, output)
+		}
+	}
+	compactRaw, err := Minify(pod, LevelCompact)
+	if err != nil {
+		t.Fatalf("Minify Compact failed: %v", err)
+	}
+	compactData, _ := json.Marshal(compactRaw)
+	if !contains(string(compactData), "EMPTY_VALUE") || contains(string(compactData), `"name":"EMPTY_VALUE"`) {
+		t.Fatalf("empty literal env was not reduced to its name: %s", compactData)
+	}
+}
+
+func TestMinify_EnvSanitizationCoversCronJobAndNestedUnstructured(t *testing.T) {
+	cronJob := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "report", Namespace: "default"},
+		Spec: batchv1.CronJobSpec{JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers: []corev1.Container{{Name: "report", Env: []corev1.EnvVar{
+				{Name: "DB_PASSWORD", Value: "cron-secret"},
+				{Name: "REPORT_MODE", Value: "daily"},
+			}}},
+		}}}}},
+	}
+
+	for _, level := range []VerbosityLevel{LevelDetail, LevelCompact} {
+		raw, err := Minify(cronJob, level)
+		if err != nil {
+			t.Fatalf("Minify CronJob level=%d failed: %v", level, err)
+		}
+		data, _ := json.Marshal(raw)
+		output := string(data)
+		if contains(output, "cron-secret") {
+			t.Fatalf("CronJob password leaked at level=%d: %s", level, output)
+		}
+		if !contains(output, "DB_PASSWORD") || !contains(output, "REPORT_MODE") {
+			t.Fatalf("CronJob env names missing at level=%d: %s", level, output)
+		}
+		if level == LevelDetail && !contains(output, "daily") {
+			t.Fatalf("safe CronJob env value missing at Detail: %s", output)
+		}
+		if level == LevelCompact && contains(output, "daily") {
+			t.Fatalf("CronJob env value survived Compact: %s", output)
+		}
+	}
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "example.io/v1",
+		"kind":       "Worker",
+		"metadata":   map[string]any{"name": "nested", "namespace": "default"},
+		"spec": map[string]any{"controller": map[string]any{"template": map[string]any{"env": []any{
+			map[string]any{"name": "API_PASSWORD", "value": "nested-secret"},
+			map[string]any{"name": "APP_MODE", "value": "staging"},
+			map[string]any{"name": "CONFIG_FROM", "valueFrom": map[string]any{"secretKeyRef": map[string]any{"name": "worker-credentials", "key": "password"}}},
+			map[string]any{"name": "MALFORMED"},
+			map[string]any{"value": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo5MDEyMzQ1Njc4OUFCQ0RFRg=="},
+			"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo5MDEyMzQ1Njc4OUFCQ0RFRg==",
+		}}}},
+	}}
+
+	detailData, _ := json.Marshal(MinifyUnstructured(obj, LevelDetail))
+	detail := string(detailData)
+	if contains(detail, "nested-secret") || contains(detail, "QUJDREVGR0hJ") || !contains(detail, "staging") || !contains(detail, "worker-credentials") {
+		t.Fatalf("unexpected nested Detail env sanitization: %s", detail)
+	}
+	compactData, _ := json.Marshal(MinifyUnstructured(obj, LevelCompact))
+	compact := string(compactData)
+	if contains(compact, "nested-secret") || contains(compact, "QUJDREVGR0hJ") || contains(compact, "staging") || !contains(compact, "API_PASSWORD") || !contains(compact, "APP_MODE") {
+		t.Fatalf("unexpected nested Compact env sanitization: %s", compact)
+	}
+}
+
+func TestMinifyUnstructured_EnvSanitizationPreservesNonEnvVarListsAndFailsClosed(t *testing.T) {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "example.io/v1",
+		"kind":       "Worker",
+		"metadata":   map[string]any{"name": "worker"},
+		"spec": map[string]any{
+			"env": []any{"prod", "staging"},
+			"template": map[string]any{"env": []any{
+				map[string]any{"name": "API_TOKEN", "value": map[string]any{"opaque": "short-secret"}},
+			}},
+		},
+	}}
+
+	for _, level := range []VerbosityLevel{LevelDetail, LevelCompact} {
+		data, _ := json.Marshal(MinifyUnstructured(obj.DeepCopy(), level))
+		output := string(data)
+		if !contains(output, `"env":["prod","staging"]`) {
+			t.Fatalf("non-EnvVar env list changed at level=%d: %s", level, output)
+		}
+		if contains(output, "short-secret") {
+			t.Fatalf("sensitive non-string env value leaked at level=%d: %s", level, output)
+		}
+	}
+}
+
 func TestMinifyUnstructured_Compact(t *testing.T) {
 	obj := &unstructured.Unstructured{
 		Object: map[string]any{
@@ -459,9 +668,11 @@ func TestMinify_SecretNeverLeaksAtAnyLevel(t *testing.T) {
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
 			"password": []byte("s3cr3t-value"),
+			"shared":   []byte("data-wins"),
 		},
 		StringData: map[string]string{
 			"api-key": "another-secret",
+			"shared":  "duplicate-key",
 		},
 	}
 
@@ -475,6 +686,9 @@ func TestMinify_SecretNeverLeaksAtAnyLevel(t *testing.T) {
 		if contains(output, "s3cr3t-value") || contains(output, "another-secret") {
 			t.Errorf("Level %d: secret data leaked: %s", level, output)
 		}
+		if !contains(output, `"keys":["api-key","password","shared"]`) {
+			t.Errorf("Level %d: secret keys are not a stable sorted union: %s", level, output)
+		}
 	}
 }
 
@@ -484,7 +698,7 @@ func TestMinify_DetailKeepsAllAnnotations(t *testing.T) {
 			Name:      "detail-test",
 			Namespace: "default",
 			Annotations: map[string]string{
-				"custom.example.com/note": "important",
+				"custom.example.com/note":     "important",
 				"kubernetes.io/ingress.class": "nginx",
 			},
 		},
@@ -514,7 +728,7 @@ func TestMinify_CompactStripsCustomAnnotations(t *testing.T) {
 			Name:      "compact-test",
 			Namespace: "default",
 			Annotations: map[string]string{
-				"custom.example.com/note": "important",
+				"custom.example.com/note":     "important",
 				"kubernetes.io/ingress.class": "nginx",
 			},
 		},

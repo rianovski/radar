@@ -2,36 +2,115 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/internal/timeline"
+	"github.com/skyhook-io/radar/pkg/k8score"
 )
 
-var testServer *httptest.Server
+var (
+	testServer    *httptest.Server
+	testServerSrv *Server
+)
+
+// testFakeClient is the shared cluster fixture built in TestMain. Tests that
+// replace the resource cache restore it from here.
+var testFakeClient *fake.Clientset
+
+func useTestResourceCache(t *testing.T, client *fake.Clientset) {
+	t.Helper()
+	t.Cleanup(func() {
+		k8s.ResetResourceCache()
+		if err := k8s.InitTestResourceCache(testFakeClient); err != nil {
+			t.Fatalf("restore package fixture cache: %v", err)
+		}
+	})
+	k8s.ResetResourceCache()
+	if err := k8s.InitTestResourceCache(client); err != nil {
+		t.Fatalf("initialize test resource cache: %v", err)
+	}
+}
 
 func TestMain(m *testing.M) {
+	// The Cloud-funnel rollout gate mints an install ID in ~/.radar on first
+	// use; redirect HOME so no test run touches the developer's real settings.
+	tmpHome, err := os.MkdirTemp("", "radar-server-test-home")
+	if err == nil {
+		os.Setenv("HOME", tmpHome)
+		os.Setenv("USERPROFILE", tmpHome)
+	}
+
 	replicas := int32(1)
+	brokenReplicas := int32(3)
 
 	deployUID := "deploy-uid-1234"
 	rsUID := "rs-uid-5678"
 
-	fakeClient := fake.NewClientset(
+	// Package-level so tests that swap in their own cluster shape (census-scale
+	// measurements) can restore the shared fixture the rest of the suite reads.
+	testFakeClient = fake.NewClientset(
 		&corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: "default"},
 			Status:     corev1.NamespaceStatus{Phase: corev1.NamespaceActive},
+		},
+		&corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: "broken"},
+			Status:     corev1.NamespaceStatus{Phase: corev1.NamespaceActive},
+		},
+		// Broken Deployment in its own namespace so it doesn't perturb the
+		// "default" fixture used by every other smoke test. Used by
+		// TestAIGetResource_IssueSummaryCountsURLPluralKind to assert the
+		// composer's URL-plural-kind filter actually matches the canonical
+		// Pascal-singular Issue.Kind values — pre-fix, count was 0.
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "stuck-app",
+				Namespace: "broken",
+				Labels:    map[string]string{"app": "stuck"},
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &brokenReplicas,
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "stuck"},
+				},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "stuck"}},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "stuck", Image: "registry.example/stuck:1"}}},
+				},
+			},
+			Status: appsv1.DeploymentStatus{
+				Replicas:            3,
+				AvailableReplicas:   0,
+				UnavailableReplicas: 3,
+			},
 		},
 		&appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{
@@ -47,12 +126,41 @@ func TestMain(m *testing.M) {
 				},
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "nginx"}},
-					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "nginx", Image: "nginx:1.25"}}},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "nginx", Image: "nginx:1.25"}},
+						// Reference nginx-tls so the topology builder includes
+						// the Secret node when IncludeSecrets=true. The
+						// neighborhood handler's Secret-root tests depend on
+						// this — without a reference the Secret would be
+						// elided regardless of IncludeSecrets.
+						Volumes: []corev1.Volume{{
+							Name: "tls",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{SecretName: "nginx-tls"},
+							},
+						}},
+					},
 				},
 			},
 			Status: appsv1.DeploymentStatus{
 				Replicas:      1,
 				ReadyReplicas: 1,
+			},
+		},
+		&autoscalingv2.HorizontalPodAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{Name: "nginx-hpa", Namespace: "default", Generation: 1},
+			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+				ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{APIVersion: "apps/v1", Kind: "Deployment", Name: "nginx"},
+				MinReplicas:    &replicas,
+				MaxReplicas:    2,
+			},
+			Status: autoscalingv2.HorizontalPodAutoscalerStatus{
+				ObservedGeneration: ptrInt64(1),
+				CurrentReplicas:    2,
+				DesiredReplicas:    2,
+				Conditions: []autoscalingv2.HorizontalPodAutoscalerCondition{
+					{Type: autoscalingv2.ScalingLimited, Status: corev1.ConditionTrue, Reason: "TooManyReplicas", Message: "the desired replica count is more than the maximum replica count"},
+				},
 			},
 		},
 		&appsv1.ReplicaSet{
@@ -120,6 +228,37 @@ func TestMain(m *testing.M) {
 				Ports:    []corev1.ServicePort{{Port: 80, TargetPort: intstr.FromInt(80)}},
 			},
 		},
+		// Ingress routing to the core Service "nginx". Used by
+		// TestAIGetResource_GroupRoutesRelationshipsToKnative to give the
+		// core Service a distinct incoming edge (EdgeRoutesTo) that the
+		// Knative Service node does NOT inherit — the test compares whether
+		// the AI GET handler picks up that edge under ?group=serving.knative.dev
+		// (regression for the kind-passed-to-relationship-lookup bug).
+		&networkingv1.Ingress{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "nginx-ingress",
+				Namespace: "default",
+			},
+			Spec: networkingv1.IngressSpec{
+				Rules: []networkingv1.IngressRule{{
+					Host: "nginx.example.com",
+					IngressRuleValue: networkingv1.IngressRuleValue{
+						HTTP: &networkingv1.HTTPIngressRuleValue{
+							Paths: []networkingv1.HTTPIngressPath{{
+								Path:     "/",
+								PathType: func() *networkingv1.PathType { p := networkingv1.PathTypePrefix; return &p }(),
+								Backend: networkingv1.IngressBackend{
+									Service: &networkingv1.IngressServiceBackend{
+										Name: "nginx",
+										Port: networkingv1.ServiceBackendPort{Number: 80},
+									},
+								},
+							}},
+						},
+					},
+				}},
+			},
+		},
 		// Seed Secrets in two namespaces so per-user RBAC tests can
 		// distinguish "gate denied → []" from "no secrets in cache" and can
 		// exercise the partial-allow case (one ns allowed, the other denied).
@@ -127,14 +266,105 @@ func TestMain(m *testing.M) {
 			ObjectMeta: metav1.ObjectMeta{Name: "nginx-tls", Namespace: "default"},
 			Type:       corev1.SecretTypeOpaque,
 		},
+		// Argo cluster-secret fixtures for /api/argo/destinations: one valid,
+		// one malformed (no server) that the endpoint must skip.
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "cluster-prod", Namespace: "argocd",
+				Labels: map[string]string{"argocd.argoproj.io/secret-type": "cluster"},
+			},
+			Type: corev1.SecretTypeOpaque,
+			Data: map[string][]byte{
+				"name":   []byte("prod-us-east1"),
+				"server": []byte("https://34.10.0.1"),
+				"config": []byte(`{"bearerToken":"SUPER-SECRET-TOKEN"}`),
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "cluster-broken", Namespace: "argocd",
+				Labels: map[string]string{"argocd.argoproj.io/secret-type": "cluster"},
+			},
+			Type: corev1.SecretTypeOpaque,
+			Data: map[string][]byte{"name": []byte("half-configured")},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "cluster-hostile", Namespace: "argocd",
+				Labels: map[string]string{"argocd.argoproj.io/secret-type": "cluster"},
+			},
+			Type: corev1.SecretTypeOpaque,
+			// server is not a URL — a mislabeled/hostile row whose bytes must
+			// not be reflected by /api/argo/destinations.
+			Data: map[string][]byte{
+				"name":   []byte("hostile"),
+				"server": []byte("Bearer NOT-A-URL-TOKEN xyz"),
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "cluster-userinfo", Namespace: "argocd",
+				Labels: map[string]string{"argocd.argoproj.io/secret-type": "cluster"},
+			},
+			Type: corev1.SecretTypeOpaque,
+			Data: map[string][]byte{
+				"name":   []byte("userinfo-cluster"),
+				"server": []byte("https://EMBEDDED-CRED-TOKEN@apiserver.example"),
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "cluster-querytoken", Namespace: "argocd",
+				Labels: map[string]string{"argocd.argoproj.io/secret-type": "cluster"},
+			},
+			Type: corev1.SecretTypeOpaque,
+			// Credentials hidden in the query string — the endpoint must
+			// reconstruct scheme://host, never reflect these bytes.
+			Data: map[string][]byte{
+				"name":   []byte("querytoken-cluster"),
+				"server": []byte("https://apiserver2.example/?token=QUERY-CRED-TOKEN#FRAG-CRED"),
+			},
+		},
 		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "system-token", Namespace: "kube-system"},
 			Type:       corev1.SecretTypeOpaque,
 		},
+		// RBAC fixtures: one SA, a Role/RoleBinding pair binding it, a
+		// ClusterRole/ClusterRoleBinding grant to system:authenticated so
+		// rbac_handlers_test can exercise both direct + inherited paths.
+		&corev1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "app-sa", Namespace: "default"},
+		},
+		&rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{Name: "app-reader", Namespace: "default"},
+			Rules: []rbacv1.PolicyRule{{
+				Verbs: []string{"get", "list"}, APIGroups: []string{""}, Resources: []string{"pods"},
+			}},
+		},
+		&rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "app-binding", Namespace: "default"},
+			RoleRef:    rbacv1.RoleRef{Kind: "Role", Name: "app-reader", APIGroup: "rbac.authorization.k8s.io"},
+			Subjects: []rbacv1.Subject{{
+				Kind: "ServiceAccount", Namespace: "default", Name: "app-sa",
+			}},
+		},
+		&rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{Name: "rbac-test-view"},
+			Rules: []rbacv1.PolicyRule{{
+				Verbs: []string{"list"}, APIGroups: []string{""}, Resources: []string{"namespaces"},
+			}},
+		},
+		&rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "rbac-test-auth-view"},
+			RoleRef:    rbacv1.RoleRef{Kind: "ClusterRole", Name: "rbac-test-view", APIGroup: "rbac.authorization.k8s.io"},
+			Subjects: []rbacv1.Subject{{
+				Kind: "Group", Name: "system:authenticated", APIGroup: "rbac.authorization.k8s.io",
+			}},
+		},
 	)
 
 	// Initialize cache from fake client (bypasses RBAC checks)
-	if err := k8s.InitTestResourceCache(fakeClient); err != nil {
+	if err := k8s.InitTestResourceCache(testFakeClient); err != nil {
 		panic("InitTestResourceCache: " + err.Error())
 	}
 
@@ -150,6 +380,7 @@ func TestMain(m *testing.M) {
 	}
 
 	srv := New(Config{DevMode: true})
+	testServerSrv = srv
 	testServer = httptest.NewServer(srv.Handler())
 
 	code := m.Run()
@@ -158,6 +389,9 @@ func TestMain(m *testing.M) {
 	srv.Stop()
 	timeline.ResetStore()
 	k8s.ResetTestState()
+	if tmpHome != "" {
+		os.RemoveAll(tmpHome)
+	}
 
 	os.Exit(code)
 }
@@ -187,6 +421,44 @@ func TestSmokeHealth(t *testing.T) {
 	count, _ := body["resourceCount"].(float64)
 	if count < 1 {
 		t.Errorf("expected resourceCount >= 1, got %v", count)
+	}
+
+	timelineStats, ok := body["timeline"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected timeline stats object, got %T", body["timeline"])
+	}
+	if _, ok := timelineStats["total_events"]; ok {
+		t.Error("health endpoint should not run live timeline event counts")
+	}
+	if timelineStats["store_present"] != true {
+		t.Errorf("expected store_present=true, got %v", timelineStats["store_present"])
+	}
+}
+
+func TestSmokeMetricsEndpoint(t *testing.T) {
+	resp := get(t, "/metrics")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/plain") {
+		t.Fatalf("expected Prometheus text content type, got %q", ct)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	for _, want := range []string{
+		"radar_sse_connected_clients",
+		"radar_sse_topology_broadcasts_total",
+		"radar_sse_dropped_events_total",
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("expected %s in metrics output, got:\n%s", want, body)
+		}
 	}
 }
 
@@ -351,6 +623,50 @@ func TestSmokeListPods(t *testing.T) {
 	}
 }
 
+func TestSmokeTopPodsHonorsNamespaceFilter(t *testing.T) {
+	resp, err := http.Get(testServer.URL + "/api/metrics/top/pods?namespaces=default")
+	if err != nil {
+		t.Fatalf("GET /api/metrics/top/pods?namespaces=default: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var body []k8s.TopPodMetrics
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(body) < 1 {
+		t.Fatal("expected at least 1 pod metric row")
+	}
+	for _, pod := range body {
+		if pod.Namespace != "default" {
+			t.Fatalf("expected only default namespace rows, got %s/%s", pod.Namespace, pod.Name)
+		}
+	}
+
+	resp, err = http.Get(testServer.URL + "/api/metrics/top/pods?namespaces=missing")
+	if err != nil {
+		t.Fatalf("GET /api/metrics/top/pods?namespaces=missing: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for missing namespace filter, got %d", resp.StatusCode)
+	}
+
+	body = nil
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode missing namespace response: %v", err)
+	}
+	if len(body) != 0 {
+		t.Fatalf("expected missing namespace filter to return no pod metrics, got %d rows", len(body))
+	}
+}
+
 func TestSmokeListDeployments(t *testing.T) {
 	resp, err := http.Get(testServer.URL + "/api/resources/deployments")
 	if err != nil {
@@ -394,6 +710,30 @@ func TestSmokeGetDeployment(t *testing.T) {
 	}
 }
 
+func TestSmokeGetHPAIncludesDiagnosis(t *testing.T) {
+	resp, err := http.Get(testServer.URL + "/api/resources/hpas/default/nginx-hpa")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	diagnosis, ok := body["hpaDiagnosis"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing hpaDiagnosis in response: %+v", body)
+	}
+	if diagnosis["state"] != "limited_max" {
+		t.Fatalf("hpaDiagnosis.state = %v, want limited_max", diagnosis["state"])
+	}
+}
+
 func TestSmokeGetResourceNotFound(t *testing.T) {
 	resp, err := http.Get(testServer.URL + "/api/resources/deployments/default/nonexistent")
 	if err != nil {
@@ -422,6 +762,8 @@ func TestSmokeEvents(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+func ptrInt64(v int64) *int64 { return &v }
 
 // --- Helpers ---
 
@@ -593,9 +935,44 @@ func TestSmokeChangesWithFilters(t *testing.T) {
 	assertOK(t, get(t, "/api/changes?namespace=default&kind=Deployment&limit=10"), &body)
 }
 
-func TestSmokeChangeChildren(t *testing.T) {
-	var body []any
-	assertOK(t, get(t, "/api/changes/deployments/default/nginx/children"), &body)
+func TestSmokeChangesNameFilter(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	clusterContext := k8s.ActiveClusterContext()
+	events := []timeline.TimelineEvent{
+		{
+			ID:             "smoke-name-filter-keep",
+			Timestamp:      now,
+			Source:         timeline.SourceInformer,
+			Kind:           "Deployment",
+			Namespace:      "default",
+			Name:           "smoke-name-filter-keep",
+			EventType:      timeline.EventTypeUpdate,
+			ClusterContext: clusterContext,
+		},
+		{
+			ID:             "smoke-name-filter-drop",
+			Timestamp:      now,
+			Source:         timeline.SourceInformer,
+			Kind:           "Deployment",
+			Namespace:      "default",
+			Name:           "smoke-name-filter-drop",
+			EventType:      timeline.EventTypeUpdate,
+			ClusterContext: clusterContext,
+		},
+	}
+	if err := timeline.RecordEvents(ctx, events); err != nil {
+		t.Fatalf("RecordEvents: %v", err)
+	}
+
+	var body []timeline.TimelineEvent
+	assertOK(t, get(t, "/api/changes?namespace=default&kind=Deployment&name=smoke-name-filter-keep&include_managed=true&filter=all&limit=10"), &body)
+	if len(body) != 1 {
+		t.Fatalf("expected exactly one name-filtered event, got %d: %+v", len(body), body)
+	}
+	if body[0].Name != "smoke-name-filter-keep" {
+		t.Fatalf("expected smoke-name-filter-keep, got %q", body[0].Name)
+	}
 }
 
 // --- AI resources ---
@@ -640,6 +1017,43 @@ func TestSmokeConnection(t *testing.T) {
 	assertKeys(t, body, "state", "context", "contexts")
 	if body["state"] != string(k8s.StateConnected) {
 		t.Errorf("expected state=%q, got %v", k8s.StateConnected, body["state"])
+	}
+}
+
+func TestSmokeConnectionStatusOnly(t *testing.T) {
+	// The UI's perpetual fallback poll opts out of context enumeration, which
+	// re-reads kubeconfig files under the client write lock on every hit.
+	var body map[string]any
+	assertOK(t, get(t, "/api/connection?contexts=0"), &body)
+	assertKeys(t, body, "state", "context", "authRecoveryOwed")
+	if _, present := body["contexts"]; present {
+		t.Error("contexts should be omitted when the poll asks for status only")
+	}
+}
+
+func TestConnectionRetryInClusterProbesBeforeTeardown(t *testing.T) {
+	k8s.ForceInCluster = true
+	t.Cleanup(func() { k8s.ForceInCluster = false })
+	previousContext := k8s.SetTestContextName("in-cluster")
+	t.Cleanup(func() { k8s.SetTestContextName(previousContext) })
+	previousStatus := k8s.GetConnectionStatus()
+	t.Cleanup(func() { k8s.SetConnectionStatus(previousStatus) })
+	stopped := false
+	k8s.SetSessionStopper(func() { stopped = true })
+	t.Cleanup(func() { k8s.SetSessionStopper(nil) })
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/connection/retry", nil)
+	(&Server{}).handleConnectionRetry(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("retry status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if !strings.Contains(recorder.Body.String(), "K8s config not initialized") {
+		t.Fatalf("retry response = %q", recorder.Body.String())
+	}
+	if stopped {
+		t.Fatal("in-cluster retry stopped active sessions")
 	}
 }
 
@@ -730,6 +1144,560 @@ func TestSmokeMetricsNilDynamicClient(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMetricsAPIUnavailable(t *testing.T) {
+	// These cases cover typed Kubernetes API errors first, then message shapes
+	// emitted by apimachinery discovery/restmapper, kubectl top-style metrics
+	// failures, and API aggregation 503s. Keep broad phrases gated by a
+	// metrics-specific signal so unrelated NotFound/Unavailable errors stay visible.
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "bare metrics API absence from apiserver",
+			err:  errors.New("failed to get node metrics: the server could not find the requested resource"),
+			want: true,
+		},
+		{
+			name: "metrics API not discovered",
+			err:  k8score.ErrMetricsAPINotDiscovered,
+			want: true,
+		},
+		{
+			name: "metrics not found",
+			err:  errors.New(`failed to get pod metrics: pods.metrics.k8s.io "api" not found`),
+			want: true,
+		},
+		{
+			name: "metrics no matches for kind",
+			err:  errors.New(`failed to get pod metrics: no matches for kind "PodMetrics" in version "metrics.k8s.io/v1beta1"`),
+			want: true,
+		},
+		{
+			name: "metrics no resource matches",
+			err:  errors.New(`failed to get pod metrics: no resource matches "pods.metrics.k8s.io"`),
+			want: true,
+		},
+		{
+			name: "metrics not available",
+			err:  errors.New(`failed to get pod metrics: pods.metrics.k8s.io not available`),
+			want: true,
+		},
+		{
+			name: "no metrics known",
+			err:  errors.New(`failed to get pod metrics: no metrics known for pod "api" in pods.metrics.k8s.io`),
+			want: true,
+		},
+		{
+			name: "unable to fetch metrics",
+			err:  errors.New(`failed to get pod metrics: unable to fetch metrics from pods.metrics.k8s.io`),
+			want: true,
+		},
+		{
+			name: "metrics APIService unavailable",
+			err:  errors.New(`failed to get pod metrics: the server is currently unable to handle the request (get pods.metrics.k8s.io)`),
+			want: true,
+		},
+		{
+			name: "non-metrics missing resource stays visible",
+			err:  errors.New("the server could not find the requested resource"),
+			want: false,
+		},
+		{
+			name: "metrics forbidden stays visible",
+			err:  errors.New("failed to get node metrics: forbidden"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := k8score.MetricsAPIUnavailable(tt.err); got != tt.want {
+				t.Fatalf("MetricsAPIUnavailable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMetricsAPIServiceNamesForVersionIncludesDiscoveredVersionFirst(t *testing.T) {
+	got := metricsAPIServiceNamesForVersion("v2beta1")
+	want := []string{"v2beta1.metrics.k8s.io", "v1.metrics.k8s.io", "v1beta1.metrics.k8s.io"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("metrics APIService names = %v, want %v", got, want)
+	}
+}
+
+func TestMetricsHistoryResponseCarriesCollectionErrorWithBufferedHistory(t *testing.T) {
+	health := k8s.MetricsCollectionHealth{
+		PodMetrics: k8s.MetricsSourceHealth{
+			ConsecutiveErrors: 1,
+			LastError:         "the server could not find the requested resource",
+		},
+		NodeMetrics: k8s.MetricsSourceHealth{
+			ConsecutiveErrors: 1,
+			LastError:         "the server could not find the requested resource",
+		},
+	}
+
+	podHistory := podMetricsHistoryResponse(context.Background(), &k8s.PodMetricsHistory{
+		Namespace: "default",
+		Name:      "api",
+		Containers: []k8s.ContainerMetricsHistory{{
+			Name: "api",
+			DataPoints: []k8s.MetricsDataPoint{{
+				Timestamp: time.Now(),
+				CPU:       100000000,
+				Memory:    268435456,
+			}},
+		}},
+	}, "default", "api", health, true)
+	if podHistory.CollectionError != "Pod metrics not found (metrics-server may not be installed)" {
+		t.Fatalf("pod collection error = %q", podHistory.CollectionError)
+	}
+	if podHistory.RawCollectionError != health.PodMetrics.LastError {
+		t.Fatalf("pod raw collection error = %q, want %q", podHistory.RawCollectionError, health.PodMetrics.LastError)
+	}
+	if !podHistory.MetricsUnavailable {
+		t.Fatalf("pod metrics unavailable = false, want true")
+	}
+
+	nodeHistory := nodeMetricsHistoryResponse(context.Background(), &k8s.NodeMetricsHistory{
+		Name: "kind-worker",
+		DataPoints: []k8s.MetricsDataPoint{{
+			Timestamp: time.Now(),
+			CPU:       100000000,
+			Memory:    268435456,
+		}},
+	}, "kind-worker", health, true)
+	if nodeHistory.CollectionError != "Node metrics not found (metrics-server may not be installed)" {
+		t.Fatalf("node collection error = %q", nodeHistory.CollectionError)
+	}
+	if nodeHistory.RawCollectionError != health.NodeMetrics.LastError {
+		t.Fatalf("node raw collection error = %q, want %q", nodeHistory.RawCollectionError, health.NodeMetrics.LastError)
+	}
+	if !nodeHistory.MetricsUnavailable {
+		t.Fatalf("node metrics unavailable = false, want true")
+	}
+}
+
+func TestMetricsHistoryResponseKeepsNonAbsenceCollectionErrors(t *testing.T) {
+	health := k8s.MetricsCollectionHealth{
+		PodMetrics: k8s.MetricsSourceHealth{
+			ConsecutiveErrors: 1,
+			LastError:         "forbidden: no access to pods.metrics.k8s.io",
+		},
+		NodeMetrics: k8s.MetricsSourceHealth{
+			ConsecutiveErrors: 1,
+			LastError:         "forbidden: no access to nodes.metrics.k8s.io",
+		},
+	}
+
+	podHistory := podMetricsHistoryResponse(context.Background(), nil, "default", "api", health, true)
+	if podHistory.CollectionError != health.PodMetrics.LastError {
+		t.Fatalf("pod collection error = %q, want %q", podHistory.CollectionError, health.PodMetrics.LastError)
+	}
+	if podHistory.RawCollectionError != "" {
+		t.Fatalf("pod raw collection error = %q, want empty", podHistory.RawCollectionError)
+	}
+	if podHistory.MetricsUnavailableDiagnosis != "" {
+		t.Fatalf("pod metrics unavailable diagnosis = %q, want empty", podHistory.MetricsUnavailableDiagnosis)
+	}
+	if podHistory.MetricsUnavailable {
+		t.Fatalf("pod metrics unavailable = true, want false")
+	}
+
+	nodeHistory := nodeMetricsHistoryResponse(context.Background(), nil, "kind-worker", health, true)
+	if nodeHistory.CollectionError != health.NodeMetrics.LastError {
+		t.Fatalf("node collection error = %q, want %q", nodeHistory.CollectionError, health.NodeMetrics.LastError)
+	}
+	if nodeHistory.RawCollectionError != "" {
+		t.Fatalf("node raw collection error = %q, want empty", nodeHistory.RawCollectionError)
+	}
+	if nodeHistory.MetricsUnavailableDiagnosis != "" {
+		t.Fatalf("node metrics unavailable diagnosis = %q, want empty", nodeHistory.MetricsUnavailableDiagnosis)
+	}
+	if nodeHistory.MetricsUnavailable {
+		t.Fatalf("node metrics unavailable = true, want false")
+	}
+}
+
+func TestMetricsAPIServiceDiagnosis(t *testing.T) {
+	tests := []struct {
+		name      string
+		condition map[string]any
+		want      string
+	}{
+		{
+			name: "available true points away from installation",
+			condition: map[string]any{
+				"type":   "Available",
+				"status": "True",
+			},
+			want: "The v1beta1.metrics.k8s.io APIService is Available, but metrics reads still fail. Check metrics-server logs and API aggregation errors.",
+		},
+		{
+			name: "available false includes reason",
+			condition: map[string]any{
+				"type":   "Available",
+				"status": "False",
+				"reason": "FailedDiscoveryCheck",
+			},
+			want: "The v1beta1.metrics.k8s.io APIService is not Available (FailedDiscoveryCheck). Check the metrics-server Service, endpoints, and API aggregation/TLS configuration.",
+		},
+		{
+			name: "available false includes compact condition message",
+			condition: map[string]any{
+				"type":    "Available",
+				"status":  "False",
+				"reason":  "FailedDiscoveryCheck",
+				"message": "failing or missing response from https://10.96.142.7:443/apis/metrics.k8s.io/v1beta1: Get \"https://10.96.142.7\": connect: connection refused",
+			},
+			want: "The v1beta1.metrics.k8s.io APIService is not Available (FailedDiscoveryCheck): failing or missing response from https://10.96.142.7:443/apis/metrics.k8s.io/v1beta1: Get \"https://10.96.142.7\": connect: connection refused. Check the metrics-server Service, endpoints, and API aggregation/TLS configuration.",
+		},
+		{
+			name: "available false preserves ellipsis in condition message",
+			condition: map[string]any{
+				"type":    "Available",
+				"status":  "False",
+				"message": "timed out waiting...",
+			},
+			want: "The v1beta1.metrics.k8s.io APIService is not Available: timed out waiting... Check the metrics-server Service, endpoints, and API aggregation/TLS configuration.",
+		},
+		{
+			name: "available false trims dangling condition punctuation",
+			condition: map[string]any{
+				"type":    "Available",
+				"status":  "False",
+				"message": "connection refused:",
+			},
+			want: "The v1beta1.metrics.k8s.io APIService is not Available: connection refused. Check the metrics-server Service, endpoints, and API aggregation/TLS configuration.",
+		},
+		{
+			name: "available unknown includes reason",
+			condition: map[string]any{
+				"type":   "Available",
+				"status": "Unknown",
+				"reason": "ServiceNotFound",
+			},
+			want: "The v1beta1.metrics.k8s.io APIService is not Available (ServiceNotFound). Check the metrics-server Service, endpoints, and API aggregation/TLS configuration.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apiService := &unstructured.Unstructured{Object: map[string]any{
+				"status": map[string]any{
+					"conditions": []any{tt.condition},
+				},
+			}}
+			if got := metricsAPIServiceDiagnosis("v1beta1.metrics.k8s.io", apiService, true); got != tt.want {
+				t.Fatalf("metricsAPIServiceDiagnosis() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMetricsAPIServiceDiagnosisCanHideConditionMessage(t *testing.T) {
+	apiService := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{
+			"conditions": []any{
+				map[string]any{
+					"type":    "Available",
+					"status":  "False",
+					"reason":  "FailedDiscoveryCheck",
+					"message": "failing or missing response from https://10.96.142.7:443/apis/metrics.k8s.io/v1beta1",
+				},
+			},
+		},
+	}}
+	want := "The v1beta1.metrics.k8s.io APIService is not Available (FailedDiscoveryCheck). Check the metrics-server Service, endpoints, and API aggregation/TLS configuration."
+	if got := metricsAPIServiceDiagnosis("v1beta1.metrics.k8s.io", apiService, false); got != want {
+		t.Fatalf("metricsAPIServiceDiagnosis() = %q, want %q", got, want)
+	}
+}
+
+func TestMetricsAPIServiceDiagnosisWithoutAvailableCondition(t *testing.T) {
+	apiService := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{
+			"conditions": []any{
+				map[string]any{"type": "ServiceHealthy", "status": "True"},
+			},
+		},
+	}}
+	want := "The v1beta1.metrics.k8s.io APIService exists but has no Available condition. Check metrics-server and API aggregation status."
+	if got := metricsAPIServiceDiagnosis("v1beta1.metrics.k8s.io", apiService, true); got != want {
+		t.Fatalf("metricsAPIServiceDiagnosis() = %q, want %q", got, want)
+	}
+}
+
+func TestMetricsAPIServiceLookupDiagnosisWhenMissing(t *testing.T) {
+	err := apierrors.NewNotFound(schema.GroupResource{Group: metricsAPIServiceGroup, Resource: "apiservices"}, "v1beta1.metrics.k8s.io")
+	want := "The v1beta1.metrics.k8s.io APIService is not registered. Install metrics-server or restore that APIService."
+	if got := metricsAPIServiceLookupDiagnosis("v1beta1.metrics.k8s.io", nil, err, true); got != want {
+		t.Fatalf("metricsAPIServiceLookupDiagnosis() = %q, want %q", got, want)
+	}
+}
+
+func TestMetricsUnavailableDiagnosisWhenAPIServiceMissing(t *testing.T) {
+	resetMetricsAPIServiceDiagnosisMemoForTest(t)
+	defer k8s.ResetTestDynamicState()
+
+	gvr := schema.GroupVersionResource{Group: metricsAPIServiceGroup, Version: "v1", Resource: "apiservices"}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{gvr: "APIServiceList"},
+	)
+	if err := k8s.InitTestDynamicResourceCache(dyn, []k8s.APIResource{{
+		Group:      metricsAPIServiceGroup,
+		Version:    "v1",
+		Kind:       metricsAPIServiceKind,
+		Name:       "apiservices",
+		Namespaced: false,
+	}}); err != nil {
+		t.Fatalf("InitTestDynamicResourceCache: %v", err)
+	}
+
+	want := "The metrics.k8s.io APIService is not registered. Install metrics-server or restore that APIService."
+	if got := metricsUnavailableDiagnosis(context.Background(), true); got != want {
+		t.Fatalf("metricsUnavailableDiagnosis() = %q, want %q", got, want)
+	}
+}
+
+func TestMetricsUnavailableDiagnosisInspectsDiscoveredMetricsVersionFirst(t *testing.T) {
+	resetMetricsAPIServiceDiagnosisMemoForTest(t)
+	defer k8s.ResetTestDynamicState()
+
+	apiServiceGVR := schema.GroupVersionResource{Group: metricsAPIServiceGroup, Version: "v1", Resource: "apiservices"}
+	v1 := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiregistration.k8s.io/v1",
+		"kind":       metricsAPIServiceKind,
+		"metadata":   map[string]any{"name": "v1.metrics.k8s.io"},
+		"status": map[string]any{"conditions": []any{map[string]any{
+			"type": "Available", "status": "False", "reason": "FailedDiscoveryCheck",
+		}}},
+	}}
+	v1beta1 := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiregistration.k8s.io/v1",
+		"kind":       metricsAPIServiceKind,
+		"metadata":   map[string]any{"name": "v1beta1.metrics.k8s.io"},
+		"status": map[string]any{"conditions": []any{map[string]any{
+			"type": "Available", "status": "True",
+		}}},
+	}}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{apiServiceGVR: "APIServiceList"},
+		v1,
+		v1beta1,
+	)
+	if err := k8s.InitTestDynamicResourceCache(dyn, []k8s.APIResource{
+		{Group: metricsAPIServiceGroup, Version: "v1", Kind: metricsAPIServiceKind, Name: "apiservices", Namespaced: false},
+		{Group: "metrics.k8s.io", Version: "v1beta1", Kind: "NodeMetrics", Name: "nodes", Namespaced: false, Verbs: []string{"get", "list"}},
+	}); err != nil {
+		t.Fatalf("InitTestDynamicResourceCache: %v", err)
+	}
+
+	want := "The v1beta1.metrics.k8s.io APIService is Available, but metrics reads still fail. Check metrics-server logs and API aggregation errors."
+	if got := metricsUnavailableDiagnosis(context.Background(), true); got != want {
+		t.Fatalf("metricsUnavailableDiagnosis() = %q, want %q", got, want)
+	}
+}
+
+func TestMetricsUnavailableDiagnosisMemoizesAPIServiceLookup(t *testing.T) {
+	resetMetricsAPIServiceDiagnosisMemoForTest(t)
+	defer k8s.ResetTestDynamicState()
+
+	gvr := schema.GroupVersionResource{Group: metricsAPIServiceGroup, Version: "v1", Resource: "apiservices"}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{gvr: "APIServiceList"},
+	)
+	gets := 0
+	dyn.Fake.PrependReactor("get", "apiservices", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		gets++
+		return false, nil, nil
+	})
+	if err := k8s.InitTestDynamicResourceCache(dyn, []k8s.APIResource{{
+		Group:      metricsAPIServiceGroup,
+		Version:    "v1",
+		Kind:       metricsAPIServiceKind,
+		Name:       "apiservices",
+		Namespaced: false,
+	}}); err != nil {
+		t.Fatalf("InitTestDynamicResourceCache: %v", err)
+	}
+
+	for range 2 {
+		if got := metricsUnavailableDiagnosis(context.Background(), true); got == "" {
+			t.Fatalf("metricsUnavailableDiagnosis() returned empty diagnosis")
+		}
+	}
+	if gets != 2 {
+		t.Fatalf("APIService GET count = %d, want 2", gets)
+	}
+}
+
+func TestMetricsUnavailableDiagnosisDoesNotMemoizeTransientAPIServiceLookupError(t *testing.T) {
+	resetMetricsAPIServiceDiagnosisMemoForTest(t)
+	defer k8s.ResetTestDynamicState()
+
+	gvr := schema.GroupVersionResource{Group: metricsAPIServiceGroup, Version: "v1", Resource: "apiservices"}
+	apiService := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiregistration.k8s.io/v1",
+		"kind":       metricsAPIServiceKind,
+		"metadata": map[string]any{
+			"name": "v1beta1.metrics.k8s.io",
+		},
+		"status": map[string]any{
+			"conditions": []any{
+				map[string]any{
+					"type":   "Available",
+					"status": "False",
+					"reason": "FailedDiscoveryCheck",
+				},
+			},
+		},
+	}}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{gvr: "APIServiceList"},
+		apiService,
+	)
+	gets := 0
+	dyn.Fake.PrependReactor("get", "apiservices", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		gets++
+		if gets == 1 {
+			return true, nil, fmt.Errorf("temporary apiservice lookup failure")
+		}
+		return false, nil, nil
+	})
+	if err := k8s.InitTestDynamicResourceCache(dyn, []k8s.APIResource{{
+		Group:      metricsAPIServiceGroup,
+		Version:    "v1",
+		Kind:       metricsAPIServiceKind,
+		Name:       "apiservices",
+		Namespaced: false,
+	}}); err != nil {
+		t.Fatalf("InitTestDynamicResourceCache: %v", err)
+	}
+
+	if got := metricsUnavailableDiagnosis(context.Background(), true); got != "" {
+		t.Fatalf("first metricsUnavailableDiagnosis() = %q, want empty transient diagnosis", got)
+	}
+	if got := metricsUnavailableDiagnosis(context.Background(), true); got == "" {
+		t.Fatalf("second metricsUnavailableDiagnosis() returned empty diagnosis after transient error")
+	}
+	if gets != 3 {
+		t.Fatalf("APIService GET count = %d, want 3", gets)
+	}
+}
+
+func TestMetricsAPIServiceDiagnosisCacheDoesNotOverwriteDifferentContext(t *testing.T) {
+	cache := metricsAPIServiceDiagnosisCache{ttl: time.Minute}
+	key := metricsAPIServiceDiagnosisKey{includeConditionMessage: true, metricsVersion: "v1"}
+	startedA := make(chan struct{})
+	releaseA := make(chan struct{})
+	resultA := make(chan string, 1)
+
+	go func() {
+		resultA <- cache.get("ctx-a", key, func() (string, bool) {
+			close(startedA)
+			<-releaseA
+			return "ctx-a diagnosis", true
+		})
+	}()
+
+	<-startedA
+	if got := cache.get("ctx-b", key, func() (string, bool) {
+		return "ctx-b diagnosis", true
+	}); got != "ctx-b diagnosis" {
+		t.Fatalf("ctx-b diagnosis = %q, want ctx-b diagnosis", got)
+	}
+
+	close(releaseA)
+	if got := <-resultA; got != "ctx-a diagnosis" {
+		t.Fatalf("ctx-a diagnosis = %q, want ctx-a diagnosis", got)
+	}
+
+	if got := cache.get("ctx-b", key, func() (string, bool) {
+		t.Fatal("ctx-b cache entry was overwritten by ctx-a")
+		return "", false
+	}); got != "ctx-b diagnosis" {
+		t.Fatalf("cached ctx-b diagnosis = %q, want ctx-b diagnosis", got)
+	}
+}
+
+func TestMetricsUnavailableDiagnosisMemoizesByConditionDetailFlag(t *testing.T) {
+	resetMetricsAPIServiceDiagnosisMemoForTest(t)
+	defer k8s.ResetTestDynamicState()
+
+	gvr := schema.GroupVersionResource{Group: metricsAPIServiceGroup, Version: "v1", Resource: "apiservices"}
+	apiService := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apiregistration.k8s.io/v1",
+		"kind":       metricsAPIServiceKind,
+		"metadata": map[string]any{
+			"name": "v1beta1.metrics.k8s.io",
+		},
+		"status": map[string]any{
+			"conditions": []any{
+				map[string]any{
+					"type":    "Available",
+					"status":  "False",
+					"reason":  "FailedDiscoveryCheck",
+					"message": "failing or missing response from https://10.96.142.7:443/apis/metrics.k8s.io/v1beta1",
+				},
+			},
+		},
+	}}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{gvr: "APIServiceList"},
+		apiService,
+	)
+	gets := 0
+	dyn.Fake.PrependReactor("get", "apiservices", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		gets++
+		return false, nil, nil
+	})
+	if err := k8s.InitTestDynamicResourceCache(dyn, []k8s.APIResource{{
+		Group:      metricsAPIServiceGroup,
+		Version:    "v1",
+		Kind:       metricsAPIServiceKind,
+		Name:       "apiservices",
+		Namespaced: false,
+	}}); err != nil {
+		t.Fatalf("InitTestDynamicResourceCache: %v", err)
+	}
+
+	detailed := metricsUnavailableDiagnosis(context.Background(), true)
+	if !strings.Contains(detailed, "10.96.142.7") {
+		t.Fatalf("detailed diagnosis = %q, want condition message", detailed)
+	}
+	redacted := metricsUnavailableDiagnosis(context.Background(), false)
+	if strings.Contains(redacted, "10.96.142.7") {
+		t.Fatalf("redacted diagnosis leaked condition message: %q", redacted)
+	}
+
+	_ = metricsUnavailableDiagnosis(context.Background(), true)
+	_ = metricsUnavailableDiagnosis(context.Background(), false)
+	if gets != 4 {
+		t.Fatalf("APIService GET count = %d, want 4 for two memo detail slots", gets)
+	}
+}
+
+func resetMetricsAPIServiceDiagnosisMemoForTest(t *testing.T) {
+	t.Helper()
+	metricsAPIServiceDiagnosisMemo.mu.Lock()
+	metricsAPIServiceDiagnosisMemo.entries = nil
+	metricsAPIServiceDiagnosisMemo.mu.Unlock()
+	t.Cleanup(func() {
+		metricsAPIServiceDiagnosisMemo.mu.Lock()
+		metricsAPIServiceDiagnosisMemo.entries = nil
+		metricsAPIServiceDiagnosisMemo.mu.Unlock()
+	})
 }
 
 // --- Settings & Config endpoints ---
@@ -857,20 +1825,20 @@ func TestSmokeCloudMode_PprofNotMounted(t *testing.T) {
 				t.Fatalf("GET %s: %v", p, err)
 			}
 			defer resp.Body.Close()
-			// Under cloud-mode the route is not mounted. The SPA fallback
+			// Under cloud-mode the route is not mounted. The index.html fallback
 			// serves index.html (200) for unknown paths — what matters is
 			// that it's NOT serving the pprof handler's dump output. A
-			// 200 with the SPA HTML (not pprof data) is the pass
+			// 200 with the frontend HTML (not pprof data) is the pass
 			// condition here.
 			if resp.StatusCode == 200 {
-				// Sanity: the response should be HTML (SPA fallback), not
+				// Sanity: the response should be HTML (index.html fallback), not
 				// a pprof dump.
 				ct := resp.Header.Get("Content-Type")
 				if !bytes.HasPrefix([]byte(ct), []byte("text/html")) {
 					t.Errorf("%s returned 200 with Content-Type %q — pprof may still be mounted", p, ct)
 				}
 			}
-			// 404 is also acceptable (no SPA handler in some test configs).
+			// 404 is also acceptable (no frontend handler in some test configs).
 		})
 	}
 }
@@ -886,7 +1854,7 @@ func TestSmokeGetConfig(t *testing.T) {
 func TestSmokePutConfig(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
-	resp := put(t, "/api/config", `{"kubeconfig":"/tmp/test-kube","port":9999,"namespace":"staging"}`)
+	resp := put(t, "/api/config", `{"kubeconfig":"/tmp/test-kube","kubeconfigDirs":["/tmp/kubeconfigs-a","/tmp/kubeconfigs-b"],"port":9999,"namespace":"staging","browser":"Safari"}`)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -898,8 +1866,14 @@ func TestSmokePutConfig(t *testing.T) {
 	if saved["kubeconfig"] != "/tmp/test-kube" {
 		t.Errorf("kubeconfig = %v, want /tmp/test-kube", saved["kubeconfig"])
 	}
+	if dirs, ok := saved["kubeconfigDirs"].([]any); !ok || len(dirs) != 2 || dirs[0] != "/tmp/kubeconfigs-a" || dirs[1] != "/tmp/kubeconfigs-b" {
+		t.Errorf("kubeconfigDirs = %v", saved["kubeconfigDirs"])
+	}
 	if saved["port"] != float64(9999) {
 		t.Errorf("port = %v, want 9999", saved["port"])
+	}
+	if saved["browser"] != "Safari" {
+		t.Errorf("browser = %v, want Safari", saved["browser"])
 	}
 
 	// Verify persisted via GET
@@ -908,6 +1882,12 @@ func TestSmokePutConfig(t *testing.T) {
 	file, _ := got["file"].(map[string]any)
 	if file["kubeconfig"] != "/tmp/test-kube" {
 		t.Errorf("persisted kubeconfig = %v", file["kubeconfig"])
+	}
+	if dirs, ok := file["kubeconfigDirs"].([]any); !ok || len(dirs) != 2 || dirs[0] != "/tmp/kubeconfigs-a" || dirs[1] != "/tmp/kubeconfigs-b" {
+		t.Errorf("persisted kubeconfigDirs = %v", file["kubeconfigDirs"])
+	}
+	if file["browser"] != "Safari" {
+		t.Errorf("persisted browser = %v", file["browser"])
 	}
 }
 
@@ -961,7 +1941,9 @@ func TestSmokeCapabilitiesShape(t *testing.T) {
 	}
 
 	var body struct {
-		Resources map[string]bool `json:"resources"`
+		Resources      map[string]bool `json:"resources"`
+		WorkloadWrites map[string]bool `json:"workloadWrites"`
+		Features       map[string]bool `json:"features"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -987,12 +1969,33 @@ func TestSmokeCapabilitiesShape(t *testing.T) {
 				tag, field.Name)
 		}
 	}
+
+	if body.WorkloadWrites == nil {
+		t.Fatal("capabilities response missing 'workloadWrites' field")
+	}
+	workloadWritesType := reflect.TypeOf(k8s.WorkloadWritePermissions{})
+	for i := 0; i < workloadWritesType.NumField(); i++ {
+		field := workloadWritesType.Field(i)
+		tag := field.Tag.Get("json")
+		if tag == "" {
+			t.Errorf("WorkloadWritePermissions.%s has no json tag", field.Name)
+			continue
+		}
+		if _, ok := body.WorkloadWrites[tag]; !ok {
+			t.Errorf("capabilities.workloadWrites missing key %q for WorkloadWritePermissions.%s", tag, field.Name)
+		}
+	}
+
+	if !body.Features["yamlReview"] || !body.Features["yamlSchemas"] || !body.Features["workloadImages"] {
+		t.Fatalf("capabilities.features = %v, want YAML review, schemas, and workload images enabled", body.Features)
+	}
 }
 
 // --- requireConnected guard (table-driven) ---
 
 func TestSmokeRequireConnected(t *testing.T) {
 	endpoints := []string{
+		"/api/api-resources",
 		"/api/topology",
 		"/api/namespaces",
 		"/api/resources/pods",
@@ -1017,5 +2020,32 @@ func TestSmokeRequireConnected(t *testing.T) {
 				t.Errorf("expected 503 when disconnected, got %d", resp.StatusCode)
 			}
 		})
+	}
+}
+
+func TestSmokeChangesExactGroup(t *testing.T) {
+	now := time.Now()
+	events := []timeline.TimelineEvent{}
+	for i, version := range []string{"batch/v1", "batch.volcano.sh/v1alpha1", ""} {
+		events = append(events, timeline.TimelineEvent{ID: fmt.Sprintf("smoke-group-%d", i), Timestamp: now.Add(time.Duration(i) * time.Second), Source: timeline.SourceInformer, Kind: "Job", APIVersion: version, Namespace: "default", Name: "smoke-group-job", EventType: timeline.EventTypeUpdate, ClusterContext: k8s.ActiveClusterContext()})
+	}
+	if err := timeline.RecordEvents(context.Background(), events); err != nil {
+		t.Fatal(err)
+	}
+	versions := func(group string) map[string]bool {
+		var body []timeline.TimelineEvent
+		assertOK(t, get(t, "/api/changes?namespace=default&kind=Job&name=smoke-group-job&group="+group+"&include_managed=true&filter=all"), &body)
+		got := map[string]bool{}
+		for _, event := range body {
+			got[event.APIVersion] = true
+		}
+		return got
+	}
+	// A versionless Job row can only come from the typed batch informer.
+	if got := versions("batch"); len(got) != 2 || !got["batch/v1"] || !got[""] {
+		t.Fatalf("built-in Job history = %v, want batch/v1 and versionless rows", got)
+	}
+	if got := versions("batch.volcano.sh"); len(got) != 1 || !got["batch.volcano.sh/v1alpha1"] {
+		t.Fatalf("Volcano Job history = %v, want only its own versioned rows", got)
 	}
 }

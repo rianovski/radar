@@ -1,5 +1,6 @@
 import { describe, test, expect, afterEach } from 'vitest'
-import { kindToPlural, pluralToKind, refToSelectedResource, initNavigationMap, resetNavigationMap } from './navigation'
+import { englishPlural } from './pluralize'
+import { kindToPlural, kindToPluralWithGroup, pluralToKind, knownKindForPluralWithGroup, refToSelectedResource, initNavigationMap, resetNavigationMap, laneId, laneResourceKey, groupQualifiesLaneId, parseLaneId } from './navigation'
 
 afterEach(() => {
   resetNavigationMap()
@@ -23,6 +24,23 @@ describe('kindToPlural', () => {
 
   test('handles kinds ending in consonant+y (changes to -ies)', () => {
     expect(kindToPlural('NetworkPolicy')).toBe('networkpolicies')
+    expect(kindToPlural('CalicoNetworkPolicy')).toBe('networkpolicies')
+    expect(kindToPlural('CalicoGlobalNetworkPolicy')).toBe('globalnetworkpolicies')
+    expect(kindToPlural('CalicoStagedNetworkPolicy')).toBe('stagednetworkpolicies')
+    expect(kindToPlural('CalicoStagedGlobalNetworkPolicy')).toBe('stagedglobalnetworkpolicies')
+    expect(kindToPlural('CalicoStagedKubernetesNetworkPolicy')).toBe('stagedkubernetesnetworkpolicies')
+  })
+
+  test('handles already-plural kind names (Endpoints)', () => {
+    // The Kind "Endpoints" IS its resource name; englishPlural would wrongly
+    // yield "endpointses" (ends in s → +es) without the builtin map entry.
+    expect(kindToPlural('Endpoints')).toBe('endpoints')
+    expect(pluralToKind('endpoints')).toBe('Endpoints')
+  })
+
+  test('handles EndpointSlice before discovery loads', () => {
+    expect(kindToPlural('EndpointSlice')).toBe('endpointslices')
+    expect(pluralToKind('endpointslices')).toBe('EndpointSlice')
   })
 
   test('handles kinds ending in ss (Class-suffix)', () => {
@@ -52,6 +70,66 @@ describe('kindToPlural', () => {
     expect(kindToPlural('HorizontalPodAutoscaler')).toBe('horizontalpodautoscalers')
     expect(kindToPlural('pvc')).toBe('persistentvolumeclaims')
     expect(kindToPlural('PodGroup')).toBe('pods')
+  })
+
+  // A cold direct-URL load runs kindToPlural against the URL's plural slug one
+  // round-trip BEFORE initNavigationMap lands, so the discovered-plural guard
+  // can't fire for a CRD absent from BUILTIN_PLURAL_TO_KIND.
+  describe('CRD plurals before the discovery map arrives', () => {
+    test('idempotent on unknown lowercase plurals', () => {
+      expect(kindToPlural('schedules')).toBe('schedules')
+      expect(kindToPlural('validatingpolicies')).toBe('validatingpolicies')
+      expect(kindToPlural('virtualservices')).toBe('virtualservices')
+      expect(kindToPlural('clusters')).toBe('clusters')
+      expect(kindToPlural('backups')).toBe('backups')
+    })
+
+    // Plurals of `*se` singulars — Flux's HelmRelease and coordination.k8s.io's
+    // Lease are both kinds Radar handles, and both reach this cold path.
+    test('idempotent on plurals of *se singulars', () => {
+      expect(kindToPlural('helmreleases')).toBe('helmreleases')
+      expect(kindToPlural('leases')).toBe('leases')
+      expect(kindToPlural('databases')).toBe('databases')
+    })
+
+    test('still pluralizes singular PascalCase CRD kinds', () => {
+      expect(kindToPlural('Schedule')).toBe('schedules')
+      expect(kindToPlural('ValidatingPolicy')).toBe('validatingpolicies')
+      expect(kindToPlural('VirtualService')).toBe('virtualservices')
+      expect(kindToPlural('Cluster')).toBe('clusters')
+    })
+
+    // Lowercase does NOT imply plural. WorkloadViewRoute passes the URL segment
+    // through verbatim, so /workload/deployment/ns/name yields "deployment";
+    // pkg/topology's normalizeKind likewise returns its input unchanged when a
+    // kind resolves through neither its static map nor discovery, so a
+    // ResourceRef can carry "certificaterequest". Both must still pluralize —
+    // including the singulars that already end in 's'.
+    test('still pluralizes lowercase singular kinds', () => {
+      expect(kindToPlural('deployment')).toBe('deployments')
+      expect(kindToPlural('pod')).toBe('pods')
+      expect(kindToPlural('cronjob')).toBe('cronjobs')
+      expect(kindToPlural('certificaterequest')).toBe('certificaterequests')
+      expect(kindToPlural('validatingpolicy')).toBe('validatingpolicies')
+      expect(kindToPlural('ingress')).toBe('ingresses')
+      expect(kindToPlural('nodeclass')).toBe('nodeclasses')
+      expect(kindToPlural('ec2nodeclass')).toBe('ec2nodeclasses')
+      expect(kindToPlural('storageclass')).toBe('storageclasses')
+    })
+
+    test('leaves the empty-string result unchanged', () => {
+      expect(kindToPlural('')).toBe(englishPlural(''))
+    })
+
+    test('agrees with the post-discovery answer', () => {
+      const inputs = ['schedules', 'validatingpolicies', 'Schedule', 'ValidatingPolicy']
+      const cold = inputs.map(kindToPlural)
+      initNavigationMap([
+        { group: 'velero.io', version: 'v1', kind: 'Schedule', name: 'schedules', namespaced: true, isCrd: true, verbs: [] },
+        { group: 'kyverno.io', version: 'v1alpha1', kind: 'ValidatingPolicy', name: 'validatingpolicies', namespaced: false, isCrd: true, verbs: [] },
+      ])
+      expect(inputs.map(kindToPlural)).toEqual(cold)
+    })
   })
 })
 
@@ -145,6 +223,43 @@ describe('initNavigationMap', () => {
       { group: 'metrics.k8s.io', version: 'v1beta1', kind: 'PodMetrics', name: 'pods', namespaced: true, isCrd: false, verbs: ['get'] },
     ])
     expect(pluralToKind('pods')).toBe('Pod')
+    expect(knownKindForPluralWithGroup('pods', '')).toBe('Pod')
+    expect(knownKindForPluralWithGroup('pods', 'metrics.k8s.io')).toBe('PodMetrics')
+    expect(kindToPluralWithGroup('PodMetrics', 'metrics.k8s.io')).toBe('pods')
+  })
+
+  test('resolves discovered plural collisions by API group', () => {
+    initNavigationMap([
+      { group: 'a.example.io', version: 'v1', kind: 'Widget', name: 'widgets', namespaced: true, isCrd: true, verbs: ['get'] },
+      { group: 'b.example.io', version: 'v1', kind: 'OtherWidget', name: 'widgets', namespaced: true, isCrd: true, verbs: ['get'] },
+    ])
+    expect(knownKindForPluralWithGroup('widgets', 'a.example.io')).toBe('Widget')
+    expect(knownKindForPluralWithGroup('widgets', 'b.example.io')).toBe('OtherWidget')
+    expect(knownKindForPluralWithGroup('OtherWidget', 'b.example.io')).toBe('OtherWidget')
+  })
+
+  test('does not invent a Kind for an undiscovered irregular CRD', () => {
+    expect(knownKindForPluralWithGroup('databases', 'postgresql.cnpg.io')).toBeUndefined()
+    expect(kindToPluralWithGroup('Database', 'postgresql.cnpg.io')).toBe('databases')
+    expect(kindToPluralWithGroup('databases', 'postgresql.cnpg.io')).toBe('databases')
+  })
+
+  test('keeps the virtual PodGroup alias distinct from scheduling PodGroup', () => {
+    initNavigationMap([
+      { group: 'scheduling.k8s.io', version: 'v1beta1', kind: 'PodGroup', name: 'podgroups', namespaced: true, isCrd: false, verbs: ['get', 'list'] },
+      { group: 'example.io', version: 'v1', kind: 'PodGroup', name: 'custompodgroups', namespaced: true, isCrd: true, verbs: ['get', 'list'] },
+    ])
+
+    expect(kindToPlural('PodGroup')).toBe('pods')
+    expect(kindToPluralWithGroup('PodGroup', 'scheduling.k8s.io')).toBe('podgroups')
+    expect(kindToPluralWithGroup('PodGroup', 'example.io')).toBe('custompodgroups')
+    expect(kindToPluralWithGroup('podgroups', 'scheduling.k8s.io')).toBe('podgroups')
+  })
+
+  test('preserves aliases and plural slugs before group discovery is initialized', () => {
+    expect(kindToPluralWithGroup('PodGroup', 'scheduling.k8s.io')).toBe('podgroups')
+    expect(kindToPluralWithGroup('CalicoGlobalNetworkPolicy', 'projectcalico.org')).toBe('globalnetworkpolicies')
+    expect(kindToPluralWithGroup('schedules', 'velero.io')).toBe('schedules')
   })
 })
 
@@ -163,6 +278,18 @@ describe('refToSelectedResource', () => {
     })
   })
 
+  test('uses the API group when a real resource collides with a virtual kind', () => {
+    initNavigationMap([
+      { group: 'scheduling.k8s.io', version: 'v1beta1', kind: 'PodGroup', name: 'podgroups', namespaced: true, isCrd: false, verbs: ['get', 'list'] },
+    ])
+    expect(refToSelectedResource({ kind: 'PodGroup', name: 'batch', namespace: 'default', group: 'scheduling.k8s.io' })).toEqual({
+      kind: 'podgroups',
+      name: 'batch',
+      namespace: 'default',
+      group: 'scheduling.k8s.io',
+    })
+  })
+
   test('preserves group field', () => {
     const result = refToSelectedResource({
       kind: 'Certificate',
@@ -176,5 +303,57 @@ describe('refToSelectedResource', () => {
       namespace: 'default',
       group: 'cert-manager.io',
     })
+  })
+
+  test('normalizes an omitted namespace for cluster-scoped references', () => {
+    expect(refToSelectedResource({ kind: 'NodePool', name: 'spot' })).toEqual({
+      kind: 'nodepools',
+      name: 'spot',
+      namespace: '',
+      group: undefined,
+    })
+  })
+})
+
+describe('lane identity helpers', () => {
+  test('groupQualifiesLaneId: only CRD groups qualify', () => {
+    expect(groupQualifiesLaneId('')).toBe(false)          // core
+    expect(groupQualifiesLaneId(undefined)).toBe(false)
+    expect(groupQualifiesLaneId('apps')).toBe(false)       // built-in
+    expect(groupQualifiesLaneId('batch')).toBe(false)
+    expect(groupQualifiesLaneId('networking.k8s.io')).toBe(false)
+    expect(groupQualifiesLaneId('resource.k8s.io')).toBe(false)
+    expect(groupQualifiesLaneId('postgresql.cnpg.io')).toBe(true)
+    expect(groupQualifiesLaneId('cluster.x-k8s.io')).toBe(true)
+  })
+
+  test('laneId: bare for core/built-in, qualified for CRD groups', () => {
+    expect(laneId('Pod', '', 'team-a', 'x')).toBe('Pod/team-a/x')
+    expect(laneId('Deployment', 'apps', 'ns', 'web')).toBe('Deployment/ns/web')
+    expect(laneId('ResourceClaim', 'resource.k8s.io', 'ml', 'gpu')).toBe('ResourceClaim/ml/gpu')
+    expect(laneId('Cluster', 'postgresql.cnpg.io', 'prod', 'main-db')).toBe('Cluster.postgresql.cnpg.io/prod/main-db')
+  })
+
+  test('laneResourceKey is always group-less', () => {
+    expect(laneResourceKey('Cluster', 'prod', 'main-db')).toBe('Cluster/prod/main-db')
+    expect(laneResourceKey('Pod', 'team-a', 'x')).toBe('Pod/team-a/x')
+  })
+
+  test('parseLaneId round-trips both bare and qualified ids', () => {
+    expect(parseLaneId('Pod/team-a/x')).toEqual({ kind: 'Pod', group: '', namespace: 'team-a', name: 'x' })
+    expect(parseLaneId('Cluster.postgresql.cnpg.io/prod/main-db')).toEqual({
+      kind: 'Cluster', group: 'postgresql.cnpg.io', namespace: 'prod', name: 'main-db',
+    })
+    expect(parseLaneId('bogus')).toBeNull()
+  })
+})
+
+describe('pluralToKind on absent input', () => {
+  // A saved investigation can carry an empty kind. This runs over every row of
+  // the run list, so throwing here took the whole investigations panel down and
+  // made every other run unopenable — one bad row, no panel.
+  test('returns the empty string instead of throwing', () => {
+    expect(() => pluralToKind('')).not.toThrow()
+    expect(pluralToKind('')).toBe('')
   })
 })

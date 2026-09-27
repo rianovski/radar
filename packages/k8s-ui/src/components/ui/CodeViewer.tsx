@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Copy, Check, ChevronUp, ChevronDown, X, Search } from 'lucide-react'
 import { codeToHtml } from 'shiki'
+import { Input } from './Input'
 
 interface CodeViewerProps {
   code: string
@@ -300,6 +301,10 @@ export function CodeViewer({
   const handleSearchKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Escape') {
       e.preventDefault()
+      // A host that also listens for Escape to close something bigger around
+      // this viewer (a full-screen overlay, say) must not see this one — the
+      // user closing the search bar, not the whole surface it's embedded in.
+      e.stopPropagation()
       closeSearch()
     } else if (e.key === 'Enter') {
       e.preventDefault()
@@ -343,9 +348,8 @@ export function CodeViewer({
       {searchOpen && (
         <div className="absolute top-2 right-2 z-20 flex items-center gap-1 px-2 py-1.5 bg-theme-surface border border-theme-border rounded-lg shadow-lg backdrop-blur-sm">
           <Search className="w-3.5 h-3.5 text-theme-text-tertiary shrink-0" />
-          <input
+          <Input
             ref={searchInputRef}
-            type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={handleSearchKeyDown}
@@ -391,7 +395,7 @@ export function CodeViewer({
         style={{ maxHeight }}
       >
         {highlighting ? (
-          <div className="p-4 text-theme-text-tertiary text-sm font-mono">Loading...</div>
+          <div className="p-4 text-theme-text-tertiary text-sm font-mono">Loading…</div>
         ) : (
           <div
             ref={contentRef}

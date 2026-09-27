@@ -16,7 +16,10 @@ export function KustomizationRenderer({ data, onNavigate }: KustomizationRendere
   const inventoryEntries = status.inventory?.entries || []
 
   // Convert to unified GitOps status
-  const gitOpsStatus = fluxConditionsToGitOpsStatus(conditions, spec.suspend === true)
+  const gitOpsStatus = fluxConditionsToGitOpsStatus(conditions, spec.suspend === true, {
+    generation: data.metadata?.generation,
+    observedGeneration: status.observedGeneration,
+  })
 
   // Parse inventory to managed resources
   const managedResources = parseFluxInventory(inventoryEntries)

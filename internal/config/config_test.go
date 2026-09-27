@@ -4,9 +4,31 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestConfigDoesNotPersistTimelinePostgresDSN(t *testing.T) {
+	if _, ok := reflect.TypeOf(Config{}).FieldByName("TimelinePostgresDSN"); ok {
+		t.Fatal("Config must not expose a persisted TimelinePostgresDSN field")
+	}
+
+	const dsn = "postgres://radar:secret@example.test/radar"
+	var cfg Config
+	if err := json.Unmarshal([]byte(`{"timelinePostgresDSN":"`+dsn+`"}`), &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), dsn) {
+		t.Fatalf("serialized Config leaked PostgreSQL DSN: %s", data)
+	}
+}
 
 func TestLoadMissing(t *testing.T) {
 	// Override path to a non-existent file
@@ -22,6 +44,29 @@ func TestLoadMissing(t *testing.T) {
 	}
 }
 
+func TestCursorConsentRequiresCurrentDisclosureVersion(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+
+	const surface = "cursor-agent:full-local"
+	if got := AIConsentVersion(surface); got != "v2" {
+		t.Fatalf("AIConsentVersion(%q) = %q, want v2", surface, got)
+	}
+	if err := Save(Config{AIConsent: map[string]string{surface: "v1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if AIConsentGiven(surface) {
+		t.Fatal("the previous Cursor disclosure must require consent again")
+	}
+	if err := RecordAIConsent(surface); err != nil {
+		t.Fatal(err)
+	}
+	if !AIConsentGiven(surface) {
+		t.Fatal("the current Cursor disclosure should satisfy consent")
+	}
+}
+
 func TestSaveAndLoad(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
@@ -32,12 +77,24 @@ func TestSaveAndLoad(t *testing.T) {
 		Kubeconfig:      "/tmp/kubeconfig",
 		KubeconfigDirs:  []string{"/dir1", "/dir2"},
 		Namespace:       "prod",
+		Namespaces:      []string{"dev", "staging"},
 		Port:            9999,
 		NoBrowser:       true,
+		Browser:         "firefox",
 		TimelineStorage: "sqlite",
 		HistoryLimit:    5000,
 		PrometheusURL:   "http://prom:9090",
-		MCP:             &mcp,
+		PrometheusHeaders: map[string]string{
+			"Authorization": "Bearer abc",
+			"X-Scope-OrgID": "tenant-1",
+		},
+		PrometheusHeadersFromEnv: map[string]string{
+			"X-Api-Key": "PROMETHEUS_API_KEY",
+		},
+		MCP:               &mcp,
+		ArgoCDURL:         "https://argocd.example.com",
+		ArgoCDToken:       "argo-secret-token",
+		ArgoCDInsecureTLS: true,
 	}
 
 	if err := Save(want); err != nil {
@@ -63,8 +120,14 @@ func TestSaveAndLoad(t *testing.T) {
 	if got.Namespace != want.Namespace {
 		t.Errorf("Namespace = %q, want %q", got.Namespace, want.Namespace)
 	}
+	if len(got.Namespaces) != 2 || got.Namespaces[0] != "dev" || got.Namespaces[1] != "staging" {
+		t.Errorf("Namespaces = %v, want %v", got.Namespaces, want.Namespaces)
+	}
 	if got.NoBrowser != want.NoBrowser {
 		t.Errorf("NoBrowser = %v, want %v", got.NoBrowser, want.NoBrowser)
+	}
+	if got.Browser != want.Browser {
+		t.Errorf("Browser = %q, want %q", got.Browser, want.Browser)
 	}
 	if got.TimelineStorage != want.TimelineStorage {
 		t.Errorf("TimelineStorage = %q, want %q", got.TimelineStorage, want.TimelineStorage)
@@ -74,6 +137,102 @@ func TestSaveAndLoad(t *testing.T) {
 	}
 	if got.MCP == nil || *got.MCP != true {
 		t.Errorf("MCP = %v, want true", got.MCP)
+	}
+	if len(got.PrometheusHeaders) != 2 ||
+		got.PrometheusHeaders["Authorization"] != "Bearer abc" ||
+		got.PrometheusHeaders["X-Scope-OrgID"] != "tenant-1" {
+		t.Errorf("PrometheusHeaders = %v, want %v", got.PrometheusHeaders, want.PrometheusHeaders)
+	}
+	if len(got.PrometheusHeadersFromEnv) != 1 ||
+		got.PrometheusHeadersFromEnv["X-Api-Key"] != "PROMETHEUS_API_KEY" {
+		t.Errorf("PrometheusHeadersFromEnv = %v, want %v", got.PrometheusHeadersFromEnv, want.PrometheusHeadersFromEnv)
+	}
+	if got.ArgoCDURL != want.ArgoCDURL {
+		t.Errorf("ArgoCDURL = %q, want %q", got.ArgoCDURL, want.ArgoCDURL)
+	}
+	if got.ArgoCDToken != want.ArgoCDToken {
+		t.Errorf("ArgoCDToken = %q, want %q", got.ArgoCDToken, want.ArgoCDToken)
+	}
+	if !got.ArgoCDInsecureTLS {
+		t.Error("ArgoCDInsecureTLS = false, want true")
+	}
+}
+
+func TestLoadNormalizesOpenCostCurrency(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+
+	if err := Save(Config{OpenCostCurrency: " eur "}); err != nil {
+		t.Fatal(err)
+	}
+	if got := Load().OpenCostCurrency; got != "EUR" {
+		t.Fatalf("OpenCostCurrency = %q, want EUR", got)
+	}
+}
+
+func TestLoadIgnoresInvalidOpenCostCurrencyAndUpdateRepairsIt(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+
+	if err := Save(Config{OpenCostCurrency: "EURO"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := Load().OpenCostCurrency; got != "" {
+		t.Fatalf("OpenCostCurrency = %q, want auto", got)
+	}
+	if _, err := Update(func(c *Config) { c.Port = 8080 }); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, ".radar", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted Config
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.OpenCostCurrency != "" {
+		t.Fatalf("persisted OpenCostCurrency = %q, want auto", persisted.OpenCostCurrency)
+	}
+}
+
+func TestSaveFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes are not meaningful on Windows")
+	}
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+
+	path := filepath.Join(dir, ".radar", "config.json")
+
+	if err := Save(Config{ArgoCDToken: "secret"}); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("config file mode = %o, want 0600", info.Mode().Perm())
+	}
+
+	// A pre-existing world-readable file must tighten on next save.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(Config{ArgoCDToken: "secret2"}); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	info, err = os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("config file mode after re-save = %o, want 0600", info.Mode().Perm())
 	}
 }
 
@@ -164,6 +323,37 @@ func TestHelpers(t *testing.T) {
 		}
 	})
 
+	t.Run("TimelineMaxSizeOr", func(t *testing.T) {
+		if (Config{}).TimelineMaxSizeOr("123") != "123" {
+			t.Error("empty TimelineMaxSize should return default")
+		}
+		if got := (Config{TimelineMaxSize: "800Mi"}).TimelineMaxSizeOr("0"); got != "800Mi" {
+			t.Errorf("TimelineMaxSizeOr(800Mi) = %q", got)
+		}
+		if got := (Config{TimelineMaxSize: "bad"}).TimelineMaxSizeOr("123"); got != "bad" {
+			t.Errorf("TimelineMaxSizeOr(bad) = %q, want bad", got)
+		}
+	})
+
+	t.Run("ParseByteSize", func(t *testing.T) {
+		cases := map[string]int64{
+			"42":    42,
+			"1Ki":   1024,
+			"1.5Mi": int64(1.5 * float64(1<<20)),
+			"2Gi":   2 << 30,
+			"3GB":   3_000_000_000,
+		}
+		for in, want := range cases {
+			got, err := ParseByteSize(in)
+			if err != nil {
+				t.Fatalf("ParseByteSize(%q): %v", in, err)
+			}
+			if got != want {
+				t.Errorf("ParseByteSize(%q) = %d, want %d", in, got, want)
+			}
+		}
+	})
+
 	t.Run("KubeconfigDirsFlag", func(t *testing.T) {
 		if (Config{}).KubeconfigDirsFlag() != "" {
 			t.Error("nil dirs should return empty string")
@@ -171,6 +361,16 @@ func TestHelpers(t *testing.T) {
 		c := Config{KubeconfigDirs: []string{"/a", "/b"}}
 		if c.KubeconfigDirsFlag() != "/a,/b" {
 			t.Errorf("got %q, want %q", c.KubeconfigDirsFlag(), "/a,/b")
+		}
+	})
+
+	t.Run("NamespacesFlag", func(t *testing.T) {
+		if (Config{}).NamespacesFlag() != "" {
+			t.Error("nil namespaces should return empty string")
+		}
+		c := Config{Namespaces: []string{"dev", "prod"}}
+		if c.NamespacesFlag() != "dev,prod" {
+			t.Errorf("got %q, want %q", c.NamespacesFlag(), "dev,prod")
 		}
 	})
 }

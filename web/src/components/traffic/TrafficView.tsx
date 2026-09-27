@@ -1,5 +1,4 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
-import { useRefreshAnimation } from '../../hooks/useRefreshAnimation'
 import { useTrafficSources, useTrafficFlows, useTrafficConnect, useSetTrafficSource } from '../../api/traffic'
 import { useClusterInfo } from '../../api/client'
 import type { TrafficWizardState, AggregatedFlow } from '../../types'
@@ -7,11 +6,14 @@ import { TrafficWizard } from './TrafficWizard'
 import { TrafficGraph, type TrafficGraphSelection } from './TrafficGraph'
 import { TrafficFilterSidebar } from './TrafficFilterSidebar'
 import { TrafficFlowListProvider } from './TrafficFlowListContext'
-import { Loader2, RefreshCw, Filter, Plug, ChevronDown, List, Activity, AlertTriangle } from 'lucide-react'
+import { Loader2, Filter, Plug, ChevronDown, List, Activity, AlertTriangle } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useQueryClient } from '@tanstack/react-query'
 import { useDock } from '../dock'
-import { EmptyState, PaneLoader } from '@skyhook-io/k8s-ui'
+import { AlertBanner, EmptyState, PaneLoader, FreshnessControl } from '@skyhook-io/k8s-ui'
+import { useConnection } from '../../context/ConnectionContext'
+import { Tooltip } from '../ui/Tooltip'
+import { matchesStatusRanges, bucketsFromCounts, bucketsFromStatus, isRateBasedSource, keepAvailable, effectiveThreshold, volumeUnit, type VolumeUnit, isExternalKind } from './trafficFilters'
 
 // Addon types for filtering
 export type AddonMode = 'show' | 'group' | 'hide'
@@ -269,8 +271,12 @@ function isSystemEndpoint(name: string, namespace: string | undefined, kind: str
     return true
   }
 
-  // Cilium reserved identities (show up as External kind with reserved names)
-  if (kind === 'External' && CILIUM_RESERVED_IDENTITIES.has(name)) {
+  // Cilium reserved identities: nodes and the host network arrive as Host;
+  // health, init and unmanaged endpoints carry no usable identity.
+  if (kind === 'Host') {
+    return true
+  }
+  if ((kind === 'External' || kind === 'Unknown') && CILIUM_RESERVED_IDENTITIES.has(name)) {
     return true
   }
 
@@ -328,21 +334,23 @@ function isSystemEndpoint(name: string, namespace: string | undefined, kind: str
   return false
 }
 
-// Helper to check if endpoint is external (case-insensitive)
-function isExternal(kind: string): boolean {
-  return kind.toLowerCase() === 'external'
-}
+const isExternal = isExternalKind
 
 interface TrafficViewProps {
   namespaces: string[]
 }
 
 export function TrafficView({ namespaces }: TrafficViewProps) {
+  const { connection } = useConnection()
   const [wizardState, setWizardState] = useState<TrafficWizardState>('detecting')
   const [timeRange, setTimeRange] = useState<string>('5m')
   const [hideSystem, setHideSystem] = useState(true)
   const [hideExternal, setHideExternal] = useState(false)
   const [minConnections, setMinConnections] = useState(0)
+  // The unit the threshold above was picked under. Stored because the number alone
+  // is ambiguous: 100 is a valid step in both scales and means something different
+  // in each.
+  const [minConnectionsUnit, setMinConnectionsUnit] = useState<VolumeUnit>('connections')
   const [showNamespaceGroups, setShowNamespaceGroups] = useState(true)
   const [aggregateExternal, setAggregateExternal] = useState(true)
   const [detectServices, setDetectServices] = useState(true)
@@ -420,8 +428,8 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
 
   const {
     data: flowsData,
-    isLoading: flowsLoading,
     isFetching: flowsFetching,
+    dataUpdatedAt: flowsUpdatedAt,
     refetch: refetchFlowsRaw,
   } = useTrafficFlows({
     namespaces,
@@ -429,18 +437,81 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
     // Only fetch flows when connected (not connecting and no connection error)
     enabled: wizardState === 'ready' && !isConnecting && !connectionError,
   })
-  const [refetchFlows, isRefreshAnimating] = useRefreshAnimation(refetchFlowsRaw)
+
+  // A 'partial' warning is the source telling us this is as complete as it gets —
+  // an attribute it does not export, traffic it cannot orient. Retrying returns
+  // the same answer, so retrying forever is all cost and no progress.
+  const warningIsPermanent = flowsData?.warningKind === 'partial'
 
   // Auto-retry when flows return with warning but no data (e.g., port-forward not ready yet)
   useEffect(() => {
-    if (flowsData?.warning && (!flowsData.aggregated || flowsData.aggregated.length === 0) && !flowsFetching) {
+    if (
+      flowsData?.warning &&
+      !warningIsPermanent &&
+      (!flowsData.aggregated || flowsData.aggregated.length === 0) &&
+      !flowsFetching
+    ) {
       const timer = setTimeout(() => refetchFlowsRaw(), 2000)
       return () => clearTimeout(timer)
     }
-  }, [flowsData, flowsFetching, refetchFlowsRaw])
+  }, [flowsData, warningIsPermanent, flowsFetching, refetchFlowsRaw])
 
   // Filter flows based on user preferences
   // Note: namespace filtering is done server-side via the global namespace selector
+  // Show L7 filters only when flows actually contain L7 data
+  const hasL7Data = useMemo(() => {
+    if (!flowsData?.aggregated) return false
+    return flowsData.aggregated.some(f => f.l7Protocol || f.topHTTPPaths || f.topDNSQueries)
+  }, [flowsData?.aggregated])
+
+  const isRateBased = isRateBasedSource(sourcesData?.active)
+
+  // Which L7 filters can return something, so the sidebar never offers a control
+  // that matches nothing. Sources differ in what they can report: a rate-based one
+  // measures a 5xx rate but no status distribution, and has no DNS query names at
+  // all, so offering 2xx or a DNS box would be a dead end.
+  const l7Capabilities = useMemo(() => {
+    const statuses = new Set<string>()
+    const verdicts = new Set<string>()
+    let hasDNSQueries = false
+    const methods = new Set<string>()
+    for (const f of flowsData?.aggregated ?? []) {
+      for (const [bucket, count] of Object.entries(f.httpStatusCounts ?? {})) {
+        if (count > 0) statuses.add(bucket)
+      }
+      // An error rate is a 5xx signal even where no status distribution exists.
+      if ((f.errorCount ?? 0) > 0) statuses.add('5xx')
+      for (const [verdict, count] of Object.entries(f.verdictCounts ?? {})) {
+        if (count > 0) verdicts.add(verdict)
+      }
+      if (f.topDNSQueries?.length) hasDNSQueries = true
+      for (const path of f.topHTTPPaths ?? []) {
+        if (path.method) methods.add(path.method)
+      }
+    }
+    return {
+      availableStatusRanges: ['2xx', '3xx', '4xx', '5xx'].filter(b => statuses.has(b)),
+      availableVerdicts: ['forwarded', 'dropped', 'error'].filter(v => verdicts.has(v)),
+      hasDNSQueries,
+      availableHTTPMethods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].filter(m => methods.has(m)),
+    }
+  }, [flowsData?.aggregated])
+
+  // The controls are built from what the data contains, so a selection can outlive
+  // its button. These are what actually filter: a choice with no control left to
+  // clear it must not keep hiding traffic.
+  const activeStatusRanges = useMemo(
+    () => keepAvailable(l7StatusRanges, l7Capabilities.availableStatusRanges),
+    [l7StatusRanges, l7Capabilities.availableStatusRanges])
+  const activeMethods = useMemo(
+    () => keepAvailable(l7Methods, l7Capabilities.availableHTTPMethods),
+    [l7Methods, l7Capabilities.availableHTTPMethods])
+  const activeVerdicts = useMemo(
+    () => keepAvailable(l7Verdicts, l7Capabilities.availableVerdicts),
+    [l7Verdicts, l7Capabilities.availableVerdicts])
+  const activeDnsPattern = l7Capabilities.hasDNSQueries ? dnsPattern : ''
+  const activeMinConnections = effectiveThreshold(minConnections, minConnectionsUnit, volumeUnit(isRateBased))
+
   const filteredFlows = useMemo<AggregatedFlow[]>(() => {
     if (!flowsData?.aggregated) return []
 
@@ -487,7 +558,7 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
       }
 
       // Connection threshold filter
-      if (flow.connections < minConnections) {
+      if (flow.connections < activeMinConnections) {
         return false
       }
 
@@ -505,23 +576,21 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
       if (l7Protocol === 'TCP' && flow.l7Protocol) return false // TCP = no L7
 
       // L7 sub-filters (only apply when active)
-      if (l7Methods.size > 0) {
-        if (!flow.topHTTPPaths?.some(p => l7Methods.has(p.method))) return false
+      if (activeMethods.size > 0) {
+        if (!flow.topHTTPPaths?.some(p => activeMethods.has(p.method))) return false
       }
-      if (l7StatusRanges.size > 0) {
-        if (!flow.httpStatusCounts || !Array.from(l7StatusRanges).some(r => (flow.httpStatusCounts?.[r] ?? 0) > 0)) return false
+      if (!matchesStatusRanges(activeStatusRanges, bucketsFromCounts(flow.httpStatusCounts), (flow.errorCount ?? 0) > 0)) return false
+      if (activeVerdicts.size > 0) {
+        if (!flow.verdictCounts || !Array.from(activeVerdicts).some(v => (flow.verdictCounts?.[v] ?? 0) > 0)) return false
       }
-      if (l7Verdicts.size > 0) {
-        if (!flow.verdictCounts || !Array.from(l7Verdicts).some(v => (flow.verdictCounts?.[v] ?? 0) > 0)) return false
-      }
-      if (dnsPattern) {
-        const pattern = dnsPattern.toLowerCase()
+      if (activeDnsPattern) {
+        const pattern = activeDnsPattern.toLowerCase()
         if (!flow.topDNSQueries?.some(q => q.query.toLowerCase().includes(pattern))) return false
       }
 
       return true
     })
-  }, [flowsData?.aggregated, hideSystem, hideExternal, minConnections, hiddenNamespaces, addonMode, l7Protocol, l7Methods, l7StatusRanges, l7Verdicts, dnsPattern])
+  }, [flowsData?.aggregated, hideSystem, hideExternal, activeMinConnections, hiddenNamespaces, addonMode, l7Protocol, activeMethods, activeStatusRanges, activeVerdicts, activeDnsPattern])
 
   // Filter raw flows with the same base filters (for list view)
   const filteredRawFlows = useMemo(() => {
@@ -554,24 +623,20 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
       if (l7Protocol === 'TCP' && flow.l7Protocol) return false
 
       // L7 sub-filters on individual flow fields
-      if (l7Methods.size > 0) {
-        if (!flow.httpMethod || !l7Methods.has(flow.httpMethod)) return false
+      if (activeMethods.size > 0) {
+        if (!flow.httpMethod || !activeMethods.has(flow.httpMethod)) return false
       }
-      if (l7StatusRanges.size > 0) {
-        if (!flow.httpStatus) return false
-        const bucket = `${Math.floor(flow.httpStatus / 100)}xx`
-        if (!l7StatusRanges.has(bucket)) return false
+      if (!matchesStatusRanges(activeStatusRanges, bucketsFromStatus(flow.httpStatus), (flow.errorRate ?? 0) > 0)) return false
+      if (activeVerdicts.size > 0) {
+        if (!flow.verdict || !activeVerdicts.has(flow.verdict)) return false
       }
-      if (l7Verdicts.size > 0) {
-        if (!flow.verdict || !l7Verdicts.has(flow.verdict)) return false
-      }
-      if (dnsPattern) {
-        if (!flow.dnsQuery || !flow.dnsQuery.toLowerCase().includes(dnsPattern.toLowerCase())) return false
+      if (activeDnsPattern) {
+        if (!flow.dnsQuery || !flow.dnsQuery.toLowerCase().includes(activeDnsPattern.toLowerCase())) return false
       }
 
       return true
     })
-  }, [flowsData?.flows, hideSystem, hideExternal, hiddenNamespaces, addonMode, l7Protocol, l7Methods, l7StatusRanges, l7Verdicts, dnsPattern])
+  }, [flowsData?.flows, hideSystem, hideExternal, hiddenNamespaces, addonMode, l7Protocol, activeMethods, activeStatusRanges, activeVerdicts, activeDnsPattern])
 
   // Apply graph selection to filter raw flows for the list panel
   const listFlows = useMemo(() => {
@@ -611,21 +676,22 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
     }
   }, [flowsData?.flows, openFlowListDock])
 
-  // Show L7 filters only when flows actually contain L7 data
-  const hasL7Data = useMemo(() => {
-    if (!flowsData?.aggregated) return false
-    return flowsData.aggregated.some(f => f.l7Protocol || f.topHTTPPaths || f.topDNSQueries)
-  }, [flowsData?.aggregated])
+  // Records which quantity the chosen threshold refers to, so it can be discarded
+  // rather than reinterpreted if the active source starts measuring the other one.
+  const chooseMinConnections = useCallback((value: number) => {
+    setMinConnections(value)
+    setMinConnectionsUnit(volumeUnit(isRateBased))
+  }, [isRateBased])
 
   // Toggle L7 filter helpers
   const toggleL7Method = useCallback((method: string) => {
-    setL7Methods(prev => { const next = new Set(prev); next.has(method) ? next.delete(method) : next.add(method); return next })
+    setL7Methods(prev => { const next = new Set(prev); if (next.has(method)) next.delete(method); else next.add(method); return next })
   }, [])
   const toggleL7StatusRange = useCallback((range: string) => {
-    setL7StatusRanges(prev => { const next = new Set(prev); next.has(range) ? next.delete(range) : next.add(range); return next })
+    setL7StatusRanges(prev => { const next = new Set(prev); if (next.has(range)) next.delete(range); else next.add(range); return next })
   }, [])
   const toggleL7Verdict = useCallback((verdict: string) => {
-    setL7Verdicts(prev => { const next = new Set(prev); next.has(verdict) ? next.delete(verdict) : next.add(verdict); return next })
+    setL7Verdicts(prev => { const next = new Set(prev); if (next.has(verdict)) next.delete(verdict); else next.add(verdict); return next })
   }, [])
 
   // Toggle namespace visibility
@@ -691,8 +757,11 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
       const destKey = flow.destination.namespace
         ? `${flow.destination.namespace}/${destAgg.name}`
         : destAgg.name
-      // Group by service name, not by port (all MongoDB connections become one edge)
-      const key = `${sourceKey}->${destKey}`
+      // Group by service name, not by port (all MongoDB connections become one edge).
+      // Traffic whose direction is known is kept apart from traffic whose direction
+      // is not, the same way the backend aggregation keys it: merging them would
+      // give one edge a single arrowhead answer that is wrong for half its bytes.
+      const key = `${sourceKey}->${destKey}|${flow.directionUnknown ? 'u' : 'o'}`
 
       const existing = aggregatedMap.get(key)
       if (existing) {
@@ -707,6 +776,8 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
         if (flow.errorCount) {
           existing.errorCount = (existing.errorCount || 0) + flow.errorCount
         }
+        // Everything merged here shares the key's direction-known state, so the
+        // flag is already correct on the entry that was created first.
       } else {
         // Create new aggregated flow with modified names
         aggregatedMap.set(key, {
@@ -738,10 +809,13 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
 
       // Only collapse external → internal flows (inbound internet traffic)
       if (sourceIsExternal && destIsInternal) {
-        // Create a key based on destination + port
+        // Key on destination + port, and on whether the direction is known: this
+        // collapse merges genuinely different external clients, so one of them
+        // arriving unoriented must not take the arrowhead off another's traffic.
+        const orientation = flow.directionUnknown ? '|u' : '|o'
         const destKey = flow.destination.namespace
-          ? `${flow.destination.namespace}/${flow.destination.name}:${flow.port}`
-          : `${flow.destination.name}:${flow.port}`
+          ? `${flow.destination.namespace}/${flow.destination.name}:${flow.port}${orientation}`
+          : `${flow.destination.name}:${flow.port}${orientation}`
 
         const existing = internetFlowsMap.get(destKey)
         if (existing) {
@@ -906,7 +980,7 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
         }
       }
 
-      if (flow.connections < minConnections) {
+      if (flow.connections < activeMinConnections) {
         return false
       }
 
@@ -915,14 +989,14 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
 
     flows.forEach(flow => {
       // Count source nodes
-      if (flow.source.namespace && flow.source.kind.toLowerCase() !== 'external') {
+      if (flow.source.namespace && !isExternalKind(flow.source.kind)) {
         if (!nsCounts.has(flow.source.namespace)) {
           nsCounts.set(flow.source.namespace, new Set())
         }
         nsCounts.get(flow.source.namespace)!.add(flow.source.name)
       }
       // Count destination nodes
-      if (flow.destination.namespace && flow.destination.kind.toLowerCase() !== 'external') {
+      if (flow.destination.namespace && !isExternalKind(flow.destination.kind)) {
         if (!nsCounts.has(flow.destination.namespace)) {
           nsCounts.set(flow.destination.namespace, new Set())
         }
@@ -934,7 +1008,7 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
       name,
       nodeCount: nodes.size,
     }))
-  }, [flowsData?.aggregated, hideSystem, hideExternal, minConnections])
+  }, [flowsData?.aggregated, hideSystem, hideExternal, activeMinConnections])
 
   // Determine wizard state based on sources detection
   useEffect(() => {
@@ -957,7 +1031,11 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
     }
   }, [sourcesData, sourcesLoading])
 
-  // Shared connection handler — used by auto-connect and retry buttons
+  // Shared connection handler — used by auto-connect and retry buttons.
+  // Deliberately does NOT reset hasAutoConnectedRef on failure: that ref gates
+  // the auto-connect effect, and re-arming it would re-fire auto-connect on
+  // every failed attempt (unbounded loop). Retries come from the explicit
+  // Retry button, which calls handleConnect directly.
   const handleConnect = useCallback(() => {
     setIsConnecting(true)
     setConnectionError(null)
@@ -968,18 +1046,18 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
         setIsConnecting(false)
         if (!data.connected && data.error) {
           setConnectionError(data.error)
-          hasAutoConnectedRef.current = false // allow retry
         }
       },
       onError: (error) => {
         setIsConnecting(false)
         setConnectionError(error.message)
-        hasAutoConnectedRef.current = false // allow retry
       },
     })
   }, [connectMutation, queryClient])
 
-  // Auto-connect when source is detected
+  // Auto-connect once when a source is first detected. Strictly one-shot per
+  // mount / cluster (the ref resets on cluster change); failures surface a
+  // manual Retry rather than re-arming this effect.
   useEffect(() => {
     if (wizardState === 'ready' && !hasAutoConnectedRef.current && !isConnecting) {
       hasAutoConnectedRef.current = true
@@ -1009,8 +1087,8 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
         setHideSystem={setHideSystem}
         hideExternal={hideExternal}
         setHideExternal={setHideExternal}
-        minConnections={minConnections}
-        setMinConnections={setMinConnections}
+        minConnections={activeMinConnections}
+        setMinConnections={chooseMinConnections}
         showNamespaceGroups={showNamespaceGroups}
         setShowNamespaceGroups={setShowNamespaceGroups}
         collapseInternet={collapseInternet}
@@ -1023,7 +1101,12 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
         setDetectServices={setDetectServices}
         timeRange={timeRange}
         setTimeRange={setTimeRange}
-        isHubble={sourcesData?.active === 'hubble' && hasL7Data}
+        showL7Filters={hasL7Data}
+        availableStatusRanges={l7Capabilities.availableStatusRanges}
+        availableVerdicts={l7Capabilities.availableVerdicts}
+        hasDNSQueries={l7Capabilities.hasDNSQueries}
+        availableHTTPMethods={l7Capabilities.availableHTTPMethods}
+        isRateBased={isRateBased}
         l7Protocol={l7Protocol}
         setL7Protocol={setL7Protocol}
         l7Methods={l7Methods}
@@ -1117,18 +1200,26 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
                 {/* Top-right: stats + actions */}
                 <div className="absolute top-3 right-3 z-10 flex items-center gap-2">
                   {flowsData?.flows && flowsData.flows.length > 0 && (
+                    <Tooltip content="Open flow list in dock">
                     <button onClick={openFlowListDock}
-                      className="flex items-center gap-1 px-2 py-1 text-[10px] rounded-lg bg-theme-surface/90 backdrop-blur border border-theme-border text-theme-text-secondary hover:text-theme-text-primary transition-colors"
-                      title="Open flow list in dock">
+                      className="flex items-center gap-1 px-2 py-1 text-[10px] rounded-lg bg-theme-surface/90 backdrop-blur border border-theme-border text-theme-text-secondary hover:text-theme-text-primary transition-colors">
                       <List className="w-3 h-3" /> Flows
                     </button>
+                    </Tooltip>
                   )}
-                  <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-theme-surface/90 backdrop-blur border border-theme-border text-[10px] text-theme-text-tertiary">
+                  <div className="flex items-center px-2 py-1 rounded-lg bg-theme-surface/90 backdrop-blur border border-theme-border text-[10px] text-theme-text-tertiary tabular-nums">
                     {flowStats.shown}/{flowStats.total}
-                    <button onClick={refetchFlows} disabled={flowsLoading || isRefreshAnimating}
-                      className={clsx('p-0.5 rounded hover:text-theme-text-primary transition-colors', (flowsLoading || isRefreshAnimating) && 'opacity-50')}>
-                      {flowsLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className={clsx('h-3 w-3', isRefreshAnimating && 'animate-spin')} />}
-                    </button>
+                  </div>
+                  {/* Flows are a REST snapshot (no poll, no stream), so this is
+                      an honest "Updated N ago" + manual refresh — not "live". */}
+                  <div className="flex items-center rounded-lg bg-theme-surface/90 backdrop-blur border border-theme-border px-1.5 py-0.5">
+                    <FreshnessControl
+                      mode="snapshot"
+                      dataUpdatedAt={flowsUpdatedAt}
+                      isFetching={flowsFetching}
+                      onRefresh={() => refetchFlowsRaw()}
+                      connectionState={connection.state}
+                    />
                   </div>
                 </div>
               </>
@@ -1141,15 +1232,39 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
               className="absolute inset-0"
             />
           ) : finalFlows.length > 0 ? (
-            <TrafficGraph
-              flows={finalFlows}
-              hotPathThreshold={hotPathThreshold}
-              showNamespaceGroups={showNamespaceGroups}
-              serviceCategories={serviceCategories}
-              addonMode={addonMode}
-              trafficSource={sourcesData?.active || ''}
-              onSelectionChange={setGraphSelection}
-            />
+            <>
+              {flowsData?.warning && warningIsPermanent && (
+                // Sits below the two chip rows (both top-3) rather than beside
+                // them: centred at that height it would cover the flow count and
+                // the refresh control at common widths. role/aria-live because it
+                // appears after the graph has already rendered.
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="absolute top-14 left-1/2 z-10 w-[min(40rem,calc(100%-1.5rem))] -translate-x-1/2"
+                >
+                  <AlertBanner
+                    variant="warning"
+                    // Not "incomplete": every warning that reaches here is about a
+                    // value on an edge that is shown being wrong or absent — a port
+                    // reported as 0, UDP reported as TCP, received bytes understated.
+                    // "Incomplete" sends the reader looking for workloads that are
+                    // missing, which is the one thing none of these mean.
+                    title="Some values on this map are unreliable"
+                    message={flowsData.warning}
+                  />
+                </div>
+              )}
+              <TrafficGraph
+                flows={finalFlows}
+                hotPathThreshold={hotPathThreshold}
+                showNamespaceGroups={showNamespaceGroups}
+                serviceCategories={serviceCategories}
+                addonMode={addonMode}
+                trafficSource={sourcesData?.active || ''}
+                onSelectionChange={setGraphSelection}
+              />
+            </>
           ) : connectionError ? (
             <div className="absolute inset-0 flex items-center justify-center">
               <div className="text-center space-y-3">
@@ -1178,10 +1293,21 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
                   action={
                     <button
                       type="button"
+                      // Nine filters can empty this view; clearing three of them left
+                      // the user pressing a button that promised everything back and
+                      // changed nothing whenever the cause was a namespace, an addon
+                      // mode or an L7 choice.
                       onClick={() => {
                         setHideSystem(false)
                         setHideExternal(false)
-                        setMinConnections(0)
+                        chooseMinConnections(0)
+                        setHiddenNamespaces(new Set())
+                        setAddonMode('show')
+                        setL7Protocol('all')
+                        setL7Methods(new Set())
+                        setL7StatusRanges(new Set())
+                        setL7Verdicts(new Set())
+                        setDnsPattern('')
                       }}
                       className="badge badge-sm border border-theme-border bg-theme-elevated text-theme-text-primary hover:bg-theme-hover transition-colors"
                     >
@@ -1195,7 +1321,11 @@ export function TrafficView({ namespaces }: TrafficViewProps) {
                   tone="neutral"
                   variant="card"
                   icon={AlertTriangle}
-                  headline="Unable to fetch traffic data"
+                  headline={
+                    warningIsPermanent
+                      ? 'No traffic Radar can place on the map'
+                      : 'Unable to fetch traffic data'
+                  }
                   body={flowsData.warning}
                   className="max-w-md"
                 />

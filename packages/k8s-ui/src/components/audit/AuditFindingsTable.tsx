@@ -1,19 +1,23 @@
-import { useState, useMemo, useRef, useEffect, type Dispatch, type SetStateAction } from 'react'
-import { ShieldAlert, AlertTriangle, ChevronRight, CheckCircle2, Search, ExternalLink, MoreHorizontal, EyeOff, Layers } from 'lucide-react'
+import { useState, useMemo, useRef, useEffect, useId, type Dispatch, type SetStateAction } from 'react'
+import { ShieldAlert, AlertTriangle, CheckCircle2, ExternalLink, MoreHorizontal, EyeOff, Layers } from 'lucide-react'
 import { clsx } from 'clsx'
 import type { AuditFinding } from './AuditAlerts'
-import { SEVERITY_TEXT, BP_CATEGORY_BADGE, DEFAULT_BADGE_COLOR } from '../../utils/badge-colors'
+import { BP_CATEGORY_BADGE, DEFAULT_BADGE_COLOR } from '../../utils/badge-colors'
 import { EmptyState } from '../ui/EmptyState'
+import { SearchBox } from '../ui/SearchBox'
 import { FilterPill } from '../ui/FilterPill'
 import { pluralize } from '../../utils/pluralize'
+import { SEVERITY_TEXT_CLASS } from '../checks/severity'
+import { Collapse, CollapseChevron, useDisclosure, disclosurePanelId } from '../ui/Collapse'
 
 const CATEGORIES = ['Security', 'Reliability', 'Efficiency'] as const
-const SEVERITIES = ['danger', 'warning'] as const
+const RAW_SEVERITIES = ['danger', 'warning'] as const
 
 export interface ResourceGroup {
   kind: string
   namespace: string
   name: string
+  /** Raw compatibility counts; warning renders as Medium and danger as High. */
   warning: number
   danger: number
   findings: AuditFinding[]
@@ -25,6 +29,17 @@ export interface CheckMeta {
   description: string
   remediation: string
   frameworks?: string[]
+  references?: CheckReference[]
+  /** Finding means the specific resource is broken (reference-integrity /
+   *  lifecycle), worth a per-resource topology/list badge — vs posture /
+   *  best-practice checks that fire near-universally. Set by the backend registry. */
+  badgeWorthy?: boolean
+}
+
+/** An authoritative link for a check (K8s docs, CIS, NSA/CISA, …). */
+export interface CheckReference {
+  label: string
+  url: string
 }
 
 export interface AuditFindingsTableProps {
@@ -54,8 +69,10 @@ export function AuditFindingsTable({ groups, findings, checks, onResourceClick, 
   const [searchTerm, setSearchTerm] = useState('')
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [expandedNS, setExpandedNS] = useState<Set<string>>(new Set())
+  // Namespace rows are mapped inline, so they can't each call useDisclosure;
+  // one generated prefix plus the namespace keeps aria-controls unique.
+  const nsPanelBase = useId()
   const [groupByNS, setGroupByNS] = useState(false)
-  const searchInputRef = useRef<HTMLInputElement>(null)
 
   const toggleInSet = (setter: Dispatch<SetStateAction<Set<string>>>, value: string) => {
     setter(prev => {
@@ -77,26 +94,14 @@ export function AuditFindingsTable({ groups, findings, checks, onResourceClick, 
     setSearchTerm('')
   }
 
-  // "/" keyboard shortcut to focus search
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === '/' && !e.ctrlKey && !e.metaKey && document.activeElement?.tagName !== 'INPUT') {
-        e.preventDefault()
-        searchInputRef.current?.focus()
-      }
-    }
-    document.addEventListener('keydown', handler)
-    return () => document.removeEventListener('keydown', handler)
-  }, [])
-
   // Compute totals from whichever data source we have
   const allFindings = useMemo(() => {
     if (groups) return groups.flatMap(g => g.findings)
     return findings ?? []
   }, [groups, findings])
 
-  const totalDangerCount = allFindings.filter(f => f.severity === 'danger').length
-  const totalWarningCount = allFindings.filter(f => f.severity === 'warning').length
+  const totalHighCount = allFindings.filter(f => f.severity === 'danger').length
+  const totalMediumCount = allFindings.filter(f => f.severity === 'warning').length
 
   // Derive available frameworks from checks metadata
   const frameworks = useMemo(() => {
@@ -167,8 +172,8 @@ export function AuditFindingsTable({ groups, findings, checks, onResourceClick, 
   const filteredAllFindings = filteredGroups
     ? filteredGroups.flatMap(g => g.findings)
     : filteredFindings ?? []
-  const dangerCount = hasActiveFilters ? filteredAllFindings.filter(f => f.severity === 'danger').length : totalDangerCount
-  const warningCount = hasActiveFilters ? filteredAllFindings.filter(f => f.severity === 'warning').length : totalWarningCount
+  const highCount = hasActiveFilters ? filteredAllFindings.filter(f => f.severity === 'danger').length : totalHighCount
+  const mediumCount = hasActiveFilters ? filteredAllFindings.filter(f => f.severity === 'warning').length : totalMediumCount
 
   // Group resources by namespace when enabled
   const namespacedGroups = useMemo(() => {
@@ -182,9 +187,9 @@ export function AuditFindingsTable({ groups, findings, checks, onResourceClick, 
     }
     // Sort namespaces: most severe first
     return Array.from(nsMap.entries()).sort((a, b) => {
-      const aDanger = a[1].reduce((n, g) => n + g.danger, 0)
-      const bDanger = b[1].reduce((n, g) => n + g.danger, 0)
-      if (aDanger !== bDanger) return bDanger - aDanger
+      const aHigh = a[1].reduce((n, g) => n + g.danger, 0)
+      const bHigh = b[1].reduce((n, g) => n + g.danger, 0)
+      if (aHigh !== bHigh) return bHigh - aHigh
       return a[0].localeCompare(b[0])
     })
   }, [groupByNS, filteredGroups])
@@ -232,20 +237,10 @@ export function AuditFindingsTable({ groups, findings, checks, onResourceClick, 
       <div className="flex flex-col gap-2 px-4 py-3 border-b border-theme-border bg-theme-base rounded-xl shrink-0">
         {/* Row 1: Counts + Search + View toggle */}
         <div className="flex items-center gap-4">
-          <SummaryBadge label="Critical" count={dangerCount} color={SEVERITY_TEXT.error} />
-          <SummaryBadge label="Warning" count={warningCount} color={SEVERITY_TEXT.warning} />
+          <SummaryBadge label="High" count={highCount} color={SEVERITY_TEXT_CLASS.high} />
+          <SummaryBadge label="Medium" count={mediumCount} color={SEVERITY_TEXT_CLASS.medium} />
 
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-theme-text-tertiary" />
-            <input
-              ref={searchInputRef}
-              type="text"
-              placeholder="Search... (press /)"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-56 pl-10 pr-4 py-1.5 bg-theme-elevated border border-theme-border-light rounded-lg text-sm text-theme-text-primary placeholder-theme-text-disabled focus:outline-none focus:ring-2 focus:ring-skyhook-500"
-            />
-          </div>
+          <SearchBox value={searchTerm} onChange={setSearchTerm} scope="audit" shortcutId="audit-search" className="w-64" />
 
           <div className="flex-1" />
 
@@ -275,12 +270,12 @@ export function AuditFindingsTable({ groups, findings, checks, onResourceClick, 
             <FilterPill key={cat} label={cat} active={categoryFilter.has(cat)} onClick={() => toggleInSet(setCategoryFilter, cat)} />
           ))}
           <span className="w-px h-5 bg-theme-border mx-2" />
-          {SEVERITIES.map(sev => (
+          {RAW_SEVERITIES.map(sev => (
             <FilterPill
               key={sev}
-              label={sev === 'danger' ? 'Critical' : 'Warning'}
+              label={sev === 'danger' ? 'High' : 'Medium'}
               active={severityFilter.has(sev)}
-              tone={sev === 'danger' ? 'danger' : 'warn'}
+              tone={sev === 'danger' ? 'high' : 'medium'}
               onClick={() => toggleInSet(setSeverityFilter, sev)}
             />
           ))}
@@ -329,14 +324,15 @@ export function AuditFindingsTable({ groups, findings, checks, onResourceClick, 
         <div className="flex flex-col gap-1">
           {namespacedGroups.map(([ns, nsGroups]) => {
             const nsExpanded = expandedNS.has(ns)
-            const nsDanger = nsGroups.reduce((n, g) => n + g.danger, 0)
-            const nsWarning = nsGroups.reduce((n, g) => n + g.warning, 0)
+            const nsHigh = nsGroups.reduce((n, g) => n + g.danger, 0)
+            const nsMedium = nsGroups.reduce((n, g) => n + g.warning, 0)
             return (
               <div key={ns}>
                 <div
                   role="button"
                   tabIndex={0}
                   aria-expanded={nsExpanded}
+                  aria-controls={disclosurePanelId(nsPanelBase, ns)}
                   onClick={() => toggleNS(ns)}
                   onKeyDown={(e) => {
                     if (e.target !== e.currentTarget) return
@@ -344,30 +340,25 @@ export function AuditFindingsTable({ groups, findings, checks, onResourceClick, 
                   }}
                   className="group flex items-center gap-3 w-full px-4 py-2 rounded-lg hover:bg-theme-hover/30 transition-colors text-left cursor-pointer focus-visible:ring-2 focus-visible:ring-theme-text-primary/20 focus-visible:outline-none"
                 >
-                  <ChevronRight className={clsx('w-4 h-4 text-theme-text-tertiary shrink-0 transition-transform duration-200', nsExpanded && 'rotate-90')} />
+                  <CollapseChevron open={nsExpanded} className="w-4 h-4" />
                   <span className="text-sm font-semibold text-theme-text-primary">{ns}</span>
                   <span className="text-xs text-theme-text-tertiary">{pluralize(nsGroups.length, 'resource')}</span>
                   <span className="flex-1" />
                   <div className="flex items-center gap-3 shrink-0">
-                    {nsDanger > 0 && <span className={clsx('text-xs font-semibold tabular-nums', SEVERITY_TEXT.error)}>{nsDanger} critical</span>}
-                    {nsWarning > 0 && <span className={clsx('text-xs font-semibold tabular-nums', SEVERITY_TEXT.warning)}>{nsWarning} warning</span>}
+                    {nsHigh > 0 && <span className={clsx('text-xs font-semibold tabular-nums', SEVERITY_TEXT_CLASS.high)}>{nsHigh} high</span>}
+                    {nsMedium > 0 && <span className={clsx('text-xs font-semibold tabular-nums', SEVERITY_TEXT_CLASS.medium)}>{nsMedium} medium</span>}
                   </div>
                   {onHideNamespace && ns !== '(cluster-scoped)' && (
                     <ContextMenu items={[{ label: `Hide ${ns} namespace`, onClick: () => onHideNamespace(ns) }]} />
                   )}
                 </div>
-                <div
-                  className="grid transition-[grid-template-rows] duration-200 ease-out"
-                  style={{ gridTemplateRows: nsExpanded ? '1fr' : '0fr' }}
-                >
-                  <div className="overflow-hidden">
-                    <div className="pl-4">
-                      {nsGroups.map(g => (
-                        <ResourceGroupRow key={`${g.kind}/${g.namespace}/${g.name}`} group={g} checks={checks} expanded={expanded} onToggle={toggle} onResourceClick={onResourceClick} onHideCheck={onHideCheck} onHideCategory={onHideCategory} />
-                      ))}
-                    </div>
+                <Collapse open={nsExpanded} id={disclosurePanelId(nsPanelBase, ns)}>
+                  <div className="pl-4">
+                    {nsGroups.map(g => (
+                      <ResourceGroupRow key={`${g.kind}/${g.namespace}/${g.name}`} group={g} checks={checks} expanded={expanded} onToggle={toggle} onResourceClick={onResourceClick} onHideCheck={onHideCheck} onHideCategory={onHideCategory} />
+                    ))}
                   </div>
-                </div>
+                </Collapse>
               </div>
             )
           })}
@@ -403,7 +394,7 @@ function FindingDetail({ finding, meta, onHideCheck, onHideCategory }: {
   onHideCheck?: (checkID: string, title: string) => void
   onHideCategory?: (category: string) => void
 }) {
-  const isDanger = finding.severity === 'danger'
+  const isHigh = finding.severity === 'danger'
   const menuItems: ContextMenuItem[] = []
   if (onHideCheck) {
     menuItems.push({ label: `Hide "${meta?.title || finding.checkID}" check`, onClick: () => onHideCheck(finding.checkID, meta?.title || finding.checkID) })
@@ -415,10 +406,10 @@ function FindingDetail({ finding, meta, onHideCheck, onHideCategory }: {
   return (
     <div className="flex flex-col gap-0.5 px-3 py-2 rounded group/finding">
       <div className="flex items-center gap-3">
-        {isDanger ? (
-          <ShieldAlert className={clsx('w-4 h-4 shrink-0', SEVERITY_TEXT.error)} />
+        {isHigh ? (
+          <ShieldAlert className={clsx('w-4 h-4 shrink-0', SEVERITY_TEXT_CLASS.high)} />
         ) : (
-          <AlertTriangle className={clsx('w-4 h-4 shrink-0', SEVERITY_TEXT.warning)} />
+          <AlertTriangle className={clsx('w-4 h-4 shrink-0', SEVERITY_TEXT_CLASS.medium)} />
         )}
         <span className="text-sm text-theme-text-primary flex-1 min-w-0">{finding.message}</span>
         <span className={clsx('badge-sm text-[10px]', BP_CATEGORY_BADGE[finding.category] || DEFAULT_BADGE_COLOR)}>
@@ -449,14 +440,15 @@ function ResourceGroupRow({ group: g, checks, expanded, onToggle, onResourceClic
 }) {
   const key = `${g.kind}/${g.namespace}/${g.name}`
   const isExpanded = expanded.has(key)
-  const hasDanger = g.danger > 0
+  const hasHigh = g.danger > 0
+  const { panelId, buttonProps } = useDisclosure(isExpanded)
 
   return (
     <div>
       <div
+        {...buttonProps}
         role="button"
         tabIndex={0}
-        aria-expanded={isExpanded}
         onClick={() => onToggle(key)}
         onKeyDown={(e) => {
           if (e.target !== e.currentTarget) return
@@ -464,11 +456,11 @@ function ResourceGroupRow({ group: g, checks, expanded, onToggle, onResourceClic
         }}
         className="group flex items-center gap-3 w-full px-4 py-2.5 rounded-lg hover:bg-theme-hover/50 transition-colors text-left cursor-pointer focus-visible:ring-2 focus-visible:ring-theme-text-primary/20 focus-visible:outline-none"
       >
-        <ChevronRight className={clsx('w-3.5 h-3.5 text-theme-text-tertiary shrink-0 transition-transform duration-200', isExpanded && 'rotate-90')} />
-        {hasDanger ? (
-          <ShieldAlert className={clsx('w-4 h-4 shrink-0', SEVERITY_TEXT.error)} />
+        <CollapseChevron open={isExpanded} className="w-3.5 h-3.5" />
+        {hasHigh ? (
+          <ShieldAlert className={clsx('w-4 h-4 shrink-0', SEVERITY_TEXT_CLASS.high)} />
         ) : (
-          <AlertTriangle className={clsx('w-4 h-4 shrink-0', SEVERITY_TEXT.warning)} />
+          <AlertTriangle className={clsx('w-4 h-4 shrink-0', SEVERITY_TEXT_CLASS.medium)} />
         )}
         <span className="text-xs text-theme-text-tertiary shrink-0">{g.kind}</span>
         {onResourceClick ? (
@@ -487,36 +479,31 @@ function ResourceGroupRow({ group: g, checks, expanded, onToggle, onResourceClic
         )}
         <span className="flex-1" />
         <div className="flex items-center gap-3 shrink-0">
-          {g.danger > 0 && <span className={clsx('text-xs font-semibold tabular-nums', SEVERITY_TEXT.error)}>{g.danger} critical</span>}
-          {g.warning > 0 && <span className={clsx('text-xs font-semibold tabular-nums', SEVERITY_TEXT.warning)}>{g.warning} warning</span>}
+          {g.danger > 0 && <span className={clsx('text-xs font-semibold tabular-nums', SEVERITY_TEXT_CLASS.high)}>{g.danger} high</span>}
+          {g.warning > 0 && <span className={clsx('text-xs font-semibold tabular-nums', SEVERITY_TEXT_CLASS.medium)}>{g.warning} medium</span>}
         </div>
         {showNamespace && onHideNamespace && g.namespace && (
           <ContextMenu items={[{ label: `Hide ${g.namespace} namespace`, onClick: () => onHideNamespace(g.namespace) }]} />
         )}
       </div>
-      <div
-        className="grid transition-[grid-template-rows] duration-200 ease-out"
-        style={{ gridTemplateRows: isExpanded ? '1fr' : '0fr' }}
-      >
-        <div className="overflow-hidden">
-          <div className="pl-11 pb-1">
-            {g.findings.map((f, i) => (
-              <FindingDetail key={`${f.checkID}-${i}`} finding={f} meta={checks?.[f.checkID]} onHideCheck={onHideCheck} onHideCategory={onHideCategory} />
-            ))}
-          </div>
+      <Collapse open={isExpanded} id={panelId}>
+        <div className="pl-11 pb-1">
+          {g.findings.map((f, i) => (
+            <FindingDetail key={`${f.checkID}-${i}`} finding={f} meta={checks?.[f.checkID]} onHideCheck={onHideCheck} onHideCategory={onHideCategory} />
+          ))}
         </div>
-      </div>
+      </Collapse>
     </div>
   )
 }
 
 function FlatFindingRow({ finding, onResourceClick, showCluster, onClusterClick }: { finding: AuditFinding; onResourceClick?: (kind: string, namespace: string, name: string) => void; showCluster?: boolean; onClusterClick?: (clusterId: string) => void }) {
-  const isDanger = finding.severity === 'danger'
-  const severityColor = isDanger ? SEVERITY_TEXT.error : SEVERITY_TEXT.warning
+  const isHigh = finding.severity === 'danger'
+  const severityColor = isHigh ? SEVERITY_TEXT_CLASS.high : SEVERITY_TEXT_CLASS.medium
 
   return (
     <div className="flex items-center gap-3 px-4 py-2.5 rounded-lg hover:bg-theme-hover/50 transition-colors">
-      {isDanger ? (
+      {isHigh ? (
         <ShieldAlert className={clsx('w-4 h-4 shrink-0', severityColor)} />
       ) : (
         <AlertTriangle className={clsx('w-4 h-4 shrink-0', severityColor)} />

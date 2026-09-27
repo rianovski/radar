@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,17 +14,115 @@ import (
 // Config holds startup configuration persisted across restarts.
 // Values are used as flag defaults; explicit CLI flags always take precedence.
 type Config struct {
-	Kubeconfig        string   `json:"kubeconfig,omitempty"`
-	KubeconfigDirs    []string `json:"kubeconfigDirs,omitempty"`
-	Namespace         string   `json:"namespace,omitempty"`
-	Port              int      `json:"port,omitempty"`
-	NoBrowser         bool     `json:"noBrowser,omitempty"`
-	TimelineStorage   string   `json:"timelineStorage,omitempty"`
-	TimelineDBPath    string   `json:"timelineDbPath,omitempty"`
-	TimelineRetention string   `json:"timelineRetention,omitempty"` // Go duration (e.g. "168h" for 7d); "0" disables
-	HistoryLimit      int      `json:"historyLimit,omitempty"`
-	PrometheusURL     string   `json:"prometheusUrl,omitempty"`
-	MCP               *bool    `json:"mcp,omitempty"` // nil = default (true), false = disabled
+	Kubeconfig     string   `json:"kubeconfig,omitempty"`
+	KubeconfigDirs []string `json:"kubeconfigDirs,omitempty"`
+	// nil = on. No CLI equivalent, deliberately — that would put a Desktop
+	// switch in the path of a command typed after `kubectl config use-context`.
+	RestoreLastDesktopContext *bool    `json:"restoreLastDesktopContext,omitempty"`
+	Namespace                 string   `json:"namespace,omitempty"`
+	Namespaces                []string `json:"namespaces,omitempty"`
+	Port                      int      `json:"port,omitempty"`
+	NoBrowser                 bool     `json:"noBrowser,omitempty"`
+	Browser                   string   `json:"browser,omitempty"`
+	TimelineStorage           string   `json:"timelineStorage,omitempty"`
+	TimelineDBPath            string   `json:"timelineDbPath,omitempty"`
+	TimelineRetention         string   `json:"timelineRetention,omitempty"` // Go duration (e.g. "168h" for 7d); "0" disables age cleanup
+	TimelineMaxSize           string   `json:"timelineMaxSize,omitempty"`   // Byte size (e.g. "800Mi", "8Gi"); "0" disables
+	HistoryLimit              int      `json:"historyLimit,omitempty"`
+	PrometheusURL             string   `json:"prometheusUrl,omitempty"`
+	OpenCostCurrency          string   `json:"opencostCurrency,omitempty"`
+	CostSource                string   `json:"costSource,omitempty"`
+	KubecostURL               string   `json:"kubecostUrl,omitempty"`
+	KubecostAPIKey            string   `json:"kubecostApiKey,omitempty"`
+	// KubecostAPIKeyContext binds a credential used with local auto-discovery to
+	// the kubeconfig context where it was configured. Explicit-URL credentials
+	// remain portable because their origin is stable across context switches.
+	KubecostAPIKeyContext string `json:"kubecostApiKeyContext,omitempty"`
+	KubecostClusterID     string `json:"kubecostClusterId,omitempty"`
+	// KubecostClusterIDContext prevents a cluster-specific central-Aggregator
+	// filter from silently following a local kubeconfig switch.
+	KubecostClusterIDContext string `json:"kubecostClusterIdContext,omitempty"`
+	// PrometheusHeaders are sent with every request to the Prometheus API.
+	// Required for auth-protected backends (Bearer tokens, X-Scope-OrgID, etc.).
+	// Stored in plain text in ~/.radar/config.json — protect the file accordingly.
+	PrometheusHeaders        map[string]string `json:"prometheusHeaders,omitempty"`
+	PrometheusHeadersFromEnv map[string]string `json:"prometheusHeadersFromEnv,omitempty"`
+	MCP                      *bool             `json:"mcp,omitempty"` // nil = default (true), false = disabled
+	// DebugImage is the image used for ephemeral debug containers and node debug
+	// pods. Empty falls back to busybox:latest; set it to a reachable mirror for
+	// air-gapped / private-registry clusters.
+	DebugImage string `json:"debugImage,omitempty"`
+
+	// ReachabilityImage is the image for the in-cluster reachability probe Job
+	// (`radar probe`). Empty falls back to RADAR_IMAGE, then the version-matched
+	// published Radar image; set it to a reachable mirror for air-gapped clusters.
+	ReachabilityImage string `json:"reachabilityImage,omitempty"`
+	// ArgoCDURL is the Argo CD API server URL. Empty enables auto-discovery.
+	ArgoCDURL string `json:"argoCdUrl,omitempty"`
+	// ArgoCDToken is the Argo CD API bearer token. Stored in plain text in
+	// ~/.radar/config.json — Save enforces 0600 on the file.
+	ArgoCDToken string `json:"argoCdToken,omitempty"`
+	// ArgoCDInsecureTLS disables TLS certificate verification for the Argo CD
+	// API client only.
+	ArgoCDInsecureTLS bool `json:"argoCdInsecureTls,omitempty"`
+	// ArgoCDTokenContext is the readable kubeconfig context recorded with an
+	// auto-discovery token. A value without ArgoCDTokenBinding marks a legacy
+	// config that needs the token confirmed again.
+	ArgoCDTokenContext string `json:"argoCdTokenContext,omitempty"`
+	// ArgoCDTokenBinding is the opaque kubeconfig source binding for an
+	// auto-discovery token. Authorization relies on this field rather than the
+	// mutable display context.
+	ArgoCDTokenBinding string `json:"argoCdTokenBinding,omitempty"`
+	// AIHistory persists AI investigations (transcripts + conclusions) to a local
+	// SQLite file so they survive restarts. nil = default (true), false = off.
+	AIHistory *bool `json:"aiHistory,omitempty"`
+	// AIHistoryDBPath overrides the history DB location (default ~/.radar/ai-runs.db).
+	AIHistoryDBPath string `json:"aiHistoryDbPath,omitempty"`
+	// AIConsent records the acknowledged AI-investigation disclosure version per
+	// agent execution profile. Machine-scoped on purpose: consent gates a
+	// machine-scoped action (spawn this machine's agent CLI, persist transcripts
+	// to this machine's disk), so one acknowledgment covers the web panel and
+	// the `radar diagnose` CLI alike.
+	AIConsent map[string]string `json:"aiConsent,omitempty"`
+}
+
+// AI-investigation consent disclosure versions, per surface. THE single source of
+// truth for the server endpoint and the CLI's standalone path alike — bump when
+// the consent copy's claims change materially, and prior acknowledgments stop
+// counting everywhere at once.
+var aiConsentVersions = map[string]string{
+	"claude:safeguarded":      "v1",
+	"claude:full-local":       "v1",
+	"codex:safeguarded":       "v1",
+	"codex:full-local":        "v1",
+	"cursor-agent:full-local": "v2",
+	"opencode:full-local":     "v1",
+}
+
+// AIConsentVersion returns the current disclosure version for a surface
+// ("" for an unknown surface).
+func AIConsentVersion(surface string) string { return aiConsentVersions[surface] }
+
+// AIConsentGiven reports whether the CURRENT disclosure version for the surface
+// has been acknowledged on this machine.
+func AIConsentGiven(surface string) bool {
+	v := aiConsentVersions[surface]
+	return v != "" && Load().AIConsent[surface] == v
+}
+
+// RecordAIConsent acknowledges the current disclosure version for a surface.
+func RecordAIConsent(surface string) error {
+	v := aiConsentVersions[surface]
+	if v == "" {
+		return os.ErrInvalid
+	}
+	_, err := Update(func(c *Config) {
+		if c.AIConsent == nil {
+			c.AIConsent = map[string]string{}
+		}
+		c.AIConsent[surface] = v
+	})
+	return err
 }
 
 // mu serializes Load-mutate-Save cycles to prevent concurrent writes
@@ -58,6 +157,13 @@ func Load() Config {
 		log.Printf("[config] Failed to parse %s: %v", path, err)
 		return Config{}
 	}
+	normalizedCurrency, err := NormalizeOpenCostCurrency(c.OpenCostCurrency)
+	if err != nil {
+		log.Printf("[config] Ignoring invalid opencostCurrency %q in %s: %v", c.OpenCostCurrency, path, err)
+		c.OpenCostCurrency = ""
+	} else {
+		c.OpenCostCurrency = normalizedCurrency
+	}
 	return c
 }
 
@@ -76,12 +182,17 @@ func Save(c Config) error {
 	}
 	data = append(data, '\n')
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	// 0600: the config can carry credentials (Prometheus headers, Argo CD token).
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp) // best-effort cleanup
 		return err
+	}
+	// Tighten pre-existing files written before the 0600 policy.
+	if err := os.Chmod(path, 0o600); err != nil {
+		log.Printf("[config] Failed to chmod %s to 0600: %v", path, err)
 	}
 	return nil
 }
@@ -119,6 +230,23 @@ func (c Config) MCPEnabledOr(def bool) bool {
 	return def
 }
 
+// RestoreLastDesktopContextOr returns *c.RestoreLastDesktopContext if non-nil, otherwise the
+// provided default.
+func (c Config) RestoreLastDesktopContextOr(def bool) bool {
+	if c.RestoreLastDesktopContext != nil {
+		return *c.RestoreLastDesktopContext
+	}
+	return def
+}
+
+// AIHistoryOr returns *c.AIHistory if non-nil, otherwise the provided default.
+func (c Config) AIHistoryOr(def bool) bool {
+	if c.AIHistory != nil {
+		return *c.AIHistory
+	}
+	return def
+}
+
 // TimelineStorageOr returns c.TimelineStorage if non-empty, otherwise the provided default.
 func (c Config) TimelineStorageOr(def string) string {
 	if c.TimelineStorage != "" {
@@ -141,8 +269,68 @@ func (c Config) TimelineRetentionOr(def time.Duration) time.Duration {
 	return d
 }
 
+func (c Config) TimelineMaxSizeOr(def string) string {
+	if c.TimelineMaxSize == "" {
+		return def
+	}
+	return c.TimelineMaxSize
+}
+
+func ParseByteSize(raw string) (int64, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, strconv.ErrSyntax
+	}
+	lower := strings.ToLower(s)
+	multipliers := []struct {
+		suffix string
+		value  int64
+	}{
+		{"gib", 1 << 30},
+		{"gb", 1000 * 1000 * 1000},
+		{"gi", 1 << 30},
+		{"g", 1000 * 1000 * 1000},
+		{"mib", 1 << 20},
+		{"mb", 1000 * 1000},
+		{"mi", 1 << 20},
+		{"m", 1000 * 1000},
+		{"kib", 1 << 10},
+		{"kb", 1000},
+		{"ki", 1 << 10},
+		{"k", 1000},
+		{"b", 1},
+	}
+	for _, m := range multipliers {
+		if strings.HasSuffix(lower, m.suffix) {
+			num := strings.TrimSpace(s[:len(s)-len(m.suffix)])
+			v, err := strconv.ParseFloat(num, 64)
+			if err != nil {
+				return 0, err
+			}
+			if v < 0 {
+				return 0, strconv.ErrSyntax
+			}
+			return int64(v * float64(m.value)), nil
+		}
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if v < 0 {
+		return 0, strconv.ErrSyntax
+	}
+	return v, nil
+}
+
 // KubeconfigDirsFlag returns KubeconfigDirs joined as a comma-separated string
 // suitable for use as a flag default value.
 func (c Config) KubeconfigDirsFlag() string {
 	return strings.Join(c.KubeconfigDirs, ",")
+}
+
+// NamespacesFlag returns Namespaces joined as a comma-separated string
+// suitable for use as a flag default value.
+func (c Config) NamespacesFlag() string {
+	return strings.Join(c.Namespaces, ",")
 }

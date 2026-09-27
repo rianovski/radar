@@ -1,5 +1,7 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
+import { createPortal } from 'react-dom'
 import { Search, X, ChevronRight } from 'lucide-react'
+import { Input } from '../ui/Input'
 import { getTopologyIcon } from '../../utils/resource-icons'
 import { clsx } from 'clsx'
 import type { TopologyNode } from '../../types'
@@ -15,7 +17,7 @@ interface TopologySearchProps {
    * only shows CAPI kinds), it should still pass the full topology
    * here so the empty-state can tell users "your query matches X
    * resources hidden by the current view" rather than the
-   * misleading "No resources found." (SKY-828 bug 45)
+   * misleading "No resources found."
    */
   allNodes?: TopologyNode[]
   /**
@@ -23,6 +25,12 @@ interface TopologySearchProps {
    * empty-state hint above. Defaults to "current view".
    */
   viewModeLabel?: string
+  /** Element the search overlay portals into — typically the topology pane. Set
+   *  it when the trigger lives inside a `pointer-events-none` overlay bar: the
+   *  overlay then renders OUTSIDE that bar (so its backdrop is clickable) and is
+   *  `absolute inset-0` scoped to this container (dims only the pane). Omit to
+   *  fall back to a viewport-level `fixed` overlay on document.body. */
+  overlayContainer?: HTMLElement | null
 }
 
 // Icon mapping for different resource kinds
@@ -43,6 +51,13 @@ function getKindColor(kind: string): string {
       return 'text-purple-300'
     case 'Service':
       return 'text-blue-400'
+    case 'CalicoNetworkPolicy':
+    case 'CalicoGlobalNetworkPolicy':
+      return 'text-teal-400'
+    case 'CalicoStagedNetworkPolicy':
+    case 'CalicoStagedGlobalNetworkPolicy':
+    case 'CalicoStagedKubernetesNetworkPolicy':
+      return 'text-amber-400'
     case 'Deployment':
     case 'Rollout':
       return 'text-emerald-400'
@@ -64,7 +79,7 @@ function getKindColor(kind: string): string {
   }
 }
 
-export function TopologySearch({ nodes, onNodeSelect, onZoomToNode, allNodes, viewModeLabel }: TopologySearchProps) {
+export function TopologySearch({ nodes, onNodeSelect, onZoomToNode, allNodes, viewModeLabel, overlayContainer }: TopologySearchProps) {
   const [isOpen, setIsOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [selectedIndex, setSelectedIndex] = useState(0)
@@ -96,9 +111,9 @@ export function TopologySearch({ nodes, onNodeSelect, onZoomToNode, allNodes, vi
   // Count of matches in the unfiltered topology that the current
   // view-mode filter is hiding. We only compute this when there's
   // a query AND the visible set returned zero results, so the cost
-  // is bounded to actual no-result interactions.
-  // (SKY-828 bug 45: Fleet view hides Pods, so searching pod names
-  // returned "No resources found" — misleading.)
+  // is bounded to actual no-result interactions. (Fleet view hides
+  // Pods, so searching a pod name there would otherwise just say
+  // "No resources found".)
   const hiddenMatchCount = useMemo(() => {
     if (!query.trim() || filteredNodes.length > 0 || !allNodes) return 0
     const lowerQuery = query.toLowerCase()
@@ -188,23 +203,32 @@ export function TopologySearch({ nodes, onNodeSelect, onZoomToNode, allNodes, vi
     setTimeout(() => inputRef.current?.focus(), 0)
   }, [])
 
+  // Portal the overlay OUT of the (pointer-events-none) overlay bar the trigger
+  // sits in. With a container → `absolute inset-0` scoped to it (the pane);
+  // without → a viewport `fixed` overlay on document.body.
+  const portalTarget = overlayContainer ?? (typeof document !== 'undefined' ? document.body : null)
+  const overlayPositionClass = overlayContainer ? 'absolute' : 'fixed'
+
   return (
     <>
       {/* Search trigger button */}
       <button
         onClick={handleOpen}
-        className="absolute top-4 left-4 z-10 flex items-center gap-2 px-3 py-2 bg-theme-surface/90 backdrop-blur border border-theme-border rounded-lg text-theme-text-secondary hover:text-theme-text-primary hover:border-theme-border-light transition-colors"
+        // Layout-neutral (positioned by the host's overlay bar); pointer-events-
+        // auto inside the pointer-events-none bar.
+        className="pointer-events-auto flex items-center gap-2 px-3 py-2 bg-theme-surface/90 backdrop-blur border border-theme-border rounded-lg text-theme-text-secondary hover:text-theme-text-primary hover:border-theme-border-light transition-colors"
       >
         <Search className="w-4 h-4" />
         <span className="text-sm">Search</span>
-        <kbd className="hidden sm:inline-flex items-center gap-0.5 px-1.5 py-0.5 text-xs bg-theme-elevated rounded border border-theme-border-light">
-          <span className="text-[10px]">⌘</span>K
+        <kbd className="hidden sm:inline-flex items-center px-1.5 py-0.5 text-xs bg-theme-elevated rounded border border-theme-border-light">
+          /
         </kbd>
       </button>
 
-      {/* Search modal */}
-      {isOpen && (
-        <div className="absolute inset-0 z-50 flex items-start justify-center pt-[10vh]">
+      {/* Portaled out of the overlay bar (see portalTarget above) so the
+          backdrop is clickable and the dim covers only the pane, not the app. */}
+      {isOpen && portalTarget && createPortal(
+        <div className={`${overlayPositionClass} inset-0 z-50 flex items-start justify-center pt-[10vh]`}>
           {/* Backdrop */}
           <div
             className="absolute inset-0 bg-theme-base/60 backdrop-blur-sm"
@@ -216,9 +240,8 @@ export function TopologySearch({ nodes, onNodeSelect, onZoomToNode, allNodes, vi
             {/* Search input */}
             <div className="flex items-center gap-3 px-4 py-3 border-b border-theme-border">
               <Search className="w-5 h-5 text-theme-text-secondary" />
-              <input
+              <Input
                 ref={inputRef}
-                type="text"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={handleInputKeyDown}
@@ -330,7 +353,8 @@ export function TopologySearch({ nodes, onNodeSelect, onZoomToNode, allNodes, vi
               </div>
             )}
           </div>
-        </div>
+        </div>,
+        portalTarget,
       )}
     </>
   )

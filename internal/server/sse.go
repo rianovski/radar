@@ -6,12 +6,15 @@ import (
 	"log"
 	"maps"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/pkg/perfstats"
 	topology "github.com/skyhook-io/radar/pkg/topology"
 )
 
@@ -26,6 +29,15 @@ type SSEBroadcaster struct {
 	mu         sync.RWMutex
 	stopCh     chan struct{}
 
+	// lastBroadcastMaxEstimated holds the max EstimatedNodes across all
+	// per-group topology builds in the most recent broadcast cycle. Drives
+	// the debounce ladder (see topologyDebounceFor). It reflects only the
+	// currently-active client groups: a sample window over recent builds
+	// would let a brief visit to a big namespace keep the debounce
+	// sticky-high long after the user filtered to a small one, whereas this
+	// settles within one cycle of a namespace switch.
+	lastBroadcastMaxEstimated atomic.Int64
+
 	// watchStopCh is closed to stop the current watchResourceChanges goroutine.
 	// On context switch, it is replaced with a fresh channel to restart the watcher.
 	watchStopCh chan struct{}
@@ -35,6 +47,11 @@ type SSEBroadcaster struct {
 	cachedTopology      *topology.Topology
 	cachedTopologyMu    sync.RWMutex
 	cachedTopologyDirty bool // true when changes occurred but topology not yet rebuilt
+	// cachedTopologyIndex is the inverted edge index over cachedTopology, built
+	// lazily on first relationship lookup and reused across drawer opens until
+	// the topology is replaced. Nil whenever cachedTopology changes (set under
+	// cachedTopologyMu alongside it). Guarded by cachedTopologyMu.
+	cachedTopologyIndex *topology.RelationshipsIndex
 
 	// warmupDone is closed when deferred informers finish syncing. During warmup,
 	// topology broadcasts use longer debounce and skip the expensive full-topology
@@ -46,6 +63,37 @@ type SSEBroadcaster struct {
 	// context-switch/connection-state callbacks are not registered.
 	entryFunc   func() *k8s.PoolEntry
 	contextName string // non-empty for pool-entry broadcasters; sent in connection_state
+
+	// topoTrigger carries broadcast requests to the topology worker. One slot:
+	// a request already waiting subsumes any later one, so a full slot means
+	// coalesce, not queue.
+	//
+	// Keeping the build off the caller is load-bearing. It takes seconds on a
+	// large cluster, and it used to run on the sole reader of the resource-change
+	// channel — the same goroutine that fans k8s_event frames out to clients. For
+	// as long as it built, no change was drained and no live update was
+	// delivered; past a few seconds per cycle the channel overflows on top of
+	// that and changes are lost outright.
+	topoTrigger chan struct{}
+
+	// topoEpoch counts resets of the cluster view (context switch, namespace
+	// rescope). A build reads the process-global caches for seconds, so one
+	// that started before a reset describes a cluster the UI has already left
+	// by the time it finishes. Every build captures the epoch up front and
+	// every publish re-checks it, so an in-flight build is discarded rather
+	// than shown or cached.
+	topoEpoch atomic.Uint64
+
+	// topoEpochAtCycleStart reads the epoch a cycle is built against. A real
+	// context switch lands on another goroutine at an arbitrary point inside a
+	// build, so injecting the capture is the only deterministic way to exercise
+	// a build that spans one.
+	topoEpochAtCycleStart func() uint64
+
+	// topoBuild is the cycle the worker runs per trigger. A seam for the same
+	// reason: the worker's scheduling (what a trigger arriving mid-build does)
+	// is otherwise only observable by running real multi-second builds.
+	topoBuild func() bool
 }
 
 // ClientInfo stores information about a connected client
@@ -53,6 +101,21 @@ type ClientInfo struct {
 	Namespaces       []string // Filter to specific namespaces (empty = all)
 	ViewMode         string   // "full" or "traffic"
 	ShowPolicyEffect bool     // Evaluate NetworkPolicies on edges
+	// DeniedKinds are cluster-scoped topology kinds (Nodes, PV, StorageClass,
+	// NodePool, …) this user can't list, stripped from every topology frame.
+	// Resolved once at subscribe time (the request is available there) so the
+	// broadcast loop never runs a SAR. nil/empty for users with full access.
+	DeniedKinds map[topology.NodeKind]bool
+	// Authorize authorizes a per-resource change frame for this client's user
+	// via SubjectAccessReview, memoized in a connection-lived TTL cache
+	// (context-scoped, independent of the shared permission cache) so a
+	// long-lived stream doesn't re-SAR every frame. Bound at subscribe time to
+	// the request's user + a connection-lived context, so the broadcast
+	// goroutine can gate diff-bearing k8s_event frames per kind without holding a
+	// request. nil when no authorizer was wired (defensive / tests) —
+	// clientCanSeeChange then falls back to the namespace + denied-kind gate.
+	// When auth is disabled the closure is still set and returns true.
+	Authorize func(group, resource, namespace, verb string) bool
 }
 
 type clientRegistration struct {
@@ -60,12 +123,53 @@ type clientRegistration struct {
 	namespaces       []string
 	viewMode         string
 	showPolicyEffect bool
+	deniedKinds      map[topology.NodeKind]bool
+	authorize        func(group, resource, namespace, verb string) bool
 }
 
 // SSEEvent represents an event to send to clients
 type SSEEvent struct {
 	Event string `json:"event"` // "topology", "k8s_event", "heartbeat"
 	Data  any    `json:"data"`
+}
+
+// topologyDebounceFor returns the topology-broadcast debounce duration based
+// on the max estimated topology node count across the most recent broadcast
+// cycle's per-group builds. Falls back to a crude derivation from total
+// resource count before the first broadcast (or when all clients have been
+// disconnected for an entire cycle).
+//
+// Ladder: ≤500 → 1s, ≤2000 → 2s, ≤5000 → 5s, >5000 → 15s. Minimum is 1s by
+// design — even at the smallest cluster scale we don't need faster topology
+// refreshes than that, and SSE k8s_event frames (which fire immediately, not
+// on this debounce) cover the case where the user wants to see individual
+// resource state changes in real time.
+//
+// The lastBroadcastMaxEstimated input reflects only currently-active client
+// groups, which means a namespace switch settles within one debounce cycle
+// (the next broadcast updates the value, and the cycle after that uses the
+// fresh value). A max taken over a sample window of recent builds would
+// instead keep a brief stint on a big namespace visible for many cycles
+// after the user switched away.
+func topologyDebounceFor(lastBroadcastMaxEstimated int64, cache interface{ GetResourceCount() int }) time.Duration {
+	estimated := lastBroadcastMaxEstimated
+	if estimated == 0 && cache != nil {
+		// No broadcasts recorded yet, or no clients connected during the
+		// last cycle. Use raw resource count divided by 5 as a crude proxy —
+		// most resources don't become topology nodes (events, secrets,
+		// configmaps).
+		estimated = int64(cache.GetResourceCount()) / 5
+	}
+	switch {
+	case estimated > 5000:
+		return 15 * time.Second
+	case estimated > 2000:
+		return 5 * time.Second
+	case estimated > 500:
+		return 2 * time.Second
+	default:
+		return 1 * time.Second
+	}
 }
 
 // safeSend sends an event to a channel, recovering from panic if the channel is closed
@@ -76,7 +180,9 @@ func safeSend(ch chan SSEEvent, event SSEEvent) {
 	select {
 	case ch <- event:
 	default:
-		// Channel full, skip
+		// Channel full, skip. Counted in perfstats so users can see drops
+		// in /api/diagnostics without enabling any flag.
+		perfstats.IncSSEDrop()
 	}
 }
 
@@ -98,14 +204,18 @@ func safeSendBlocking(ch chan SSEEvent, event SSEEvent, timeout time.Duration) b
 
 // NewSSEBroadcaster creates a new SSE broadcaster
 func NewSSEBroadcaster() *SSEBroadcaster {
-	return &SSEBroadcaster{
+	b := &SSEBroadcaster{
 		clients:     make(map[chan SSEEvent]ClientInfo),
 		register:    make(chan clientRegistration),
 		unregister:  make(chan chan SSEEvent),
 		stopCh:      make(chan struct{}),
 		watchStopCh: make(chan struct{}),
 		warmupDone:  make(chan struct{}),
+		topoTrigger: make(chan struct{}, 1),
 	}
+	b.topoEpochAtCycleStart = b.topoEpoch.Load
+	b.topoBuild = b.broadcastTopologyUpdate
+	return b
 }
 
 // NewSSEBroadcasterFor creates a broadcaster backed by a pool entry instead of
@@ -166,9 +276,49 @@ func (b *SSEBroadcaster) Start() {
 	}
 
 	go b.run()
+	go b.topologyWorker()
 	go b.watchResourceChanges()
 	go b.watchDeferredSync()
 	go b.heartbeat()
+}
+
+// requestTopologyBroadcast asks the topology worker to run a broadcast cycle.
+// Never blocks and never runs the build on the caller's goroutine.
+func (b *SSEBroadcaster) requestTopologyBroadcast() {
+	select {
+	case b.topoTrigger <- struct{}{}:
+	default:
+		// A request is already queued; it will pick up the current state.
+	}
+}
+
+// topologyRetryDelay is how long the worker waits before re-arming a trigger it
+// consumed while the cluster view was torn down. Reconnect and context switch
+// both queue their own trigger, so this only covers the window where neither
+// fires — but the token it consumed stood for every request that coalesced into
+// it, so dropping it silently strands the graph until the next cluster change.
+const topologyRetryDelay = 2 * time.Second
+
+// topologyWorker owns every broadcast build, so concurrent triggers (debounce
+// fire, context switch, CRD discovery) coalesce into a single build instead of
+// racing several multi-second ones.
+func (b *SSEBroadcaster) topologyWorker() {
+	for {
+		select {
+		case <-b.stopCh:
+			return
+		case <-b.topoTrigger:
+			if b.topoBuild() || b.ClientCount() == 0 {
+				continue
+			}
+			select {
+			case <-b.stopCh:
+				return
+			case <-time.After(topologyRetryDelay):
+				b.requestTopologyBroadcast()
+			}
+		}
+	}
 }
 
 // registerCRDDiscoveryCallback registers for CRD discovery completion
@@ -176,7 +326,7 @@ func (b *SSEBroadcaster) Start() {
 func (b *SSEBroadcaster) registerCRDDiscoveryCallback() {
 	k8s.OnCRDDiscoveryComplete(func() {
 		log.Printf("SSE broadcaster: CRD discovery complete, broadcasting topology update")
-		b.broadcastTopologyUpdate()
+		b.requestTopologyBroadcast()
 	})
 }
 
@@ -223,7 +373,7 @@ func (b *SSEBroadcaster) watchDeferredSync() {
 					Event: "deferred_ready",
 					Data:  map[string]any{},
 				})
-				b.broadcastTopologyUpdate()
+				b.requestTopologyBroadcast()
 
 				// Signal warmup complete — debounce can drop to normal.
 				// Close the local copy (not b.warmupDone) so a context switch
@@ -276,7 +426,7 @@ func (b *SSEBroadcaster) registerConnectionStateCallback() {
 		// When we become connected, build and broadcast topology to all clients
 		if status.State == k8s.StateConnected {
 			log.Printf("SSE broadcaster: connection became connected, scheduling topology broadcast")
-			go b.broadcastTopologyUpdate()
+			b.requestTopologyBroadcast()
 		}
 	})
 }
@@ -294,13 +444,16 @@ func (b *SSEBroadcaster) registerContextSwitchCallback() {
 		})
 	})
 
-	// Register for context switch completion
-	k8s.OnContextSwitch(func(newContext string) {
-		log.Printf("SSE broadcaster: context switched to %q, clearing cached topology", newContext)
+	resetCacheView := func() {
+		// Bump before clearing: a build already in flight against the previous
+		// cluster must fail its epoch check no matter where it is, including
+		// between this clear and its own write.
+		b.topoEpoch.Add(1)
 
 		// Clear cached topology and dirty flag for the old context
 		b.cachedTopologyMu.Lock()
 		b.cachedTopology = nil
+		b.cachedTopologyIndex = nil
 		b.cachedTopologyDirty = false
 		b.cachedTopologyMu.Unlock()
 
@@ -312,6 +465,12 @@ func (b *SSEBroadcaster) registerContextSwitchCallback() {
 
 		// Restart the resource change watcher for the new cache
 		b.restartResourceWatcher()
+	}
+
+	// Register for context switch completion
+	k8s.OnContextSwitch(func(newContext string) {
+		log.Printf("SSE broadcaster: context switched to %q, clearing cached topology", newContext)
+		resetCacheView()
 
 		// Broadcast context_changed event to all clients
 		b.mu.RLock()
@@ -326,25 +485,35 @@ func (b *SSEBroadcaster) registerContextSwitchCallback() {
 			},
 		}, 2*time.Second)
 
-		// Broadcast the new topology so clients can complete the switch
-		// Run in goroutine to not block the context switch
+		// Broadcast the new topology so clients can complete the switch.
+		// Handed to the worker so the context switch isn't blocked on a build.
 		log.Printf("SSE broadcaster: scheduling topology broadcast")
-		go b.broadcastTopologyUpdate()
+		b.requestTopologyBroadcast()
+	})
+
+	k8s.OnNamespaceRescope(func(namespace string) {
+		log.Printf("SSE broadcaster: namespace cache rescoped to %q, clearing cached topology", k8s.SanitizeForLog(namespace))
+		resetCacheView()
+		log.Printf("SSE broadcaster: scheduling topology broadcast")
+		b.requestTopologyBroadcast()
 	})
 }
 
 // initCachedTopology builds the initial topology cache
 func (b *SSEBroadcaster) initCachedTopology() {
+	epoch := b.topoEpoch.Load()
 	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(b.getCache())).WithDynamic(k8s.NewTopologyDynamicProvider(b.getDynCache(), b.getDiscovery()))
 	opts := topology.DefaultBuildOptions()
 	opts.ViewMode = topology.ViewModeResources
 	// Include ReplicaSets in the cache so relationship lookups work for them
 	opts.IncludeReplicaSets = true
 	opts.ForRelationshipCache = true
+	opts.IncludeSecrets = true
 
 	if topo, err := builder.Build(opts); err == nil {
-		b.updateCachedTopology(topo)
-		log.Printf("Initialized topology cache with %d nodes and %d edges", len(topo.Nodes), len(topo.Edges))
+		if b.updateCachedTopology(topo, epoch) {
+			log.Printf("Initialized topology cache with %d nodes and %d edges", len(topo.Nodes), len(topo.Edges))
+		}
 	} else {
 		log.Printf("Warning: Failed to initialize topology cache: %v", err)
 	}
@@ -376,7 +545,7 @@ func (b *SSEBroadcaster) run() {
 				close(reg.ch) // Signal rejection by closing the channel
 				continue
 			}
-			b.clients[reg.ch] = ClientInfo{Namespaces: reg.namespaces, ViewMode: reg.viewMode, ShowPolicyEffect: reg.showPolicyEffect}
+			b.clients[reg.ch] = ClientInfo{Namespaces: reg.namespaces, ViewMode: reg.viewMode, ShowPolicyEffect: reg.showPolicyEffect, DeniedKinds: reg.deniedKinds, Authorize: reg.authorize}
 			b.mu.Unlock()
 			log.Printf("SSE client connected (namespaces=%v, view=%s), total clients: %d", reg.namespaces, reg.viewMode, len(b.clients))
 
@@ -426,7 +595,6 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 			return
 		}
 		// Cache not ready yet — wait for connection to be established
-		log.Println("SSE broadcaster: cache not ready, waiting for connection...")
 		ch := make(chan struct{}, 1)
 		k8s.OnConnectionChange(func(status k8s.ConnectionStatus) {
 			// Check if this watcher was replaced by a context switch.
@@ -458,7 +626,6 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 				log.Println("Warning: Resource cache still nil after connection")
 				return
 			}
-			log.Println("SSE broadcaster: cache ready, starting resource change watcher")
 		case <-b.stopCh:
 			return
 		case <-watchStop:
@@ -479,14 +646,16 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 	//   jump on every arrival, so we coalesce into 5s windows. The UI is
 	//   already on the home view by this point with a "loading more" hint;
 	//   the slight delay is preferable to a fidgety graph.
-	// - After warmup: re-evaluate based on cluster size. Large clusters (>5000
-	//   resources) use 5s; smaller clusters use 500ms.
+	// - After warmup: scale debounce by the estimated topology node count
+	//   from the most recent builds (the same signal driving the in-builder
+	//   large-cluster optimizations). Minimum 1s — even at small scale we
+	//   don't need faster topology refreshes than that.
 	const warmupDebounce = 5 * time.Second
-	debounceDuration := warmupDebounce
 	b.watchMu.Lock()
 	warmupCh := b.warmupDone // local copy under lock; nil-ed after firing to avoid closed-channel spin
 	b.watchMu.Unlock()
-	log.Printf("SSE watcher: using %v warmup debounce until initial sync completes", debounceDuration)
+	warmupComplete := false
+	log.Printf("SSE watcher: using %v warmup debounce until initial sync completes", warmupDebounce)
 
 	debounceTimer := time.NewTimer(0)
 	<-debounceTimer.C // drain initial timer
@@ -501,15 +670,9 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 			return
 
 		case <-warmupCh:
-			// Warmup complete — re-evaluate debounce based on actual cluster size
 			warmupCh = nil // prevent closed-channel spin on next iteration
-			resourceCount := cache.GetResourceCount()
-			if resourceCount > 5000 {
-				debounceDuration = 5 * time.Second
-			} else {
-				debounceDuration = 500 * time.Millisecond
-			}
-			log.Printf("SSE watcher: warmup complete (%d resources), switching to %v debounce", resourceCount, debounceDuration)
+			warmupComplete = true
+			log.Printf("SSE watcher: warmup complete (%d resources), debounce now dynamic by estimated node count (min 1s)", cache.GetResourceCount())
 
 		case change, ok := <-changes:
 			if !ok {
@@ -520,47 +683,81 @@ func (b *SSEBroadcaster) watchResourceChanges() {
 			if change.Kind == "Event" || change.Operation == "delete" ||
 				(change.Kind == "Pod" && change.Operation != "update") ||
 				change.Diff != nil { // Also broadcast updates with meaningful diffs
-				eventData := map[string]any{
-					"kind":      change.Kind,
-					"namespace": change.Namespace,
-					"name":      change.Name,
-					"operation": change.Operation,
-				}
-				// Include diff info if available
-				if change.Diff != nil {
-					eventData["diff"] = map[string]any{
-						"fields":  change.Diff.Fields,
-						"summary": change.Diff.Summary,
+				// Resolve the GVR for per-kind authorization. The dynamic cache
+				// stamps the exact GVR on the change (disambiguates CRD kind
+				// collisions); the typed cache leaves it empty, so resolve from
+				// Kind — unambiguous for the well-known typed kinds.
+				group, resource := change.Group, change.Resource
+				namespace := change.Namespace
+				if resource == "" {
+					if g, r, clusterScoped, ok := k8s.ResolveChangeGVR(change.Kind, change.Group); ok {
+						group, resource = g, r
+						if clusterScoped {
+							namespace = ""
+						}
 					}
 				}
-				b.Broadcast(SSEEvent{
+				eventData := resourceChangeEventData(change, group)
+				b.broadcastResourceChange(SSEEvent{
 					Event: "k8s_event",
 					Data:  eventData,
-				})
+				}, namespace, group, resource, change.Kind)
 			}
 
-			// Schedule debounced topology update
+			// Schedule debounced topology update. Re-evaluate debounce on
+			// every reset so a cluster that grows past a ladder threshold
+			// starts coalescing more aggressively without restart, and so
+			// a namespace switch (which changes the active client groups
+			// and therefore the next broadcast's max estimate) settles
+			// within one debounce cycle.
 			if !pendingUpdate {
-				debounceTimer.Reset(debounceDuration)
+				dur := warmupDebounce
+				if warmupComplete {
+					dur = topologyDebounceFor(b.lastBroadcastMaxEstimated.Load(), cache)
+				}
+				debounceTimer.Reset(dur)
 				pendingUpdate = true
 			}
 
 		case <-debounceTimer.C:
 			if pendingUpdate {
 				pendingUpdate = false
-				b.broadcastTopologyUpdate()
+				b.requestTopologyBroadcast()
 			}
 		}
 	}
 }
 
-// broadcastTopologyUpdate sends the current topology to all clients
-func (b *SSEBroadcaster) broadcastTopologyUpdate() {
-	// Skip if resource cache is torn down (e.g. during context switch).
-	// The next successful connection will trigger a fresh build.
-	if b.getCache() == nil {
-		return
+func resourceChangeEventData(change k8s.ResourceChange, group string) map[string]any {
+	eventData := map[string]any{
+		"kind":      change.Kind,
+		"group":     group,
+		"namespace": change.Namespace,
+		"name":      change.Name,
+		"operation": change.Operation,
 	}
+	if change.Diff != nil {
+		eventData["diff"] = map[string]any{
+			"fields":  change.Diff.Fields,
+			"summary": change.Diff.Summary,
+		}
+	}
+	return eventData
+}
+
+// broadcastTopologyUpdate sends the current topology to all clients. Reports
+// false when the cluster view was torn down and nothing could be built, so the
+// worker can re-arm the trigger it consumed instead of dropping it.
+func (b *SSEBroadcaster) broadcastTopologyUpdate() bool {
+	// Skip if resource cache is torn down (e.g. during context switch).
+	if b.getCache() == nil {
+		return false
+	}
+
+	// The cluster this cycle describes. A switch landing mid-cycle re-triggers
+	// the worker, so abandoning here costs nothing and keeps the previous
+	// cluster's graph off the wire.
+	epoch := b.topoEpochAtCycleStart()
 
 	b.mu.RLock()
 	clients := make(map[chan SSEEvent]ClientInfo, len(b.clients))
@@ -570,27 +767,43 @@ func (b *SSEBroadcaster) broadcastTopologyUpdate() {
 	if len(clients) == 0 {
 		// No clients — mark the relationship cache as dirty so it gets
 		// rebuilt on next GetCachedTopology() call. Skip the expensive build.
-		b.cachedTopologyMu.Lock()
-		b.cachedTopologyDirty = true
-		b.cachedTopologyMu.Unlock()
-		return
+		b.markCachedTopologyDirty()
+		// Forget the last cycle's estimate so a future session doesn't inherit
+		// a disconnected session's debounce (a small namespace shouldn't keep a
+		// big one's 15s cadence). topologyDebounceFor falls back to the resource-
+		// count proxy until the next broadcast records a real estimate.
+		b.lastBroadcastMaxEstimated.Store(0)
+		return true
 	}
 
-	log.Printf("Broadcasting topology update to %d clients", len(clients))
+	// Checked before the full-topology build, which is the most expensive one
+	// in the cycle (every namespace, ReplicaSets included): a switch that has
+	// already landed makes it wrong before it costs anything, and the reset
+	// queued its own trigger to replace it.
+	if b.topoEpoch.Load() != epoch {
+		return b.abandonCycleForNewCluster()
+	}
 
 	// During warmup, skip the expensive full-topology cache build. Nobody is
 	// clicking into resource details while the connecting spinner is showing,
 	// so the relationship cache isn't needed yet. Mark dirty for lazy rebuild.
 	if b.isWarmingUp() {
-		b.cachedTopologyMu.Lock()
-		b.cachedTopologyDirty = true
-		b.cachedTopologyMu.Unlock()
+		b.markCachedTopologyDirty()
 	} else {
 		if fullTopo, err := b.buildFullTopology(); err == nil {
-			b.updateCachedTopology(fullTopo)
+			// A rejected write leaves the new cluster with nothing cached, so
+			// leave the cache dirty for the next reader to rebuild — the same
+			// rule the on-demand rebuild path follows.
+			if !b.updateCachedTopology(fullTopo, epoch) {
+				b.markCachedTopologyDirty()
+			}
 		} else {
 			log.Printf("Error building full topology for cache: %v", err)
 		}
+	}
+
+	if b.topoEpoch.Load() != epoch {
+		return b.abandonCycleForNewCluster()
 	}
 
 	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(b.getCache())).WithDynamic(k8s.NewTopologyDynamicProvider(b.getDynCache(), b.getDiscovery()))
@@ -600,26 +813,45 @@ func (b *SSEBroadcaster) broadcastTopologyUpdate() {
 	// Note: namespaces are pre-sorted at subscription time for consistent grouping
 	type clientKey struct {
 		namespacesKey    string // comma-separated sorted namespaces
+		deniedKindsKey   string // comma-separated sorted denied cluster-scoped kinds
 		viewMode         string
 		showPolicyEffect bool
 	}
 	type clientGroup struct {
 		namespaces       []string
 		showPolicyEffect bool
-		channels         []chan SSEEvent
+		deniedKinds      map[topology.NodeKind]bool
+		clients          map[chan SSEEvent]ClientInfo
 	}
 	clientGroups := make(map[clientKey]*clientGroup)
 	for ch, info := range clients {
 		nsKey := strings.Join(info.Namespaces, ",") // namespaces already sorted at subscribe time
-		key := clientKey{namespacesKey: nsKey, viewMode: info.ViewMode, showPolicyEffect: info.ShowPolicyEffect}
+		// Users with identical namespace + cluster-scoped RBAC share one frame;
+		// a user denied cluster-scoped kinds gets a distinct, stripped frame
+		// rather than the unfiltered bytes of a more-privileged peer.
+		key := clientKey{namespacesKey: nsKey, deniedKindsKey: deniedKindsKey(info.DeniedKinds), viewMode: info.ViewMode, showPolicyEffect: info.ShowPolicyEffect}
 		if clientGroups[key] == nil {
-			clientGroups[key] = &clientGroup{namespaces: info.Namespaces, showPolicyEffect: info.ShowPolicyEffect}
+			clientGroups[key] = &clientGroup{namespaces: info.Namespaces, showPolicyEffect: info.ShowPolicyEffect, deniedKinds: info.DeniedKinds, clients: make(map[chan SSEEvent]ClientInfo)}
 		}
-		clientGroups[key].channels = append(clientGroups[key].channels, ch)
+		clientGroups[key].clients[ch] = info
 	}
 
-	// Build topology for each group and send
+	// Build topology for each group and send. Pre-marshal once per group so
+	// the same bytes go out to every client in the group (the per-client SSE
+	// writer would otherwise re-marshal the same large topology N times).
+	// Also gives us a single point to record payload bytes and the max
+	// estimated node count across active groups — the latter drives the
+	// next cycle's debounce ladder.
+	var maxEstimated int64
+	published := false
 	for key, group := range clientGroups {
+		// Re-checked per group, not just once: a cycle with many groups is
+		// many builds long, and every one after the switch is both wrong and
+		// time the new cluster's build spends waiting for this one to finish.
+		if b.topoEpoch.Load() != epoch {
+			return b.abandonCycleForNewCluster()
+		}
+
 		opts := topology.DefaultBuildOptions()
 		opts.Namespaces = group.namespaces
 		if key.viewMode == "traffic" {
@@ -632,16 +864,179 @@ func (b *SSEBroadcaster) broadcastTopologyUpdate() {
 			log.Printf("Error building topology for broadcast: %v", err)
 			continue
 		}
+		if b.topoEpoch.Load() != epoch {
+			return b.abandonCycleForNewCluster()
+		}
+		topo.StripNodeKinds(group.deniedKinds)
 
-		event := SSEEvent{
-			Event: "topology",
-			Data:  topo,
+		if int64(topo.EstimatedNodes) > maxEstimated {
+			maxEstimated = int64(topo.EstimatedNodes)
 		}
 
-		for _, ch := range group.channels {
-			safeSend(ch, event)
+		// A synthesized NodeClass kind, cluster-scoped Crossplane XR/MR nodes,
+		// and Calico policy nodes each contain independently authorized provider
+		// APIs. Regroup against the exact tuples present in this build, then
+		// marshal once per effective provider permission set.
+		type nodeClassGroup struct {
+			allowed        map[topology.SARTuple]bool
+			allowedDynamic map[topology.SARTuple]bool
+			allowedCalico  map[topology.SARTuple]bool
+			allowedSecrets map[topology.SARTuple]bool
+			channels       []chan SSEEvent
+		}
+		nodeClassGroups := make(map[string]*nodeClassGroup)
+		for ch, info := range group.clients {
+			authorize := nodeClassAuthorizer(info.Authorize)
+			allowed := authorizedNodeClassTuples(topo, authorize)
+			allowedDynamic := authorizedClusterScopedDynamicTuples(topo, authorize)
+			allowedCalico := authorizedCalicoPolicyTuples(topo, info.Authorize)
+			allowedSecrets := authorizedSecretTuples(topo, info.Authorize)
+			authKey := nodeClassTuplesKey(allowed) + "\x02" + nodeClassTuplesKey(allowedDynamic) + "\x03" + sarTuplesKey(allowedCalico) + "\x04" + sarTuplesKey(allowedSecrets)
+			if nodeClassGroups[authKey] == nil {
+				nodeClassGroups[authKey] = &nodeClassGroup{allowed: allowed, allowedDynamic: allowedDynamic, allowedCalico: allowedCalico, allowedSecrets: allowedSecrets}
+			}
+			nodeClassGroups[authKey].channels = append(nodeClassGroups[authKey].channels, ch)
+		}
+		for _, authGroup := range nodeClassGroups {
+			filtered := cloneTopology(topo)
+			filtered.StripNodeClassesExcept(authGroup.allowed)
+			filtered.StripClusterScopedDynamicExcept(authGroup.allowedDynamic)
+			filtered.StripCalicoPoliciesExcept(authGroup.allowedCalico)
+			filtered.StripSecretsExcept(authGroup.allowedSecrets)
+			data, marshalErr := json.Marshal(filtered)
+			if marshalErr != nil {
+				log.Printf("Error marshaling topology for broadcast: %v", marshalErr)
+				continue
+			}
+			perfstats.RecordTopologyPayload(len(data))
+			event := SSEEvent{Event: "topology", Data: json.RawMessage(data)}
+			for _, ch := range authGroup.channels {
+				safeSend(ch, event)
+			}
+			published = true
 		}
 	}
+
+	// One broadcast cycle = one debounce fire that reached clients. Counted on
+	// the way out rather than on entry so a cycle abandoned for the previous
+	// cluster, or one where every group's build errored, isn't reported as a
+	// broadcast that happened.
+	if published {
+		perfstats.IncSSEBroadcast()
+	}
+
+	// Store the max for the next cycle's debounce decision. Stored even
+	// when maxEstimated stayed 0 (eg. every build errored) — that just
+	// falls through to the bootstrap proxy in topologyDebounceFor.
+	b.lastBroadcastMaxEstimated.Store(maxEstimated)
+	return true
+}
+
+// deniedKindsKey builds a stable grouping key from a denied-kinds set so that
+// clients with the same effective cluster-scoped RBAC share a pre-marshaled
+// frame. Empty (full access) collapses to "" — the common case.
+func deniedKindsKey(deny map[topology.NodeKind]bool) string {
+	if len(deny) == 0 {
+		return ""
+	}
+	kinds := make([]string, 0, len(deny))
+	for k := range deny {
+		kinds = append(kinds, string(k))
+	}
+	sort.Strings(kinds)
+	return strings.Join(kinds, ",")
+}
+
+// nodeClassAuthorizer narrows the per-kind change authorizer to the exact
+// provider resource carried by a NodeClass topology node. NodeClass kinds are
+// cluster-scoped and unbounded (one CRD per provider), so the gate must ask
+// about the node's own group/resource rather than a finite kind table. A nil
+// authorizer fails closed: an unwired caller must not widen NodeClass
+// visibility.
+func nodeClassAuthorizer(authorize func(group, resource, namespace, verb string) bool) func(topology.SARTuple) bool {
+	return func(tuple topology.SARTuple) bool {
+		if authorize == nil {
+			return false
+		}
+		return authorize(tuple.Group, tuple.Resource, "", "list")
+	}
+}
+
+func authorizedNodeClassTuples(topo *topology.Topology, authorize func(topology.SARTuple) bool) map[topology.SARTuple]bool {
+	allowed := make(map[topology.SARTuple]bool)
+	if authorize == nil {
+		return allowed
+	}
+	for _, tuple := range topo.NodeClassRBACTuples() {
+		if authorize(tuple) {
+			allowed[tuple] = true
+		}
+	}
+	return allowed
+}
+
+func authorizedClusterScopedDynamicTuples(topo *topology.Topology, authorize func(topology.SARTuple) bool) map[topology.SARTuple]bool {
+	allowed := make(map[topology.SARTuple]bool)
+	if authorize == nil {
+		return allowed
+	}
+	for _, tuple := range topo.ClusterScopedDynamicRBACTuples() {
+		if authorize(tuple) {
+			allowed[tuple] = true
+		}
+	}
+	return allowed
+}
+
+// authorizedCalicoPolicyTuples applies the client's exact API-group and
+// namespace authorization to the Calico policy identities present in a
+// topology. A missing authorizer authorizes nothing, matching how the NodeClass
+// and cluster-scoped dynamic filters treat it.
+func authorizedCalicoPolicyTuples(topo *topology.Topology, authorize func(group, resource, namespace, verb string) bool) map[topology.SARTuple]bool {
+	allowed := make(map[topology.SARTuple]bool)
+	if topo == nil || authorize == nil {
+		return allowed
+	}
+	for _, tuple := range topo.CalicoPolicyRBACTuples() {
+		if authorize(tuple.Group, tuple.Resource, tuple.Namespace, "list") {
+			allowed[tuple] = true
+		}
+	}
+	return allowed
+}
+
+func sarTuplesKey(tuples map[topology.SARTuple]bool) string {
+	if len(tuples) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(tuples))
+	for tuple := range tuples {
+		keys = append(keys, tuple.Group+"\x00"+tuple.Resource+"\x00"+tuple.Namespace)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, "\x01")
+}
+
+func nodeClassTuplesKey(tuples map[topology.SARTuple]bool) string {
+	if len(tuples) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(tuples))
+	for tuple := range tuples {
+		keys = append(keys, tuple.Group+"\x00"+tuple.Resource)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, "\x01")
+}
+
+func cloneTopology(topo *topology.Topology) *topology.Topology {
+	if topo == nil {
+		return nil
+	}
+	clone := *topo
+	clone.Nodes = append([]topology.Node(nil), topo.Nodes...)
+	clone.Edges = append([]topology.Edge(nil), topo.Edges...)
+	return &clone
 }
 
 // heartbeat sends periodic heartbeats to keep connections alive
@@ -664,8 +1059,27 @@ func (b *SSEBroadcaster) heartbeat() {
 	}
 }
 
+// premarshalEventData serializes event.Data to json.RawMessage once, before
+// fan-out, so the per-client SSE writer emits the same bytes to every connected
+// client instead of reflection-marshaling the identical payload N times (once
+// per tab). Frames whose Data is already json.RawMessage (the topology path)
+// pass through untouched. A marshal error leaves Data as-is — the per-client
+// writer then surfaces it via its existing error path.
+func premarshalEventData(event SSEEvent) SSEEvent {
+	if _, ok := event.Data.(json.RawMessage); ok {
+		return event
+	}
+	data, err := json.Marshal(event.Data)
+	if err != nil {
+		return event
+	}
+	event.Data = json.RawMessage(data)
+	return event
+}
+
 // Broadcast sends an event to all connected clients
 func (b *SSEBroadcaster) Broadcast(event SSEEvent) {
+	event = premarshalEventData(event)
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
@@ -704,8 +1118,86 @@ func (b *SSEBroadcaster) BroadcastReliable(event SSEEvent, timeout time.Duration
 	}
 }
 
+// broadcastResourceChange sends a per-resource change frame (k8s_event, which
+// can carry a spec/data diff) only to clients whose RBAC plausibly permits the
+// resource. Namespaced changes go only to clients whose RBAC-filtered namespace
+// set includes the namespace; cluster-scoped changes go only to clients not
+// denied that kind (the topology denied set resolved at subscribe time).
+//
+// This is a PARTIAL gate, not a complete authorization boundary, and is a big
+// reduction over the previous broadcast-to-all (which leaked every diff to every
+// client). Two gaps remain, both needing per-(group,resource) state this path
+// doesn't carry yet (ResourceChange has only Kind):
+//   - namespaced kinds the user can't read WITHIN an allowed namespace (e.g.
+//     Secrets/Roles for a list-pods-only viewer) still pass the namespace check;
+//   - cluster-scoped kinds outside the topology set (ClusterRole, webhooks,
+//     cluster-scoped CRDs) aren't in DeniedKinds, and kind-string matching misses
+//     CRD variants (EC2NodeClass vs synthesized NodeClass).
+//
+// The group/resource come from the change's GVR (dynamic cache) or are resolved
+// from its Kind (typed cache); an empty resource means the kind couldn't be
+// resolved and the frame fails closed for authenticated clients.
+//
+// Clients are snapshotted under the lock, then authorized + sent WITHOUT it: an
+// authorization can miss the per-user memo and do a SAR round-trip, and holding
+// b.mu across that would stall registrations and other broadcasts. safeSend
+// tolerates a channel closed by a concurrent Unsubscribe after the snapshot.
+func (b *SSEBroadcaster) broadcastResourceChange(event SSEEvent, namespace, group, resource, kind string) {
+	event = premarshalEventData(event)
+
+	type target struct {
+		ch   chan SSEEvent
+		info ClientInfo
+	}
+	b.mu.RLock()
+	targets := make([]target, 0, len(b.clients))
+	for ch, info := range b.clients {
+		targets = append(targets, target{ch: ch, info: info})
+	}
+	b.mu.RUnlock()
+
+	for _, t := range targets {
+		if clientCanSeeChange(t.info, namespace, group, resource, kind) {
+			safeSend(t.ch, event)
+		}
+	}
+}
+
+// clientCanSeeChange reports whether a client's RBAC allows a change frame for
+// the given (namespace, group, resource, kind).
+func clientCanSeeChange(info ClientInfo, namespace, group, resource, kind string) bool {
+	if info.Authorize == nil {
+		// No authorizer wired (tests / defensive): fall back to the namespace +
+		// topology-denied-kind gate.
+		if namespace != "" {
+			return info.Namespaces == nil || slices.Contains(info.Namespaces, namespace)
+		}
+		return !info.DeniedKinds[topology.NodeKind(kind)]
+	}
+
+	if namespace != "" {
+		// Namespaced change: must see the namespace (nil = all) AND hold read on
+		// this kind within it.
+		if info.Namespaces != nil && !slices.Contains(info.Namespaces, namespace) {
+			return false
+		}
+		if resource == "" {
+			return false // unresolved kind under auth — fail closed
+		}
+		return info.Authorize(group, resource, namespace, "list")
+	}
+
+	// Cluster-scoped change (no namespace): require the cluster-scoped read.
+	if resource == "" {
+		return false
+	}
+	return info.Authorize(group, resource, "", "list")
+}
+
 // Subscribe adds a new SSE client. Returns nil if max clients reached.
-func (b *SSEBroadcaster) Subscribe(namespaces []string, viewMode string, showPolicyEffect ...bool) chan SSEEvent {
+// authorize gates per-kind change frames for the client's user (may be nil in
+// tests / when no authorizer is wired).
+func (b *SSEBroadcaster) Subscribe(namespaces []string, viewMode string, deniedKinds map[topology.NodeKind]bool, authorize func(group, resource, namespace, verb string) bool, showPolicyEffect ...bool) chan SSEEvent {
 	// Check client count before creating the channel to fail fast
 	b.mu.RLock()
 	clientCount := len(b.clients)
@@ -727,7 +1219,7 @@ func (b *SSEBroadcaster) Subscribe(namespaces []string, viewMode string, showPol
 
 	policyEffect := len(showPolicyEffect) > 0 && showPolicyEffect[0]
 	ch := make(chan SSEEvent, 10)
-	b.register <- clientRegistration{ch: ch, namespaces: sortedNs, viewMode: viewMode, showPolicyEffect: policyEffect}
+	b.register <- clientRegistration{ch: ch, namespaces: sortedNs, viewMode: viewMode, showPolicyEffect: policyEffect, deniedKinds: deniedKinds, authorize: authorize}
 	return ch
 }
 
@@ -777,42 +1269,117 @@ func (b *SSEBroadcaster) GetCachedTopology() *topology.Topology {
 	return topo
 }
 
+// GetCachedTopologyWithIndex returns the cached topology together with its
+// inverted edge index, building (and memoizing) the index on first use after a
+// topology refresh. Relationship lookups that pass the index skip the O(edges)
+// scan that edgesForNode/walkTopmostOwner otherwise do per call, so reusing one
+// index across drawer opens turns repeated O(E) work into O(in-degree) per lookup.
+//
+// The returned (topo, index) pair is always consistent: the index is built from
+// the exact topo returned. When the topology is replaced between the two reads,
+// a fresh index is built for the returned topo without polluting the cache.
+func (b *SSEBroadcaster) GetCachedTopologyWithIndex() (*topology.Topology, *topology.RelationshipsIndex) {
+	topo := b.GetCachedTopology() // handles lazy rebuild when dirty
+	if topo == nil {
+		return nil, nil
+	}
+
+	b.cachedTopologyMu.RLock()
+	idx := b.cachedTopologyIndex
+	current := b.cachedTopology
+	b.cachedTopologyMu.RUnlock()
+	if idx != nil && current == topo {
+		return topo, idx
+	}
+
+	// Build outside the lock — IndexByResource is O(edges).
+	built := topology.IndexByResource(topo)
+	b.cachedTopologyMu.Lock()
+	if b.cachedTopology == topo {
+		b.cachedTopologyIndex = built
+	}
+	b.cachedTopologyMu.Unlock()
+	return topo, built
+}
+
 // rebuildCachedTopology rebuilds the full topology for relationship lookups.
 // Returns true if the rebuild succeeded, false otherwise.
 func (b *SSEBroadcaster) rebuildCachedTopology() bool {
 	if b.getCache() == nil {
 		return false
 	}
+	epoch := b.topoEpoch.Load()
 	if fullTopo, err := b.buildFullTopology(); err == nil {
-		b.updateCachedTopology(fullTopo)
-		return true
+		// A rejected write leaves nothing cached for the new cluster, so the
+		// caller must re-dirty and let the next read rebuild against it.
+		return b.updateCachedTopology(fullTopo, epoch)
 	} else {
 		log.Printf("Error rebuilding topology cache on demand: %v", err)
 		return false
 	}
 }
 
-// updateCachedTopology stores a full topology for relationship lookups
-func (b *SSEBroadcaster) updateCachedTopology(topo *topology.Topology) {
+// abandonCycleForNewCluster drops a cycle whose cluster the UI has already left.
+// The relationship cache is flagged on the way out: whatever it holds was built
+// for the previous cluster, and the reset that bumped the epoch left it empty
+// and clean, which a reader would otherwise take as "this cluster has no
+// topology". Reports the cycle as run — the reset queued its own trigger, so
+// there is nothing for the worker to re-arm.
+func (b *SSEBroadcaster) abandonCycleForNewCluster() bool {
+	b.markCachedTopologyDirty()
+	return true
+}
+
+// markCachedTopologyDirty flags the relationship cache for rebuild on the next
+// read. Used wherever a cycle declines to store a graph — no clients, warmup, or
+// a build rejected for the previous cluster — so a reader rebuilds rather than
+// being told an empty cache is current.
+func (b *SSEBroadcaster) markCachedTopologyDirty() {
+	b.cachedTopologyMu.Lock()
+	b.cachedTopologyDirty = true
+	b.cachedTopologyMu.Unlock()
+}
+
+// updateCachedTopology stores a full topology for relationship lookups, unless
+// the cluster view was reset while it was being built. Reports whether it
+// stored.
+func (b *SSEBroadcaster) updateCachedTopology(topo *topology.Topology, epoch uint64) bool {
 	b.cachedTopologyMu.Lock()
 	defer b.cachedTopologyMu.Unlock()
+	if b.topoEpoch.Load() != epoch {
+		return false
+	}
 	b.cachedTopology = topo
+	b.cachedTopologyIndex = nil // rebuilt lazily on next relationship lookup
 	b.cachedTopologyDirty = false
+	return true
 }
 
 // buildFullTopology constructs a full topology (all namespaces, resources view)
-// for relationship lookups. Used by both broadcast and lazy rebuild paths.
+// for relationship lookups against the process-global caches.
+func buildFullTopology() (*topology.Topology, error) {
+	return buildFullTopologyFrom(k8s.GetResourceCache(), k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery())
+}
+
+// buildFullTopology is the package function against this broadcaster's
+// caches, which are a pool entry's for per-context broadcasters. Used by both
+// broadcast and lazy rebuild paths.
 func (b *SSEBroadcaster) buildFullTopology() (*topology.Topology, error) {
-	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(b.getCache())).WithDynamic(k8s.NewTopologyDynamicProvider(b.getDynCache(), b.getDiscovery()))
+	return buildFullTopologyFrom(b.getCache(), b.getDynCache(), b.getDiscovery())
+}
+
+func buildFullTopologyFrom(cache *k8s.ResourceCache, dynCache *k8s.DynamicResourceCache, discovery *k8s.ResourceDiscovery) (*topology.Topology, error) {
+	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(cache)).WithDynamic(k8s.NewTopologyDynamicProvider(dynCache, discovery))
 	opts := topology.DefaultBuildOptions()
 	opts.ViewMode = topology.ViewModeResources
 	opts.IncludeReplicaSets = true
 	opts.ForRelationshipCache = true
+	opts.IncludeSecrets = true
 	return builder.Build(opts)
 }
 
 // HandleSSE is the HTTP handler for the SSE endpoint
-func (b *SSEBroadcaster) HandleSSE(w http.ResponseWriter, r *http.Request) {
+func (b *SSEBroadcaster) HandleSSE(w http.ResponseWriter, r *http.Request, deniedKinds map[topology.NodeKind]bool, authorize func(group, resource, namespace, verb string) bool) {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -835,7 +1402,7 @@ func (b *SSEBroadcaster) HandleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Subscribe to events
-	eventCh := b.Subscribe(namespaces, viewMode, policyEffect)
+	eventCh := b.Subscribe(namespaces, viewMode, deniedKinds, authorize, policyEffect)
 	if eventCh == nil {
 		http.Error(w, "Too many SSE connections", http.StatusServiceUnavailable)
 		return
@@ -863,6 +1430,10 @@ func (b *SSEBroadcaster) HandleSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Send initial topology immediately (only if connected)
 	if status.State == k8s.StateConnected {
+		// Same rule as the broadcast cycle: this build reads the caches for as
+		// long as any other, so a switch landing inside it would otherwise make
+		// the previous cluster's graph this client's first frame.
+		epoch := b.topoEpoch.Load()
 		builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(b.getCache())).WithDynamic(k8s.NewTopologyDynamicProvider(b.getDynCache(), b.getDiscovery()))
 		opts := topology.DefaultBuildOptions()
 		opts.Namespaces = namespaces
@@ -870,7 +1441,12 @@ func (b *SSEBroadcaster) HandleSSE(w http.ResponseWriter, r *http.Request) {
 			opts.ViewMode = topology.ViewModeTraffic
 		}
 		opts.ShowPolicyEffect = policyEffect
-		if topo, err := builder.Build(opts); err == nil {
+		if topo, err := builder.Build(opts); err == nil && b.topoEpoch.Load() == epoch {
+			topo.StripNodeKinds(deniedKinds)
+			topo.StripNodeClassesExcept(authorizedNodeClassTuples(topo, nodeClassAuthorizer(authorize)))
+			topo.StripClusterScopedDynamicExcept(authorizedClusterScopedDynamicTuples(topo, nodeClassAuthorizer(authorize)))
+			topo.StripCalicoPoliciesExcept(authorizedCalicoPolicyTuples(topo, authorize))
+			topo.StripSecretsExcept(authorizedSecretTuples(topo, authorize))
 			data, marshalErr := json.Marshal(topo)
 			if marshalErr != nil {
 				log.Printf("SSE: failed to marshal initial topology: %v", marshalErr)
@@ -890,7 +1466,18 @@ func (b *SSEBroadcaster) HandleSSE(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			data, err := json.Marshal(event.Data)
+			// Frames are pre-marshaled to json.RawMessage once before fan-out
+			// (premarshalEventData), so for the common case write the shared
+			// bytes directly — re-marshaling here would re-serialize the same
+			// payload for every connected client. Fall back to marshaling for
+			// any frame that wasn't pre-marshaled.
+			var data []byte
+			var err error
+			if raw, ok := event.Data.(json.RawMessage); ok {
+				data = raw
+			} else {
+				data, err = json.Marshal(event.Data)
+			}
 			if err != nil {
 				// Log the error and notify client instead of silently dropping
 				log.Printf("SSE: failed to marshal event %q: %v", event.Event, err)
@@ -913,4 +1500,19 @@ func (b *SSEBroadcaster) HandleSSE(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+func authorizedSecretTuples(topo *topology.Topology, authorize func(group, resource, namespace, verb string) bool) map[topology.SARTuple]bool {
+	allowed := map[topology.SARTuple]bool{}
+	if authorize == nil {
+		return allowed
+	}
+	tuples := topo.SecretRBACTuples()
+	clusterWide := len(tuples) > 0 && authorize("", "secrets", "", "list")
+	for _, tuple := range tuples {
+		if clusterWide || authorize("", "secrets", tuple.Namespace, "list") {
+			allowed[tuple] = true
+		}
+	}
+	return allowed
 }

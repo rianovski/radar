@@ -8,6 +8,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/skyhook-io/radar/internal/desktopenv"
 	"github.com/skyhook-io/radar/internal/errorlog"
 	"github.com/skyhook-io/radar/internal/k8s"
 	prometheuspkg "github.com/skyhook-io/radar/internal/prometheus"
@@ -15,19 +16,22 @@ import (
 	"github.com/skyhook-io/radar/internal/traffic"
 	"github.com/skyhook-io/radar/internal/version"
 	"github.com/skyhook-io/radar/pkg/k8score"
+	"github.com/skyhook-io/radar/pkg/perfstats"
 )
 
 // DiagConfig holds sanitized configuration for the diagnostics endpoint.
 // No sensitive values (kubeconfig paths, Prometheus URLs, etc.).
 type DiagConfig struct {
-	Port             int    `json:"port"`
-	DevMode          bool   `json:"devMode"`
-	Namespace        string `json:"namespace,omitempty"`
-	TimelineStorage  string `json:"timelineStorage"`
-	HistoryLimit     int    `json:"historyLimit"`
-	DebugEvents      bool   `json:"debugEvents"`
-	MCPEnabled       bool   `json:"mcpEnabled"`
-	HasPrometheusURL bool   `json:"hasPrometheusURL"`
+	Port                 int    `json:"port"`
+	DevMode              bool   `json:"devMode"`
+	Namespace            string `json:"namespace,omitempty"`
+	TimelineStorage      string `json:"timelineStorage"`
+	HistoryLimit         int    `json:"historyLimit"`
+	DebugEvents          bool   `json:"debugEvents"`
+	MCPEnabled           bool   `json:"mcpEnabled"`
+	OpenCostCurrency     string `json:"opencostCurrency"`
+	HasPrometheusURL     bool   `json:"hasPrometheusURL"`
+	HasPrometheusHeaders bool   `json:"hasPrometheusHeaders"`
 }
 
 // DiagnosticsSnapshot is the top-level diagnostics response.
@@ -53,6 +57,8 @@ type DiagnosticsSnapshot struct {
 	Permissions         *DiagPermissions             `json:"permissions,omitempty"`
 	APIDiscovery        *DiagAPIDiscovery            `json:"apiDiscovery,omitempty"`
 	SSE                 *DiagSSE                     `json:"sse,omitempty"`
+	Perf                *perfstats.Snapshot          `json:"perf,omitempty"`
+	Desktop             *desktopenv.Snapshot         `json:"desktop,omitempty"`
 	Runtime             *DiagRuntime                 `json:"runtime,omitempty"`
 	Config              *DiagConfig                  `json:"config,omitempty"`
 	RecentErrors        []errorlog.ErrorEntry        `json:"recentErrors,omitempty"`
@@ -74,17 +80,20 @@ type DiagConnection struct {
 // command basenames suitable for inclusion in a public bug report. Helps
 // triage issues like "some clusters don't show up in the switcher" or
 // "can't switch clusters on the desktop app" (radar#411) — the answer
-// typically lives in one of: kubeconfig loading mode, context merge
+// typically lives in one of: kubeconfig loading mode, context-name
 // collisions, shell env enrichment, or an exec auth plugin missing from
 // the desktop app's PATH.
 type DiagKubeconfig struct {
-	Mode                   string   `json:"mode"`                             // in-cluster, single, multi-env, multi-dir, or "" if not initialized
-	FileCount              int      `json:"fileCount"`                        // Number of kubeconfig files loaded
-	ContextCount           int      `json:"contextCount"`                     // Contexts exposed after client-go merge
-	EnrichedFromShell      bool     `json:"enrichedFromShell"`                // Desktop app captured KUBECONFIG from login shell
-	CurrentContextUsesExec bool     `json:"currentContextUsesExec"`           // Current context's AuthInfo uses an exec credential plugin
-	ExecPluginsPresent     []string `json:"execPluginsPresent,omitempty"`     // Exec plugin command basenames resolvable on $PATH
-	ExecPluginsMissing     []string `json:"execPluginsMissing,omitempty"`     // Exec plugin command basenames NOT resolvable on $PATH (smoking gun for desktop-app multi-cluster failures)
+	Mode                       string   `json:"mode"`                         // in-cluster, single, multi-env, multi-dir, multi-source, or "" if not initialized
+	FileCount                  int      `json:"fileCount"`                    // Number of kubeconfig files loaded
+	DirectoryFileCount         int      `json:"directoryFileCount"`           // Loaded files discovered from configured directories
+	ContextCount               int      `json:"contextCount"`                 // Contexts exposed after source resolution
+	EnrichedFromShell          bool     `json:"enrichedFromShell"`            // Desktop app captured KUBECONFIG from login shell
+	KubeconfigEnvIgnored       bool     `json:"kubeconfigEnvIgnored"`         // KUBECONFIG suppressed by configured sources
+	KubeconfigEnvIgnoredReason string   `json:"kubeconfigEnvIgnoredReason"`   // Non-sensitive reason KUBECONFIG was suppressed
+	CurrentContextUsesExec     bool     `json:"currentContextUsesExec"`       // Current context's AuthInfo uses an exec credential plugin
+	ExecPluginsPresent         []string `json:"execPluginsPresent,omitempty"` // Exec plugin command basenames resolvable on $PATH
+	ExecPluginsMissing         []string `json:"execPluginsMissing,omitempty"` // Exec plugin command basenames NOT resolvable on $PATH (smoking gun for desktop-app multi-cluster failures)
 }
 
 // DiagCluster holds cluster detection info.
@@ -104,16 +113,23 @@ type DiagCache struct {
 
 // DiagTimeline holds timeline store info.
 type DiagTimeline struct {
-	StorageType  string `json:"storageType"`
-	TotalEvents  int64  `json:"totalEvents"`
-	OldestEvent  string `json:"oldestEvent,omitempty"`
-	NewestEvent  string `json:"newestEvent,omitempty"`
-	StorageBytes int64  `json:"storageBytes,omitempty"`
-	StoreErrors  int64  `json:"storeErrors"`
-	TotalDrops   int64  `json:"totalDrops"`
+	StorageType string `json:"storageType"`
+	// Degraded reports that the configured persistent backend failed to open
+	// and this session runs on a volatile in-memory fallback — the first thing
+	// to check when history vanished after a restart. StorageType reflects the
+	// ACTUAL store in use, not the configured one.
+	Degraded       bool   `json:"degraded,omitempty"`
+	DegradedReason string `json:"degradedReason,omitempty"`
+	TotalEvents    int64  `json:"totalEvents"`
+	OldestEvent    string `json:"oldestEvent,omitempty"`
+	NewestEvent    string `json:"newestEvent,omitempty"`
+	StorageBytes   int64  `json:"storageBytes,omitempty"`
+	StoreErrors    int64  `json:"storeErrors"`
+	TotalDrops     int64  `json:"totalDrops"`
 
 	// SQLite-only retention/cleanup state.
 	RetentionAge       string `json:"retentionAge,omitempty"`
+	MaxStorageBytes    int64  `json:"maxStorageBytes,omitempty"`
 	LastCleanupAt      string `json:"lastCleanupAt,omitempty"`
 	LastCleanupDeleted int64  `json:"lastCleanupDeletedRows,omitempty"`
 	LastCleanupError   string `json:"lastCleanupError,omitempty"`
@@ -218,11 +234,15 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	// Connection — always available, no cluster needed
 	collectSafe("connection", &errs, func() {
 		status := k8s.GetConnectionStatus()
+		connectionError := status.Error
+		if status.ErrorType == "config" && connectionError != "" {
+			connectionError = "Kubeconfig initialization failed; see local Radar logs for details"
+		}
 		snap.Connection = &DiagConnection{
 			State:       string(status.State),
 			Context:     status.Context,
 			ClusterName: status.ClusterName,
-			Error:       status.Error,
+			Error:       connectionError,
 			ErrorType:   status.ErrorType,
 		}
 	})
@@ -231,13 +251,16 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	collectSafe("kubeconfig", &errs, func() {
 		summary := k8s.GetKubeconfigSummary()
 		snap.Kubeconfig = &DiagKubeconfig{
-			Mode:                   summary.Mode,
-			FileCount:              summary.FileCount,
-			ContextCount:           summary.ContextCount,
-			EnrichedFromShell:      summary.EnrichedFromShell,
-			CurrentContextUsesExec: summary.CurrentContextUsesExec,
-			ExecPluginsPresent:     summary.ExecPluginsPresent,
-			ExecPluginsMissing:     summary.ExecPluginsMissing,
+			Mode:                       summary.Mode,
+			FileCount:                  summary.FileCount,
+			DirectoryFileCount:         summary.DirectoryFileCount,
+			ContextCount:               summary.ContextCount,
+			EnrichedFromShell:          summary.EnrichedFromShell,
+			KubeconfigEnvIgnored:       summary.KubeconfigEnvIgnored,
+			KubeconfigEnvIgnoredReason: summary.KubeconfigEnvIgnoredReason,
+			CurrentContextUsesExec:     summary.CurrentContextUsesExec,
+			ExecPluginsPresent:         summary.ExecPluginsPresent,
+			ExecPluginsMissing:         summary.ExecPluginsMissing,
 		}
 	})
 
@@ -314,8 +337,14 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 		if stats.RetentionAge > 0 {
 			diag.RetentionAge = stats.RetentionAge.String()
 		}
+		diag.MaxStorageBytes = stats.MaxStorageBytes
 		if s.diagConfig != nil {
 			diag.StorageType = s.diagConfig.TimelineStorage
+		}
+		if stats.Degraded {
+			diag.StorageType = "memory"
+			diag.Degraded = true
+			diag.DegradedReason = stats.DegradedReason
 		}
 		snap.Timeline = diag
 	})
@@ -328,10 +357,11 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 		}
 		snapshot := metrics.GetSnapshot()
 		snap.EventPipeline = &DiagEventPipeline{
-			Received:    snapshot.Counters.Received,
-			Dropped:     snapshot.Counters.Dropped,
-			Recorded:    snapshot.Counters.Recorded,
-			RecentDrops: snapshot.RecentDrops,
+			Received: snapshot.Counters.Received,
+			Dropped:  snapshot.Counters.Dropped,
+			Recorded: snapshot.Counters.Recorded,
+			// Compose cluster-scope + per-user RBAC on the drop records (see handleDebugEvents).
+			RecentDrops: s.filterDropsByRBAC(r, timeline.DropsForCluster(snapshot.RecentDrops, k8s.ActiveClusterContext())),
 			Uptime:      snapshot.Uptime,
 		}
 	})
@@ -475,6 +505,24 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 
+	// Perf — always-on counters + sample windows for topology build/SSE
+	// behavior at scale. Cheap to collect (atomic loads + copy of a
+	// 100-entry ring buffer per metric).
+	collectSafe("perf", &errs, func() {
+		perf := perfstats.GetSnapshot()
+		snap.Perf = &perf
+	})
+
+	// Desktop host environment — the display server and WebKit render
+	// overrides decide whether the webview renders at all, and the CLI shares
+	// this endpoint, so gate on actually being the desktop app.
+	collectSafe("desktop", &errs, func() {
+		if !version.IsDesktop() {
+			return
+		}
+		snap.Desktop = desktopenv.Collect()
+	})
+
 	// Runtime
 	collectSafe("runtime", &errs, func() {
 		var m runtime.MemStats
@@ -490,7 +538,9 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	// Config
 	collectSafe("config", &errs, func() {
 		if s.diagConfig != nil {
-			snap.Config = s.diagConfig
+			current := *s.diagConfig
+			current.OpenCostCurrency = s.resolvedOpenCostCurrency()
+			snap.Config = &current
 		}
 	})
 

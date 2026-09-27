@@ -1,0 +1,270 @@
+package opencost
+
+// DefaultCurrentWindow is the lookback every "current cost" query uses. It is
+// exported so a response can report the window its numbers cover instead of
+// leaving the field empty for the caller to guess.
+const DefaultCurrentWindow = "1h"
+
+// Unavailability reasons — returned in the "reason" field when available=false
+// so the frontend can show contextual guidance to the user.
+const (
+	DefaultCurrency           = "USD"
+	ReasonNoPrometheus        = "no_prometheus"  // Prometheus/VictoriaMetrics not found in cluster
+	ReasonNoCostSource        = "no_cost_source" // neither OpenCost metrics nor Kubecost is available
+	ReasonNoMetrics           = "no_metrics"     // Prometheus found but OpenCost metrics not present
+	ReasonQueryError          = "query_error"    // Prometheus found but cost queries failed
+	ReasonAccessDenied        = "access_denied"  // user cannot access the requested resource
+	ReasonNotFound            = "not_found"      // requested resource no longer exists
+	ReasonSourceUnavailable   = "source_unavailable"
+	ReasonAuthentication      = "authentication_error"
+	ReasonConfigMismatch      = "configuration_mismatch"
+	ReasonDeploymentConfig    = "deployment_configuration_error"
+	ReasonHistoryUnsupported  = "history_unsupported"
+	ReasonInsufficientHistory = "insufficient_history"
+)
+
+// HourlyCost bases. On the Prometheus path the cluster total is raised to the
+// summed node cost when nodes cost more than the namespace allocations; that
+// total then already contains unallocated capacity and carries no storage.
+const (
+	HourlyCostBasisAllocated    = "allocated"
+	HourlyCostBasisNodeCapacity = "node_capacity"
+)
+
+// CostSummary is the response for the /api/opencost/summary endpoint.
+type CostSummary struct {
+	TotalNodeCost    *float64 `json:"-"`
+	Available        bool     `json:"available"`
+	Reason           string   `json:"reason,omitempty"` // Set when available=false; see the Reason* constants above.
+	Source           string   `json:"source,omitempty"`
+	DataThrough      string   `json:"dataThrough,omitempty"`
+	Currency         string   `json:"currency"`
+	Window           string   `json:"window,omitempty"`
+	TotalHourlyCost  float64  `json:"totalHourlyCost,omitempty"`
+	TotalStorageCost float64  `json:"totalStorageCost,omitempty"`
+	TotalNetworkCost float64  `json:"totalNetworkCost,omitempty"`
+	TotalIdleCost    float64  `json:"totalIdleCost,omitempty"`
+	// TotalIdleCost adds two different things: node capacity no workload
+	// requested, and requested capacity no workload used. They are recovered
+	// by different actions (removing nodes vs rightsizing), so they are also
+	// reported apart. TotalUnallocatedCost is nil when the source cannot
+	// measure it, and always on a namespace-scoped summary: unrequested node
+	// capacity belongs to the cluster, not to any namespace.
+	TotalUnallocatedCost   *float64 `json:"totalUnallocatedCost,omitempty"`
+	TotalUnusedRequestCost float64  `json:"totalUnusedRequestCost,omitempty"`
+	// TotalAllocatedCost is the sum of the namespace rows. TotalHourlyCost
+	// equals it unless HourlyCostBasis is HourlyCostBasisNodeCapacity.
+	TotalAllocatedCost float64         `json:"totalAllocatedCost,omitempty"`
+	HourlyCostBasis    string          `json:"hourlyCostBasis,omitempty"`
+	ClusterEfficiency  float64         `json:"clusterEfficiency,omitempty"` // 0-100
+	NamespaceScope     []string        `json:"namespaceScope,omitempty"`
+	Namespaces         []NamespaceCost `json:"namespaces,omitempty"`
+}
+
+// NamespaceCost holds per-row cost breakdown. The name reflects the
+// default aggregation; the struct is also used for controller and pod
+// rows — Kind disambiguates (empty = namespace).
+type NamespaceCost struct {
+	Name            string  `json:"name"`
+	Kind            string  `json:"kind,omitempty"`      // "namespace" (default if empty) | "controller" | "pod"
+	Namespace       string  `json:"namespace,omitempty"` // populated for controller/pod rows
+	HourlyCost      float64 `json:"hourlyCost"`
+	CPUCost         float64 `json:"cpuCost"`
+	MemoryCost      float64 `json:"memoryCost"`
+	StorageCost     float64 `json:"storageCost,omitempty"`
+	NetworkCost     float64 `json:"networkCost,omitempty"`
+	CPUUsageCost    float64 `json:"cpuUsageCost,omitempty"`
+	MemoryUsageCost float64 `json:"memoryUsageCost,omitempty"`
+	// UsageUnavailable prevents missing Kubecost usage from being treated as zero when scoped totals are recomputed.
+	UsageUnavailable bool    `json:"-"`
+	Efficiency       float64 `json:"efficiency,omitempty"` // 0-100
+	IdleCost         float64 `json:"idleCost,omitempty"`
+}
+
+// WorkloadCostResponse is the response for the /api/opencost/workloads endpoint.
+type WorkloadCostResponse struct {
+	Available   bool           `json:"available"`
+	Reason      string         `json:"reason,omitempty"`
+	Source      string         `json:"source,omitempty"`
+	Window      string         `json:"window,omitempty"`
+	DataThrough string         `json:"dataThrough,omitempty"`
+	Currency    string         `json:"currency"`
+	Namespace   string         `json:"namespace"`
+	Workloads   []WorkloadCost `json:"workloads"`
+}
+
+type WorkloadCostDetailResponse struct {
+	Available   bool          `json:"available"`
+	Reason      string        `json:"reason,omitempty"`
+	Source      string        `json:"source,omitempty"`
+	Window      string        `json:"window,omitempty"`
+	DataThrough string        `json:"dataThrough,omitempty"`
+	Currency    string        `json:"currency"`
+	Namespace   string        `json:"namespace"`
+	Kind        string        `json:"kind"`
+	Name        string        `json:"name"`
+	Current     *WorkloadCost `json:"current,omitempty"`
+}
+
+// WorkloadCost holds per-workload cost breakdown within a namespace.
+type WorkloadCost struct {
+	Name                 string  `json:"name"`
+	Kind                 string  `json:"kind"` // Deployment, StatefulSet, DaemonSet, Job, standalone, staticpod
+	HourlyCost           float64 `json:"hourlyCost"`
+	CPUCost              float64 `json:"cpuCost"`
+	MemoryCost           float64 `json:"memoryCost"`
+	Replicas             int     `json:"replicas"`
+	CPUUsageCost         float64 `json:"cpuUsageCost,omitempty"`
+	MemoryUsageCost      float64 `json:"memoryUsageCost,omitempty"`
+	CPUUsageAvailable    bool    `json:"cpuUsageAvailable"`
+	MemoryUsageAvailable bool    `json:"memoryUsageAvailable"`
+	CPUAllocationUse     float64 `json:"cpuAllocationUse"`
+	MemoryAllocationUse  float64 `json:"memoryAllocationUse"`
+	Efficiency           float64 `json:"efficiency,omitempty"` // 0-100
+	IdleCost             float64 `json:"idleCost,omitempty"`
+}
+
+// CostTrendResponse is the response for the /api/opencost/trend endpoint.
+type CostTrendResponse struct {
+	Available   bool              `json:"available"`
+	Reason      string            `json:"reason,omitempty"`
+	Source      string            `json:"source,omitempty"`
+	Currency    string            `json:"currency"`
+	Range       string            `json:"range"`
+	WindowStart int64             `json:"windowStart,omitempty"`
+	WindowEnd   int64             `json:"windowEnd,omitempty"`
+	DataThrough string            `json:"dataThrough,omitempty"`
+	Series      []CostTrendSeries `json:"series,omitempty"`
+	// NamespaceCount is how many namespaces reported cost in the window, which
+	// is more than the series when the top-N cap folded the rest into "other".
+	// Without it a capped answer cannot be told from a whole-cluster one.
+	NamespaceCount int `json:"namespaceCount,omitempty"`
+}
+
+type WorkloadCostTrendResponse struct {
+	Available       bool            `json:"available"`
+	Reason          string          `json:"reason,omitempty"`
+	Source          string          `json:"source,omitempty"`
+	Currency        string          `json:"currency"`
+	Namespace       string          `json:"namespace"`
+	Kind            string          `json:"kind"`
+	Name            string          `json:"name"`
+	Range           string          `json:"range"`
+	WindowTotalCost float64         `json:"windowTotalCost,omitempty"`
+	DataPoints      []CostDataPoint `json:"dataPoints,omitempty"`
+}
+
+type ApplicationWorkloadRef struct {
+	Kind      string `json:"kind"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
+type ApplicationWorkloadCostInput struct {
+	ApplicationWorkloadRef
+	DesiredReplicas int `json:"desiredReplicas,omitempty"`
+}
+
+type ApplicationCostCoverage struct {
+	Total       int                         `json:"total"`
+	Included    int                         `json:"included"`
+	Unavailable []ApplicationWorkloadStatus `json:"unavailable,omitempty"`
+	Unsupported []ApplicationWorkloadRef    `json:"unsupported,omitempty"`
+}
+
+type ApplicationWorkloadStatus struct {
+	ApplicationWorkloadRef
+	Reason       string `json:"reason"`
+	ScaledToZero bool   `json:"scaledToZero,omitempty"`
+}
+
+type ApplicationCostTotals struct {
+	HourlyCost           float64 `json:"hourlyCost"`
+	CPUCost              float64 `json:"cpuCost"`
+	MemoryCost           float64 `json:"memoryCost"`
+	Replicas             int     `json:"replicas"`
+	CPUUsageCost         float64 `json:"cpuUsageCost,omitempty"`
+	MemoryUsageCost      float64 `json:"memoryUsageCost,omitempty"`
+	CPUUsageAvailable    bool    `json:"cpuUsageAvailable"`
+	MemoryUsageAvailable bool    `json:"memoryUsageAvailable"`
+	CPUAllocationUse     float64 `json:"cpuAllocationUse"`
+	MemoryAllocationUse  float64 `json:"memoryAllocationUse"`
+}
+
+type ApplicationWorkloadCost struct {
+	ApplicationWorkloadRef
+	Available    bool          `json:"available"`
+	Reason       string        `json:"reason,omitempty"`
+	ScaledToZero bool          `json:"scaledToZero,omitempty"`
+	Current      *WorkloadCost `json:"current,omitempty"`
+}
+
+type ApplicationCostResponse struct {
+	Available   bool                      `json:"available"`
+	Reason      string                    `json:"reason,omitempty"`
+	Source      string                    `json:"source,omitempty"`
+	Window      string                    `json:"window,omitempty"`
+	DataThrough string                    `json:"dataThrough,omitempty"`
+	Currency    string                    `json:"currency"`
+	Partial     bool                      `json:"partial,omitempty"`
+	Totals      ApplicationCostTotals     `json:"totals"`
+	Coverage    ApplicationCostCoverage   `json:"coverage"`
+	Workloads   []ApplicationWorkloadCost `json:"workloads,omitempty"`
+}
+
+type ApplicationCostTrendSeries struct {
+	ApplicationWorkloadRef
+	WindowTotalCost float64         `json:"windowTotalCost,omitempty"`
+	DataPoints      []CostDataPoint `json:"dataPoints,omitempty"`
+}
+
+type ApplicationCostTrendResponse struct {
+	Available       bool                         `json:"available"`
+	Reason          string                       `json:"reason,omitempty"`
+	Source          string                       `json:"source,omitempty"`
+	Currency        string                       `json:"currency"`
+	Range           string                       `json:"range"`
+	Partial         bool                         `json:"partial,omitempty"`
+	WindowTotalCost float64                      `json:"windowTotalCost,omitempty"`
+	DataPoints      []CostDataPoint              `json:"dataPoints,omitempty"`
+	Series          []ApplicationCostTrendSeries `json:"series,omitempty"`
+	Coverage        ApplicationCostCoverage      `json:"coverage"`
+}
+
+// CostTrendSeries holds cost data points for a single namespace.
+type CostTrendSeries struct {
+	Remainder  bool            `json:"-"`
+	Namespace  string          `json:"namespace"`
+	DataPoints []CostDataPoint `json:"dataPoints"`
+}
+
+// CostDataPoint is a single (timestamp, value) pair for cost trends.
+type CostDataPoint struct {
+	Timestamp int64   `json:"timestamp"`
+	Value     float64 `json:"value"`
+}
+
+// NodeCostResponse is the response for the /api/opencost/nodes endpoint.
+type NodeCostResponse struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
+	Source    string `json:"source,omitempty"`
+	// Window is the lookback the figures cover. Kubecost answers node assets
+	// from either the current window or its daily fallback, so without this a
+	// reader cannot tell an hour of data from a day of it.
+	Window      string     `json:"window,omitempty"`
+	DataThrough string     `json:"dataThrough,omitempty"`
+	Currency    string     `json:"currency"`
+	Nodes       []NodeCost `json:"nodes,omitempty"`
+}
+
+// NodeCost holds per-node cost breakdown.
+type NodeCost struct {
+	Name         string  `json:"name"`
+	ProviderID   string  `json:"providerID,omitempty"`
+	InstanceType string  `json:"instanceType,omitempty"`
+	Region       string  `json:"region,omitempty"`
+	HourlyCost   float64 `json:"hourlyCost"`
+	CPUCost      float64 `json:"cpuCost"`
+	MemoryCost   float64 `json:"memoryCost"`
+}

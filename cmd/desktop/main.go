@@ -4,11 +4,16 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
+	goruntime "runtime"
+	"strconv"
 	"time"
 
 	"github.com/skyhook-io/radar/internal/app"
+	"github.com/skyhook-io/radar/internal/cloud"
 	"github.com/skyhook-io/radar/internal/config"
+	"github.com/skyhook-io/radar/internal/desktopenv"
 	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/internal/updater"
 	versionpkg "github.com/skyhook-io/radar/internal/version"
@@ -26,14 +31,32 @@ var (
 	version = "dev"
 )
 
+// linuxGPUPolicy is declared once so the value the webview is configured with
+// and the value diagnostics reports can never drift apart.
+const linuxGPUPolicy = linux.WebviewGpuPolicyOnDemand
+
+func gpuPolicyName(p linux.WebviewGpuPolicy) string {
+	switch p {
+	case linux.WebviewGpuPolicyAlways:
+		return "always"
+	case linux.WebviewGpuPolicyOnDemand:
+		return "on-demand"
+	case linux.WebviewGpuPolicyNever:
+		return "never"
+	default:
+		return "unknown"
+	}
+}
+
 func main() {
 	// Load persistent config (~/.radar/config.json) for flag defaults.
 	fileCfg := config.Load()
 
 	// Parse flags (defaults come from config file, falling back to hardcoded values)
-	kubeconfig := flag.String("kubeconfig", fileCfg.Kubeconfig, "Path to kubeconfig file (default: ~/.kube/config)")
-	kubeconfigDir := flag.String("kubeconfig-dir", fileCfg.KubeconfigDirsFlag(), "Comma-separated directories containing kubeconfig files (mutually exclusive with --kubeconfig)")
+	kubeconfig := flag.String("kubeconfig", fileCfg.Kubeconfig, "Path to primary kubeconfig file (default: ~/.kube/config)")
+	kubeconfigDir := flag.String("kubeconfig-dir", fileCfg.KubeconfigDirsFlag(), "Comma-separated directories containing additional kubeconfig files")
 	namespace := flag.String("namespace", fileCfg.Namespace, "Initial namespace filter (empty = all namespaces)")
+	namespaces := flag.String("namespaces", fileCfg.NamespacesFlag(), "Initial namespace filters as a comma-separated list (e.g. ns1,ns2,ns3). Use this when you can list resources in specific namespaces but cannot list namespaces cluster-wide.")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	historyLimit := flag.Int("history-limit", fileCfg.HistoryLimitOr(10000), "Maximum number of events to retain in timeline")
 	debugEvents := flag.Bool("debug-events", false, "Enable verbose event debugging")
@@ -41,10 +64,12 @@ func main() {
 	disableHelmWrite := flag.Bool("disable-helm-write", false, "Simulate restricted Helm permissions")
 	disableExec := flag.Bool("disable-exec", false, "Simulate restricted exec permissions")
 	podShellDefault := flag.String("pod-shell-default", "", "Override the default pod exec shell command (runs as 'sh -c <value>'; empty = built-in bash -il → ash → sh cascade)")
-	timelineStorage := flag.String("timeline-storage", fileCfg.TimelineStorageOr("memory"), "Timeline storage backend: memory or sqlite")
+	timelineStorage := flag.String("timeline-storage", fileCfg.TimelineStorageOr("memory"), "Timeline storage backend: memory, sqlite, or postgres")
 	timelineDBPath := flag.String("timeline-db", fileCfg.TimelineDBPath, "Path to timeline database file (default: ~/.radar/timeline.db)")
-	timelineRetention := flag.Duration("timeline-retention", fileCfg.TimelineRetentionOr(7*24*time.Hour), "How long to retain timeline events when --timeline-storage=sqlite (e.g. 168h, 720h). 0 disables cleanup (unbounded growth).")
+	timelineRetention := flag.Duration("timeline-retention", fileCfg.TimelineRetentionOr(7*24*time.Hour), "How long to retain timeline events when --timeline-storage=sqlite or postgres (e.g. 168h, 720h). 0 disables age-based cleanup.")
+	timelineMaxSize := flag.String("timeline-max-size", fileCfg.TimelineMaxSizeOr("1Gi"), "Maximum SQLite timeline storage size before pruning oldest events (e.g. 800Mi, 8Gi). 0 disables size-based pruning.")
 	prometheusURL := flag.String("prometheus-url", fileCfg.PrometheusURL, "Manual Prometheus/VictoriaMetrics URL (skips auto-discovery)")
+	openCostCurrency := flag.String("opencost-currency", fileCfg.OpenCostCurrency, "Override the ISO 4217 currency label for OpenCost values (empty: auto-detect, then USD)")
 	flag.Parse()
 
 	if *showVersion {
@@ -80,33 +105,125 @@ func main() {
 	// set GTK_THEME so WebKitGTK's prefers-color-scheme media query works.
 	applySystemTheme()
 
-	if *kubeconfig != "" && *kubeconfigDir != "" {
-		log.Printf("ERROR: --kubeconfig and --kubeconfig-dir are mutually exclusive")
+	kubeconfigFlagSet := false
+	kubeconfigDirsFlagSet := false
+	namespaceFlagSet := false
+	namespacesFlagSet := false
+	openCostCurrencyFlagSet := false
+	prometheusURLFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "kubeconfig":
+			kubeconfigFlagSet = true
+		case "kubeconfig-dir":
+			kubeconfigDirsFlagSet = true
+		case "namespace":
+			namespaceFlagSet = true
+		case "namespaces":
+			namespacesFlagSet = true
+		case "opencost-currency":
+			openCostCurrencyFlagSet = true
+		case "prometheus-url":
+			prometheusURLFlagSet = true
+		}
+	})
+	timelineMaxSizeBytes, err := config.ParseByteSize(*timelineMaxSize)
+	if err != nil {
+		log.Printf("ERROR: invalid --timeline-max-size %q: %v", *timelineMaxSize, err)
+		os.Exit(1)
+	}
+	normalizedOpenCostCurrency, err := config.NormalizeOpenCostCurrency(*openCostCurrency)
+	if err != nil {
+		log.Printf("ERROR: invalid --opencost-currency %q: %v", *openCostCurrency, err)
+		os.Exit(1)
+	}
+	if err := app.ValidatePrometheusHeaderDestination(fileCfg.PrometheusURL, *prometheusURL, len(fileCfg.PrometheusHeaders)+len(fileCfg.PrometheusHeadersFromEnv) > 0); err != nil {
+		log.Printf("ERROR: invalid Prometheus header configuration: %v", err)
+		os.Exit(1)
+	}
+	resolvedPrometheusHeaders, err := app.ResolvePrometheusHeaders(fileCfg.PrometheusHeaders, fileCfg.PrometheusHeadersFromEnv)
+	if err != nil {
+		log.Printf("ERROR: invalid Prometheus header configuration: %v", err)
+		os.Exit(1)
+	}
+	resolvedNamespace, resolvedNamespaces, err := app.ResolveNamespaceSelection(*namespace, *namespaces, namespaceFlagSet, namespacesFlagSet)
+	if err != nil {
+		log.Printf("ERROR: %v", err)
+		os.Exit(1)
+	}
+	if len(resolvedNamespaces) > k8s.MaxScopeCandidates {
+		log.Printf("ERROR: --namespaces lists %d namespaces but the RBAC probe fanout cap is %d", len(resolvedNamespaces), k8s.MaxScopeCandidates)
+		os.Exit(1)
+	}
+	resolvedKubeconfig, resolvedKubeconfigDirs := app.ResolveKubeconfigSelection(
+		*kubeconfig, *kubeconfigDir, kubeconfigFlagSet, kubeconfigDirsFlagSet,
+	)
+
+	// The device flow and consent page must identify this build and target the
+	// same control plane the CLI would — Desktop starts the same shared server.
+	cloud.Version = version
+	hubAPIURL, hubAppURL, err := cloud.ResolveHubOriginsFromEnv()
+	if err != nil {
+		log.Printf("ERROR: %v", err)
 		os.Exit(1)
 	}
 
+	// A configured port is honored as-is. Otherwise reuse the last launch's
+	// port, so the webview keeps its origin and storage.
+	desktopPort := fileCfg.PortOr(0)
+	desktopPortRemembered := desktopPort == 0
+	if desktopPortRemembered {
+		desktopPort = lastDesktopPort(desktopPortPath())
+	}
+
 	cfg := app.AppConfig{
-		Kubeconfig:        *kubeconfig,
-		KubeconfigDirs:    app.ParseKubeconfigDirs(*kubeconfigDir),
-		Namespace:         *namespace,
-		Port:              fileCfg.PortOr(0), // Configured port, or random to avoid conflicts with CLI
-		DevMode:           false,
-		HistoryLimit:      *historyLimit,
-		DebugEvents:       *debugEvents,
-		FakeInCluster:     *fakeInCluster,
-		DisableHelmWrite:  *disableHelmWrite,
-		DisableExec:       *disableExec,
-		PodShellDefault:   *podShellDefault,
-		TimelineStorage:   *timelineStorage,
-		TimelineDBPath:    *timelineDBPath,
-		TimelineRetention: *timelineRetention,
-		PrometheusURL:     *prometheusURL,
-		Version:           version,
-		MCPEnabled:        fileCfg.MCPEnabledOr(true),
+		Kubeconfig:                resolvedKubeconfig,
+		KubeconfigDirs:            resolvedKubeconfigDirs,
+		RestoreLastDesktopContext: fileCfg.RestoreLastDesktopContextOr(true),
+		Namespace:                 resolvedNamespace,
+		Namespaces:                resolvedNamespaces,
+		Port:                      desktopPort,
+		PortFallback:              desktopPortRemembered,
+		ListenAddress:             "127.0.0.1",
+		DevMode:                   false,
+		HistoryLimit:              *historyLimit,
+		DebugEvents:               *debugEvents,
+		FakeInCluster:             *fakeInCluster,
+		DisableHelmWrite:          *disableHelmWrite,
+		DisableExec:               *disableExec,
+		PodShellDefault:           *podShellDefault,
+		TimelineStorage:           *timelineStorage,
+		TimelineDBPath:            *timelineDBPath,
+		TimelinePostgresDSN:       os.Getenv("RADAR_TIMELINE_POSTGRES_DSN"),
+		TimelineRetention:         *timelineRetention,
+		TimelineMaxSizeBytes:      timelineMaxSizeBytes,
+		PrometheusURL:             *prometheusURL,
+		PrometheusURLFlag:         prometheusURLFlagSet,
+		OpenCostCurrency:          normalizedOpenCostCurrency,
+		CostSource:                fileCfg.CostSource,
+		KubecostURL:               fileCfg.KubecostURL,
+		KubecostAPIKey:            fileCfg.KubecostAPIKey,
+		KubecostAPIKeyContext:     fileCfg.KubecostAPIKeyContext,
+		KubecostClusterID:         fileCfg.KubecostClusterID,
+		KubecostClusterIDContext:  fileCfg.KubecostClusterIDContext,
+		OpenCostFlagSet:           openCostCurrencyFlagSet,
+		PrometheusHeaders:         resolvedPrometheusHeaders,
+		PrometheusHeadersFromEnv:  fileCfg.PrometheusHeadersFromEnv,
+		Version:                   version,
+		HubAPIURL:                 hubAPIURL,
+		HubAppURL:                 hubAppURL,
+		MCPEnabled:                fileCfg.MCPEnabledOr(true),
+		AIHistory:                 fileCfg.AIHistoryOr(true),
+		AIHistoryDBPath:           fileCfg.AIHistoryDBPath,
+	}
+
+	if !cfg.RestoreLastDesktopContext {
+		app.ForgetLastContext()
 	}
 
 	app.SetGlobals(cfg)
 	versionpkg.SetDesktop(true)
+	desktopenv.SetGPUPolicy(gpuPolicyName(linuxGPUPolicy))
 
 	// Clean up leftover files from previous update
 	updater.CleanupOldUpdate()
@@ -123,7 +240,10 @@ func main() {
 		})
 	}
 
-	timelineStoreCfg := app.BuildTimelineStoreConfig(cfg)
+	timelineStoreCfg, err := app.BuildTimelineStoreConfig(cfg)
+	if err != nil {
+		log.Fatalf("Invalid timeline configuration: %v", err)
+	}
 	app.RegisterCallbacks(cfg, timelineStoreCfg)
 
 	// Create server and attach desktop updater
@@ -142,7 +262,7 @@ func main() {
 	<-ready
 
 	// Write port file so MCP clients can discover the running server
-	app.WriteMCPPortFile(srv.ActualPort())
+	app.WriteMCPPortFile(srv.ActualAddr(), srv.BasePath())
 
 	// Initialize cluster in background (browser will see progress via SSE)
 	if k8sInitErr == nil {
@@ -155,9 +275,20 @@ func main() {
 	windowTitle := formatWindowTitle(k8s.GetContextName())
 
 	desktopApp := NewDesktopApp(srv, timelineStoreCfg)
+	if desktopPortRemembered {
+		desktopApp.onWindowReady = func() {
+			go rememberDesktopPort(desktopPortPath(), desktopPort, srv.ActualPort(), portOwner, loopbackPortBindable)
+		}
+	}
+	// macOS only. Wails maps this to `[NSApp hide:]`, which leaves the dock icon
+	// in place, so a dock click or Cmd+Tab brings the window back. The other
+	// platforms have no such affordance: GTK hides the window on delete-event and
+	// Windows drops the taskbar entry, and Wails v2 ships no tray icon, so a
+	// hidden window there is only recoverable by killing the process.
+	hideOnClose := goruntime.GOOS == "darwin"
 
 	// Run Wails application
-	err := wails.Run(&options.App{
+	err = wails.Run(&options.App{
 		Title:            windowTitle,
 		Width:            1440,
 		Height:           900,
@@ -167,11 +298,17 @@ func main() {
 		MaxHeight:        4320,
 		WindowStartState: options.Maximised,
 
+		// Closing the window leaves the server running. Quit is explicit
+		// (Cmd+Q / File → Quit).
+		HideWindowOnClose: hideOnClose,
+
 		AssetServer: &assetserver.Options{
-			Handler: NewRedirectHandler(srv.ActualAddr(), cfg.Namespace),
+			// The address actually bound, not "localhost", which may resolve to
+			// [::1] where another service can hold the same port.
+			Handler: NewRedirectHandler(net.JoinHostPort("127.0.0.1", strconv.Itoa(srv.ActualPort())), cfg.Namespace, cfg.Namespaces),
 		},
 
-		Menu: createMenu(desktopApp, version),
+		Menu: createMenu(desktopApp, version, goruntime.GOOS),
 
 		BackgroundColour: options.NewRGBA(10, 10, 15, 255),
 
@@ -188,13 +325,13 @@ func main() {
 			TitleBar: mac.TitleBarDefault(),
 			About: &mac.AboutInfo{
 				Title:   "Radar",
-				Message: "Kubernetes Visibility Tool\nBuilt by Skyhook\n\nVersion: " + version,
+				Message: "Kubernetes Visibility Tool\nBuilt by Skyhook\n\nVersion: " + version + "\n\nhttps://github.com/skyhook-io/radar",
 			},
 		},
 
 		Linux: &linux.Options{
 			ProgramName:      "radar",
-			WebviewGpuPolicy: linux.WebviewGpuPolicyOnDemand,
+			WebviewGpuPolicy: linuxGPUPolicy,
 		},
 	})
 

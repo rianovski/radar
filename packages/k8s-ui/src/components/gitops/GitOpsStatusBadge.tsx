@@ -2,6 +2,8 @@ import { clsx } from 'clsx'
 import { CheckCircle2, AlertCircle, Loader2, Pause, HelpCircle, XCircle } from 'lucide-react'
 import type { GitOpsStatus, SyncStatus, GitOpsHealthStatus } from '../../types/gitops'
 import { SEVERITY_BADGE_BORDERED, SEVERITY_BADGE } from '../../utils/badge-colors'
+import { formatCompactAge } from '../../utils/format'
+import { Tooltip } from '../ui/Tooltip'
 
 interface GitOpsStatusBadgeProps {
   status: GitOpsStatus
@@ -67,7 +69,10 @@ function getStatusIcon(status: GitOpsStatus) {
 }
 
 function getStatusColorClass(status: GitOpsStatus): string {
-  if (status.suspended) return SEVERITY_BADGE_BORDERED.warning
+  // Suspended sync (manual-sync mode) is an intentional operating mode many teams
+  // run by default — sky (info), not amber. Real drift surfaces separately as
+  // OutOfSync (still amber); the Pause icon + "Suspended" label signal it's manual.
+  if (status.suspended) return SEVERITY_BADGE_BORDERED.info
   if (status.sync === 'Synced' && status.health === 'Healthy') return SEVERITY_BADGE_BORDERED.success
   if (status.health === 'Degraded') return SEVERITY_BADGE_BORDERED.error
   if (status.sync === 'OutOfSync') return SEVERITY_BADGE_BORDERED.warning
@@ -112,7 +117,9 @@ function getHealthInfo(health: GitOpsHealthStatus) {
     case 'Degraded':
       return { icon: XCircle, color: SEVERITY_BADGE.error, label: 'Degraded' }
     case 'Suspended':
-      return { icon: Pause, color: SEVERITY_BADGE.warning, label: 'Suspended' }
+      // Intentional pause, not a degradation — sky (info), matching the resource
+      // table + app rollup. The Pause icon already signals it's deliberate.
+      return { icon: Pause, color: SEVERITY_BADGE.info, label: 'Suspended' }
     case 'Missing':
       return { icon: AlertCircle, color: SEVERITY_BADGE.warning, label: 'Missing' }
     default:
@@ -125,8 +132,9 @@ function getHealthInfo(health: GitOpsHealthStatus) {
  */
 export function SyncStatusBadge({ sync, suspended }: { sync: SyncStatus; suspended?: boolean }) {
   if (suspended) {
+    // Manual-sync mode is intentional — sky (info), not amber. See getStatusColorClass.
     return (
-      <span className={clsx('badge', SEVERITY_BADGE_BORDERED.warning)}>
+      <span className={clsx('badge', SEVERITY_BADGE_BORDERED.info)}>
         <Pause className="w-3 h-3" />
         Suspended
       </span>
@@ -168,5 +176,43 @@ export function HealthStatusBadge({ health }: { health: GitOpsHealthStatus }) {
       <Icon className={clsx('w-3 h-3', health === 'Progressing' && 'animate-spin')} />
       {label}
     </span>
+  )
+}
+
+
+/**
+ * ReconcilingIndicator rides alongside the sync badge rather than replacing it,
+ * the same primary-plus-secondary shape the Velero schedule cell uses for a
+ * paused-and-rejected schedule.
+ *
+ * A pass being in flight says nothing about whether the declared state is
+ * applied, so it must not touch the sync word — but a pass that never finishes
+ * is the one fault nothing else in the product notices, and on a healthy object
+ * a real pass completes in milliseconds. In practice this only becomes visible
+ * when a controller is wedged, which is exactly when it should be.
+ */
+export function ReconcilingIndicator({
+  reconciling,
+  since,
+  sync,
+}: {
+  reconciling?: boolean
+  since?: string
+  /** The sync word shown beside this. Omitted when there is no badge alongside. */
+  sync?: SyncStatus
+}) {
+  // Suppressed when the sync badge already says Reconciling — it carries the
+  // same fact and spins for it. Showing both puts two spinners on one row for
+  // one thing. The secondary exists for the case the primary CANNOT express:
+  // an applied object whose reconcile pass never finished.
+  if (!reconciling || sync === 'Reconciling') return null
+  const age = formatCompactAge(since)
+  const tip = age
+    ? `A reconcile pass has been in flight for ${age}. On a healthy resource a pass finishes in milliseconds, so a long-running one usually means the controller is stuck.`
+    : 'A reconcile pass is in flight.'
+  return (
+    <Tooltip content={tip}>
+      <Loader2 className="w-3 h-3 shrink-0 animate-spin text-theme-text-tertiary" aria-label="Reconcile pass in flight" />
+    </Tooltip>
   )
 }

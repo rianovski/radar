@@ -1,0 +1,45 @@
+# BackupRepositories, one of them restic.
+#   restic is being retired (no new backups since v1.17, restore dropped in
+#   v1.19), which is what the Type column exists to make scannable.
+---
+apiVersion: velero.io/v1
+kind: BackupRepository
+metadata:
+  name: repo-legacy-restic
+  namespace: velero
+spec:
+  backupStorageLocation: default
+  maintenanceFrequency: 168h0m0s
+  repositoryType: restic
+  volumeNamespace: legacy-app
+status:
+  lastMaintenanceTime: "@now-11950m"
+  phase: Ready
+---
+apiVersion: velero.io/v1
+kind: BackupRepository
+metadata:
+  name: repo-notready
+  namespace: velero
+spec:
+  backupStorageLocation: default
+  maintenanceFrequency: 1h0m0s
+  repositoryType: kopia
+  volumeNamespace: default
+status:
+  message: "error running maintenance: unable to connect to repository"
+  phase: NotReady
+---
+apiVersion: velero.io/v1
+kind: BackupRepository
+metadata:
+  name: repo-ready
+  namespace: velero
+spec:
+  backupStorageLocation: default
+  maintenanceFrequency: 1h0m0s
+  repositoryType: kopia
+  volumeNamespace: default
+status:
+  lastMaintenanceTime: "@now-1870m"
+  phase: Ready

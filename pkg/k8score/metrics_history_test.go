@@ -1,0 +1,157 @@
+package k8score
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
+)
+
+func TestMetricsHistoryResolvesServedVersionLazily(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: MetricsAPIGroup, Version: "v1", Resource: "pods"}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{gvr: "PodMetricsList"},
+	)
+	dyn.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetResource() != gvr {
+			t.Fatalf("metrics collection used %v, want %v", action.GetResource(), gvr)
+		}
+		return true, &unstructured.UnstructuredList{}, nil
+	})
+	ready := false
+	store := NewMetricsHistoryStoreWithResolver(dyn, func(resource string) (schema.GroupVersionResource, bool) {
+		if !ready || resource != "pods" {
+			return schema.GroupVersionResource{}, false
+		}
+		return gvr, true
+	})
+
+	store.collectPodMetrics(context.Background(), time.Now())
+	if store.lastPodError != ErrMetricsAPINotDiscovered.Error() {
+		t.Fatalf("initial error = %q", store.lastPodError)
+	}
+
+	ready = true
+	store.collectPodMetrics(context.Background(), time.Now())
+	if store.consecutivePodErrors != 0 || store.lastPodError != "" {
+		t.Fatalf("collection did not recover after discovery: errors=%d last=%q", store.consecutivePodErrors, store.lastPodError)
+	}
+}
+
+func TestMetricsCollectionErrorLevel(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "api not found",
+			err:  apierrors.NewNotFound(schema.GroupResource{Group: "metrics.k8s.io", Resource: "pods"}, "api"),
+			want: "warning",
+		},
+		{
+			name: "metrics api resource absent",
+			err:  errors.New("the server could not find the requested resource (get pods.metrics.k8s.io)"),
+			want: "warning",
+		},
+		{
+			name: "metrics kind not matched",
+			err:  errors.New("no matches for kind PodMetrics in version metrics.k8s.io/v1beta1"),
+			want: "warning",
+		},
+		{
+			name: "metrics not available",
+			err:  errors.New("pods.metrics.k8s.io not available"),
+			want: "warning",
+		},
+		{
+			name: "no metrics known",
+			err:  errors.New("no metrics known for pod api in pods.metrics.k8s.io"),
+			want: "warning",
+		},
+		{
+			name: "unable to fetch metrics",
+			err:  errors.New("unable to fetch metrics from pods.metrics.k8s.io"),
+			want: "warning",
+		},
+		{
+			name: "metrics APIService unavailable",
+			err:  errors.New("the server is currently unable to handle the request (get pods.metrics.k8s.io)"),
+			want: "warning",
+		},
+		{
+			name: "non metrics missing resource",
+			err:  errors.New("the server could not find the requested resource"),
+			want: "error",
+		},
+		{
+			name: "forbidden metrics",
+			err:  errors.New("pods.metrics.k8s.io is forbidden"),
+			want: "error",
+		},
+		{
+			name: "nil",
+			err:  nil,
+			want: "error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := metricsCollectionErrorLevel(tt.err); got != tt.want {
+				t.Fatalf("metricsCollectionErrorLevel() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseCPU(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int64
+	}{
+		{"", 0},
+		{"137492n", 137492},
+		{"188u", 188000},
+		{"250m", 250000000},
+		{"1", 1000000000},
+	}
+
+	for _, tt := range tests {
+		if got := parseCPU(tt.input); got != tt.want {
+			t.Errorf("parseCPU(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestGetAllNodeMetricsLatestPreservesSampleTimestamp(t *testing.T) {
+	first := time.Date(2026, time.July, 13, 8, 0, 0, 0, time.UTC)
+	latest := first.Add(30 * time.Second)
+	buffer := newRingBuffer(MetricsHistorySize)
+	buffer.Add(MetricsDataPoint{Timestamp: first, CPU: 100, Memory: 200})
+	buffer.Add(MetricsDataPoint{Timestamp: latest, CPU: 300, Memory: 400})
+	store := &MetricsHistoryStore{
+		nodeMetrics: map[string]*nodeMetricsBuffer{
+			"node-a": {name: "node-a", buffer: buffer},
+		},
+	}
+
+	got := store.GetAllNodeMetricsLatest()
+	if len(got) != 1 {
+		t.Fatalf("latest node metrics count = %d, want 1", len(got))
+	}
+	if !got[0].ObservedAt.Equal(latest) {
+		t.Fatalf("observedAt = %s, want sample timestamp %s", got[0].ObservedAt, latest)
+	}
+	if got[0].CPU != 300 || got[0].Memory != 400 {
+		t.Fatalf("latest node metrics = %+v, want CPU=300 Memory=400", got[0])
+	}
+}

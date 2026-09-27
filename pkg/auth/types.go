@@ -18,8 +18,9 @@ type Config struct {
 	CookieTTL time.Duration // default 4h, sliding
 
 	// Proxy mode
-	UserHeader   string // default "X-Forwarded-User"
-	GroupsHeader string // default "X-Forwarded-Groups"
+	UserHeader     string // default "X-Forwarded-User"
+	GroupsHeader   string // default "X-Forwarded-Groups"
+	ProxyLogoutURL string // optional, URL the logout button redirects to so the upstream proxy session is torn down (e.g. oauth2-proxy /oauth2/sign_out)
 
 	// Session revocation (optional, used by backchannel logout)
 	Revoker SessionRevoker
@@ -29,17 +30,24 @@ type Config struct {
 	APIKeys *APIKeyStore
 
 	// OIDC mode
-	OIDCIssuer       string
-	OIDCClientID     string
-	OIDCClientSecret string
+	OIDCIssuer                string
+	OIDCInternalIssuer        string
+	OIDCAuthorizationURL      string
+	OIDCTokenURL              string
+	OIDCUserInfoURL           string
+	OIDCJWKSURL               string
+	OIDCClientID              string
+	OIDCClientSecret          string
 	OIDCRedirectURL           string
-	OIDCGroupsClaim           string // default "groups"
-	OIDCPostLogoutRedirectURL  string // optional, URL to redirect after IdP logout
-	OIDCUsernamePrefix         string // prefix added to OIDC username for K8s impersonation (e.g., "oidc:")
-	OIDCGroupsPrefix           string // prefix added to OIDC groups for K8s impersonation (e.g., "oidc:")
-	OIDCInsecureSkipVerify     bool   // skip TLS verification for OIDC provider (dev/test only)
-	OIDCCACert                 string // path to CA certificate file for OIDC provider TLS
-	OIDCBackchannelLogout      bool   // enable backchannel logout endpoint
+	OIDCGroupsClaim           string   // default "groups"
+	OIDCScopes                []string // OAuth2 scopes requested at authorization; default ["openid", "profile", "email", "groups"]
+	OIDCPostLogoutRedirectURL string   // optional, URL to redirect after IdP logout
+	OIDCUsernamePrefix        string   // prefix added to OIDC username for K8s impersonation (e.g., "oidc:")
+	OIDCGroupsPrefix          string   // prefix added to OIDC groups for K8s impersonation (e.g., "oidc:")
+	OIDCInsecureSkipVerify    bool     // skip TLS verification for OIDC provider (dev/test only)
+	OIDCCACert                string   // path to CA certificate file for OIDC provider TLS
+	OIDCBackchannelLogout     bool     // enable backchannel logout endpoint
+	OIDCEnablePKCE            bool     // enable PKCE (S256) for the OIDC authorization-code flow (opt-in)
 }
 
 // SessionRevoker checks whether a session has been revoked (e.g., via OIDC
@@ -67,6 +75,9 @@ func (c *Config) Defaults() {
 	}
 	if c.OIDCGroupsClaim == "" {
 		c.OIDCGroupsClaim = "groups"
+	}
+	if len(c.OIDCScopes) == 0 {
+		c.OIDCScopes = []string{"openid", "profile", "email", "groups"}
 	}
 	// Fall back to env vars for secrets (used by Helm chart)
 	if c.Secret == "" {

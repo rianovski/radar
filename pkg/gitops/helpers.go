@@ -1,6 +1,12 @@
 package gitops
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/skyhook-io/radar/pkg/resourceid"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+)
 
 // StringValue returns v as a string, or "" if v is not a string.
 // Convenience helper for unstructured map[string]any access where typed
@@ -12,14 +18,91 @@ func StringValue(v any) string {
 	return ""
 }
 
-// GroupFromAPIVersion extracts the API group from a Kubernetes apiVersion
-// string. Returns "" for the core group ("v1" or empty input).
-func GroupFromAPIVersion(apiVersion string) string {
-	if apiVersion == "" || apiVersion == "v1" {
-		return ""
+// IsInClusterDestination reports whether an Argo Application deploys to the
+// cluster Radar is connected to — spec.destination is the local API server or
+// the "in-cluster" name — as opposed to a remote hub-spoke destination. Radar's
+// per-user SARs authorize against the local cluster only, so the desired/live
+// manifests of a remote destination cannot be authorized here. An Application
+// with no destination is invalid (Argo reports InvalidSpecError and deploys
+// nothing), so it is not local either: its status.resources may be left over
+// from a destination it no longer names. Fail closed: a nil Application is
+// treated as not-in-cluster.
+func IsInClusterDestination(app *unstructured.Unstructured) bool {
+	if app == nil {
+		return false
 	}
-	if before, _, ok := strings.Cut(apiVersion, "/"); ok {
-		return before
+	name, server := argoDestination(app)
+	if strings.EqualFold(name, "in-cluster") {
+		return true
 	}
-	return apiVersion
+	return isLocalAPIServer(server)
+}
+
+// HasArgoDestination reports whether an Argo Application names a destination
+// cluster at all, by server or by name.
+func HasArgoDestination(app *unstructured.Unstructured) bool {
+	if app == nil {
+		return false
+	}
+	name, server := argoDestination(app)
+	return name != "" || server != ""
+}
+
+func argoDestination(app *unstructured.Unstructured) (name, server string) {
+	name, _, _ = unstructured.NestedString(app.Object, "spec", "destination", "name")
+	server, _, _ = unstructured.NestedString(app.Object, "spec", "destination", "server")
+	return strings.TrimSpace(name), strings.TrimSpace(server)
+}
+
+// FluxTargetsLocalCluster reports whether a Flux Kustomization or HelmRelease
+// applies to the cluster Radar is connected to. spec.kubeConfig points it at
+// another cluster, whose objects its inventory then names; nothing Radar reads
+// locally belongs to them. Fail closed: a nil object is not local.
+func FluxTargetsLocalCluster(obj *unstructured.Unstructured) bool {
+	if obj == nil {
+		return false
+	}
+	_, remote, _ := unstructured.NestedMap(obj.Object, "spec", "kubeConfig")
+	return !remote
+}
+
+// isLocalAPIServer matches the in-cluster Kubernetes API server URL Argo records
+// for a same-cluster destination (kubernetes.default.svc, with or without a
+// scheme, port, or trailing dot). Any other host is a remote cluster.
+func isLocalAPIServer(server string) bool {
+	if server == "" {
+		return false
+	}
+	h := server
+	if i := strings.Index(h, "://"); i >= 0 {
+		h = h[i+3:]
+	}
+	if i := strings.IndexAny(h, "/?#"); i >= 0 {
+		h = h[:i]
+	}
+	if i := strings.LastIndex(h, ":"); i >= 0 {
+		h = h[:i]
+	}
+	h = strings.TrimSuffix(strings.ToLower(h), ".")
+	// Accept every in-cluster form: the short names and the service FQDN with any
+	// cluster domain (kubernetes.default.svc.cluster.local, or a custom domain).
+	return h == "kubernetes" || h == "kubernetes.default" ||
+		h == "kubernetes.default.svc" || strings.HasPrefix(h, "kubernetes.default.svc.")
+}
+
+// ParseFluxInventoryID parses Flux's namespace_name_group_kind inventory key
+// from the right so resource names containing underscores remain intact.
+func ParseFluxInventoryID(id string) (group, kind, namespace, name string, ok bool) {
+	parts := strings.Split(id, "_")
+	if len(parts) < 4 {
+		return "", "", "", "", false
+	}
+	kind = parts[len(parts)-1]
+	group = resourceid.NormalizeGroup(parts[len(parts)-2])
+	namespace = parts[0]
+	name = strings.Join(parts[1:len(parts)-2], "_")
+	if kind == "" || name == "" {
+		return "", "", "", "", false
+	}
+	return group, kind, namespace, name, true
 }

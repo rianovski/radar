@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react'
+import { useState, useCallback, useRef, useEffect } from 'react'
 
 const MIN_SPIN_DURATION = 400 // ms
 const SUCCESS_DISPLAY_DURATION = 1200 // ms
@@ -15,6 +15,18 @@ type RefreshPhase = 'idle' | 'spinning' | 'success'
 export function useRefreshAnimation(refetchFn: () => void | Promise<unknown>): [() => void, boolean, RefreshPhase] {
   const [phase, setPhase] = useState<RefreshPhase>('idle')
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Guards the async `finally`/timer callbacks from setting state after the
+  // host unmounts — this hook now lives on routed views that mount/unmount.
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    // Re-arm on (re)mount — Strict Mode's mount→cleanup→remount would otherwise
+    // leave this stuck false and freeze the spinner on the next refresh.
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      if (timeoutRef.current) clearTimeout(timeoutRef.current)
+    }
+  }, [])
 
   const wrappedRefetch = useCallback(() => {
     if (timeoutRef.current) {
@@ -31,9 +43,10 @@ export function useRefreshAnimation(refetchFn: () => void | Promise<unknown>): [
       const remaining = MIN_SPIN_DURATION - elapsed
 
       const transitionToSuccess = () => {
+        if (!mountedRef.current) return
         setPhase('success')
         timeoutRef.current = setTimeout(() => {
-          setPhase('idle')
+          if (mountedRef.current) setPhase('idle')
         }, SUCCESS_DISPLAY_DURATION)
       }
 

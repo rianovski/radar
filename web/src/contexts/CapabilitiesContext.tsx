@@ -12,6 +12,12 @@ const defaultCapabilities: Capabilities = {
   secretsUpdate: true,
   helmWrite: true,
   nodeWrite: true,
+  workloadWrites: {
+    deployments: true,
+    daemonSets: true,
+    statefulSets: true,
+    rollouts: true,
+  },
   mcpEnabled: true,
   // Default to 'local' for the loading window so the UI renders the
   // OSS standalone shape until /api/capabilities resolves. Both
@@ -30,11 +36,20 @@ const restrictedCapabilities: Capabilities = {
   secretsUpdate: false,
   helmWrite: false,
   nodeWrite: false,
+  workloadWrites: {
+    deployments: false,
+    daemonSets: false,
+    statefulSets: false,
+    rollouts: false,
+  },
   mcpEnabled: false,
   deployment: { mode: 'local' },
 }
 
-const CapabilitiesContext = createContext<Capabilities>(defaultCapabilities)
+const CapabilitiesContext = createContext<Capabilities>({
+  ...defaultCapabilities,
+  localTerminal: false,
+})
 
 export function CapabilitiesProvider({ children }: { children: ReactNode }) {
   const { data: capabilities, error } = useCapabilities()
@@ -79,6 +94,14 @@ export function useCanPortForward(): boolean {
   return useContext(CapabilitiesContext).portForward
 }
 
+// True when Radar runs as a local binary (live port-forward is possible). When
+// false (in-cluster / Radar Cloud) a live forward can't bind a usable local
+// listener, so the UI offers a copy-paste `kubectl port-forward` command instead.
+// Defaults to local during the capabilities-loading window (see defaultCapabilities).
+export function useIsLocalDeployment(): boolean {
+  return useContext(CapabilitiesContext).deployment?.mode === 'local'
+}
+
 export function useCanViewSecrets(): boolean {
   return useContext(CapabilitiesContext).secrets
 }
@@ -121,13 +144,11 @@ export function useHasLimitedAccess(): boolean {
   return Object.entries(resources).some(([kind, allowed]) => !allowed && !isOptionalKind(kind))
 }
 
-// Namespace-scoped capability hooks: lazily re-check exec/logs/portForward
-// scoped to a specific namespace when global RBAC checks denied them.
-// Falls back to global capability values while the namespace check is loading
-// or when all capabilities are already granted.
+// Namespace-scoped capability hooks. A concrete namespace gets its own
+// capability check; callers use global capability values until it resolves.
 export function useNamespacedCapabilities(namespace: string | undefined) {
   const globalCaps = useContext(CapabilitiesContext)
-  const { data: nsCaps, error } = useNamespaceCapabilities(namespace, globalCaps)
+  const { data: nsCaps, error, isPending } = useNamespaceCapabilities(namespace, globalCaps)
 
   if (error) {
     console.warn(`Failed to fetch namespace capabilities for ${namespace}, using global:`, error)
@@ -137,5 +158,7 @@ export function useNamespacedCapabilities(namespace: string | undefined) {
     canExec: nsCaps?.exec ?? globalCaps.exec,
     canViewLogs: nsCaps?.logs ?? globalCaps.logs,
     canPortForward: nsCaps?.portForward ?? globalCaps.portForward,
-  }), [globalCaps.exec, globalCaps.logs, globalCaps.portForward, nsCaps])
+    workloadWrites: nsCaps?.workloadWrites ?? globalCaps.workloadWrites,
+    workloadWritesPending: Boolean(namespace && isPending),
+  }), [globalCaps.exec, globalCaps.logs, globalCaps.portForward, globalCaps.workloadWrites, isPending, namespace, nsCaps])
 }

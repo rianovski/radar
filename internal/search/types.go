@@ -1,6 +1,9 @@
 package search
 
-import "github.com/skyhook-io/radar/internal/filter"
+import (
+	"github.com/skyhook-io/radar/internal/filter"
+	"github.com/skyhook-io/radar/pkg/resourcecontext"
+)
 
 const (
 	DefaultLimit = 50
@@ -46,13 +49,27 @@ type Hit struct {
 	Summary   any            `json:"summary,omitempty"`
 	Raw       any            `json:"raw,omitempty"`
 	Matched   []MatchedField `json:"matched,omitempty"`
+	Snippets  []MatchSnippet `json:"snippets,omitempty"`
+	// SummaryContext is the compact per-row enrichment (managedBy, health,
+	// issueCount). Populated by handlers via Options.SummaryBuilder; nil
+	// when the caller opted out (context=none) or no fields apply.
+	SummaryContext *resourcecontext.ResourceSummaryContext `json:"summaryContext,omitempty"`
 }
 
 // MatchedField records where a query token landed (debug + UI highlight).
 type MatchedField struct {
 	Token string `json:"token"`
-	Site  string `json:"site"` // "name" | "namespace" | "label:k" | "annotation:k" | "image" | "kind"
+	Site  string `json:"site"` // "name" | "namespace" | "label:k" | "annotation:k" | "image" | "kind" | "content:path"
 	Score int    `json:"score"`
+}
+
+// MatchSnippet is a short excerpt from a content field that matched a free
+// token. It lets agents use search as a cheap grep-like first pass without
+// fetching the full resource body for every hit.
+type MatchSnippet struct {
+	Token   string `json:"token"`
+	Path    string `json:"path"`
+	Snippet string `json:"snippet"`
 }
 
 // Result is the full response shape for a search request.
@@ -62,7 +79,7 @@ type Result struct {
 	Searched int   `json:"searched"` // approx. number of objects scanned
 	// TotalMatched is the count of hits BEFORE truncation by Limit.
 	// Equals Total when no truncation occurred. Surfaced so callers
-	// (the hub's fleet aggregator, agents, the SPA) can report honest
+	// (the hub's fleet aggregator, agents, the frontend) can report honest
 	// "X of N" counts when the limit clips the result set — without
 	// it the caller has no way to tell it's looking at a windowed view.
 	TotalMatched int `json:"total_matched"`
@@ -86,4 +103,3 @@ const (
 	IncludeRaw
 	IncludeNone // identity only (cheapest)
 )
-

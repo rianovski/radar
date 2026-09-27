@@ -1,6 +1,9 @@
 import { useRef, useEffect, useState, useCallback } from 'react'
-import { X, Copy, Check, Radio, Terminal, MessageSquare, Code2, ChevronRight, Pin } from 'lucide-react'
+import { X, Copy, Check, Radio, Terminal, MessageSquare, Code2, Pin } from 'lucide-react'
 import { apiUrl, getAuthHeaders, getCredentialsMode } from '../../api/config'
+import { MCP_TOOL_CATALOG } from './mcpToolCatalog'
+import { Tooltip } from '../ui/Tooltip'
+import { Disclosure } from '@skyhook-io/k8s-ui/components/ui/Disclosure'
 
 interface MCPSetupDialogProps {
   open: boolean
@@ -18,13 +21,14 @@ function CopyButton({ text }: { text: string }) {
   }
 
   return (
+    <Tooltip content="Copy to clipboard" position="left" wrapperClassName="absolute top-2 right-2">
     <button
       onClick={handleCopy}
-      className="absolute top-2 right-2 p-1.5 rounded-md bg-theme-elevated/50 hover:bg-theme-elevated text-theme-text-tertiary hover:text-theme-text-secondary transition-colors"
-      title="Copy to clipboard"
+      className="p-1.5 rounded-md bg-theme-elevated/50 hover:bg-theme-elevated text-theme-text-tertiary hover:text-theme-text-secondary transition-colors"
     >
       {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
     </button>
+    </Tooltip>
   )
 }
 
@@ -172,6 +176,15 @@ export function MCPSetupDialog({ open, onClose, mcpUrl }: MCPSetupDialogProps) {
     }
   }, null, 2)
 
+  const opencodeConfig = JSON.stringify({
+    mcp: {
+      radar: {
+        type: "remote",
+        url: mcpUrl,
+      }
+    }
+  }, null, 2)
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
@@ -201,15 +214,17 @@ export function MCPSetupDialog({ open, onClose, mcpUrl }: MCPSetupDialogProps) {
               <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener noreferrer" className="text-purple-400 hover:text-purple-300 underline underline-offset-2">
                 Model Context Protocol
               </a>{' '}
-              (MCP) server that lets AI assistants query your cluster through Radar.
+              (MCP) server that lets AI agents inspect, investigate, and operate your cluster through Radar.
               Unlike raw kubectl access, Radar gives your AI pre-processed, enriched data —
               topology graphs, health assessments, deduplicated events, filtered logs — so it
               can understand your cluster state quickly without burning through context on
               verbose YAML output.
             </p>
             <p className="text-sm text-theme-text-secondary leading-relaxed">
-              Read tools are strictly read-only. Write tools (restart, scale, sync) are
-              non-destructive and annotated so your AI client can distinguish them.
+              Most read tools do not change cluster state. An in-cluster route probe can create up
+              to five self-deleting probe pods when explicitly requested. Write tools (restart,
+              scale, sync, apply, node drain) are annotated as destructive so your AI client
+              can flag them and prompt before running.
             </p>
           </div>
 
@@ -219,7 +234,7 @@ export function MCPSetupDialog({ open, onClose, mcpUrl }: MCPSetupDialogProps) {
             <div className="relative">
               <div className="flex items-center gap-3 bg-theme-base rounded-md px-3 py-2.5">
                 <span className="badge text-purple-400 bg-purple-500/10">HTTP</span>
-                <code className="text-sm font-mono text-theme-text-primary">{mcpUrl}</code>
+                <code className="inline-code text-sm">{mcpUrl}</code>
               </div>
               <CopyButton text={mcpUrl} />
             </div>
@@ -277,114 +292,58 @@ export function MCPSetupDialog({ open, onClose, mcpUrl }: MCPSetupDialogProps) {
               { icon: Code2, name: 'VS Code Copilot', path: '.vscode/mcp.json', config: vsCodeConfig },
               { icon: Code2, name: 'Cline', path: 'Cline MCP settings (via UI)', config: clineConfig },
               { icon: Code2, name: 'JetBrains AI', path: 'Settings → Tools → AI Assistant → MCP', config: jetbrainsConfig },
+              { icon: Terminal, name: 'OpenCode', path: '~/.config/opencode/opencode.json', config: opencodeConfig },
               { icon: Terminal, name: 'OpenAI Codex', path: '~/.codex/config.toml', config: codexConfig },
               { icon: Terminal, name: 'Gemini CLI', path: '~/.gemini/settings.json', config: geminiConfig },
             ].map((agent) => (
-              <details key={agent.name} className="group rounded-md border border-theme-border/50 bg-theme-base/30">
-                <summary className="flex items-center gap-2 px-3 py-2 select-none list-none hover:bg-theme-hover/50 rounded-md transition-colors [&::-webkit-details-marker]:hidden">
-                  <ChevronRight className="w-3.5 h-3.5 text-theme-text-tertiary transition-transform group-open:rotate-90" />
-                  <agent.icon className="w-4 h-4 text-theme-text-tertiary" />
-                  <span className="text-sm font-medium text-theme-text-primary">{agent.name}</span>
-                  {agent.path && <span className="text-[10px] text-theme-text-tertiary ml-auto">{agent.path}</span>}
-                </summary>
+              <Disclosure
+                key={agent.name}
+                className="rounded-md border border-theme-border/50 bg-theme-base/30"
+                summaryClassName="gap-2 px-3 py-2 select-none hover:bg-theme-hover/50 rounded-md transition-colors"
+                summary={
+                  <>
+                    <agent.icon className="w-4 h-4 text-theme-text-tertiary" />
+                    <span className="text-sm font-medium text-theme-text-primary">{agent.name}</span>
+                    {agent.path && <span className="text-[10px] text-theme-text-tertiary ml-auto">{agent.path}</span>}
+                  </>
+                }
+              >
                 <div className="px-3 pb-3 pt-1">
                   <CodeBlock>{agent.config}</CodeBlock>
                 </div>
-              </details>
+              </Disclosure>
             ))}
           </div>
 
           {/* Available tools */}
           <div className="space-y-2">
-            <h4 className="text-sm font-semibold text-theme-text-primary">Tools</h4>
+            <div className="flex items-baseline justify-between">
+              <h4 className="text-sm font-semibold text-theme-text-primary">Tools</h4>
+              <span className="text-[11px] text-theme-text-tertiary">{MCP_TOOL_CATALOG.length} tools</span>
+            </div>
             <div className="grid grid-cols-1 gap-1.5">
-              {[
-                { name: 'get_dashboard', desc: 'Get cluster health overview including resource counts, problems (failing pods, unhealthy deployments), recent warning events, and Helm release status. Start here to understand cluster state before drilling into specific resources.', params: [
-                  { name: 'namespace', required: false, desc: 'filter to a specific namespace' },
-                ]},
-                { name: 'list_resources', desc: 'List Kubernetes resources of a given kind with minified summaries. Supports all built-in kinds (pods, deployments, services, etc.) and CRDs. Use to discover what\'s running before inspecting individual resources.', params: [
-                  { name: 'kind', required: true, desc: 'resource kind, e.g. pods, deployments, services' },
-                  { name: 'namespace', required: false, desc: 'filter to a specific namespace' },
-                ]},
-                { name: 'get_resource', desc: 'Get detailed information about a single Kubernetes resource. Returns minified spec, status, and metadata. Optionally include related context (events, relationships, metrics, logs) to avoid extra tool calls.', params: [
-                  { name: 'kind', required: true, desc: 'resource kind, e.g. pod, deployment, service' },
-                  { name: 'namespace', required: true, desc: 'resource namespace' },
-                  { name: 'name', required: true, desc: 'resource name' },
-                  { name: 'include', required: false, desc: 'events, relationships, metrics, logs' },
-                ]},
-                { name: 'get_topology', desc: 'Get the topology graph showing relationships between Kubernetes resources. Returns nodes and edges representing Deployments, Services, Ingresses, Pods, etc. Use \'traffic\' view for network flow or \'resources\' view for ownership hierarchy. Use \'summary\' format for LLM-friendly text descriptions.', params: [
-                  { name: 'namespace', required: false, desc: 'filter to a specific namespace' },
-                  { name: 'view', required: false, desc: 'traffic or resources' },
-                  { name: 'format', required: false, desc: 'graph (default) or summary (text)' },
-                ]},
-                { name: 'get_events', desc: 'Get recent Kubernetes warning events, deduplicated and sorted by recency. Useful for diagnosing issues — shows event reason, message, and occurrence count. Filter by resource kind/name to scope to a specific resource.', params: [
-                  { name: 'namespace', required: false, desc: 'filter to a specific namespace' },
-                  { name: 'limit', required: false, desc: 'max events to return (default 20)' },
-                  { name: 'kind', required: false, desc: 'filter to events for this resource kind' },
-                  { name: 'name', required: false, desc: 'filter to events for this resource name' },
-                ]},
-                { name: 'get_pod_logs', desc: 'Get filtered log lines from a pod, prioritizing errors and warnings. Returns diagnostically relevant lines (errors, panics, stack traces) or falls back to the last 20 lines if no error patterns match.', params: [
-                  { name: 'namespace', required: true, desc: 'pod namespace' },
-                  { name: 'name', required: true, desc: 'pod name' },
-                  { name: 'container', required: false, desc: 'container name (defaults to first)' },
-                  { name: 'tail_lines', required: false, desc: 'lines from end (default 200)' },
-                ]},
-                { name: 'list_namespaces', desc: 'List all Kubernetes namespaces with their status. Use to discover available namespaces before filtering other queries.', params: [] },
-                { name: 'get_changes', desc: 'Get recent resource changes (creates, updates, deletes) from the cluster timeline. Use to investigate what changed before an incident. Filter by namespace, resource kind, or specific resource name.', params: [
-                  { name: 'namespace', required: false, desc: 'filter to a specific namespace' },
-                  { name: 'kind', required: false, desc: 'filter to a resource kind (e.g. Deployment)' },
-                  { name: 'name', required: false, desc: 'filter to a specific resource name' },
-                  { name: 'since', required: false, desc: 'lookback duration, e.g. 1h, 30m (default 1h)' },
-                  { name: 'limit', required: false, desc: 'max changes to return (default 20, max 50)' },
-                ]},
-                { name: 'list_helm_releases', desc: 'List all Helm releases in the cluster with their status and health. Returns release name, namespace, chart, version, status, and resource health.', params: [
-                  { name: 'namespace', required: false, desc: 'filter to a specific namespace' },
-                ]},
-                { name: 'get_helm_release', desc: 'Get detailed information about a specific Helm release including owned resources and their status. Optionally include values, revision history, or manifest diff between revisions.', params: [
-                  { name: 'namespace', required: true, desc: 'release namespace' },
-                  { name: 'name', required: true, desc: 'release name' },
-                  { name: 'include', required: false, desc: 'values, history, diff' },
-                  { name: 'diff_revision_1', required: false, desc: 'first revision for diff' },
-                  { name: 'diff_revision_2', required: false, desc: 'second revision for diff (defaults to current)' },
-                ]},
-                { name: 'get_workload_logs', desc: 'Get aggregated, AI-filtered logs from all pods of a workload (Deployment, StatefulSet, or DaemonSet). Logs are collected from all matching pods, filtered for errors/warnings, and deduplicated.', params: [
-                  { name: 'kind', required: true, desc: 'deployment, statefulset, or daemonset' },
-                  { name: 'namespace', required: true, desc: 'workload namespace' },
-                  { name: 'name', required: true, desc: 'workload name' },
-                  { name: 'container', required: false, desc: 'specific container name' },
-                  { name: 'tail_lines', required: false, desc: 'lines per pod (default 100)' },
-                ]},
-                { name: 'manage_workload', desc: 'Perform operations on a workload. \'restart\' triggers a rolling restart, \'scale\' changes the replica count, \'rollback\' reverts to a previous revision.', params: [
-                  { name: 'action', required: true, desc: 'restart, scale, or rollback' },
-                  { name: 'kind', required: true, desc: 'deployment, statefulset, or daemonset' },
-                  { name: 'namespace', required: true, desc: 'workload namespace' },
-                  { name: 'name', required: true, desc: 'workload name' },
-                  { name: 'replicas', required: false, desc: 'target replica count (for scale)' },
-                  { name: 'revision', required: false, desc: 'target revision (for rollback)' },
-                ]},
-                { name: 'manage_cronjob', desc: 'Perform operations on a CronJob. \'trigger\' creates a manual Job run, \'suspend\' pauses the schedule, \'resume\' re-enables it.', params: [
-                  { name: 'action', required: true, desc: 'trigger, suspend, or resume' },
-                  { name: 'namespace', required: true, desc: 'cronjob namespace' },
-                  { name: 'name', required: true, desc: 'cronjob name' },
-                ]},
-                { name: 'manage_gitops', desc: 'Perform operations on GitOps resources. ArgoCD: sync, suspend, resume. FluxCD: reconcile, suspend, resume.', params: [
-                  { name: 'action', required: true, desc: 'sync/reconcile, suspend, or resume' },
-                  { name: 'tool', required: true, desc: 'argocd or fluxcd' },
-                  { name: 'namespace', required: true, desc: 'resource namespace' },
-                  { name: 'name', required: true, desc: 'resource name' },
-                  { name: 'kind', required: false, desc: 'FluxCD resource kind (e.g. kustomization, helmrelease)' },
-                ]},
-              ].map((tool) => (
+              {MCP_TOOL_CATALOG.map((tool) => (
                 <div key={tool.name} className="card-inner space-y-1.5">
-                  <code className="text-[11px] font-mono text-purple-400">{tool.name}</code>
+                  <div className="flex items-center gap-2">
+                    <code className="inline-code text-[11px]">{tool.name}</code>
+                    {tool.write && (
+                      <Tooltip content="Write tool — annotated as destructive">
+                      <span className="badge-sm bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                        write
+                      </span>
+                      </Tooltip>
+                    )}
+                  </div>
                   <p className="text-[11px] text-theme-text-tertiary leading-relaxed">{tool.desc}</p>
                   {tool.params.length > 0 && (
                     <div className="flex flex-wrap gap-1.5 pt-0.5">
                       {tool.params.map((p) => (
-                        <span key={p.name} className="badge-sm font-mono bg-theme-elevated text-theme-text-secondary" title={p.desc}>
-                          <span className="text-theme-text-secondary">{p.name}</span>
+                        <Tooltip key={p.arg} content={p.desc}>
+                        <span className="inline-code text-[11px]">
+                          <span>{p.arg}</span>
                           {p.required && <span className="text-red-400">*</span>}
                         </span>
+                        </Tooltip>
                       ))}
                     </div>
                   )}

@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"log"
+	"regexp"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -14,9 +15,13 @@ import (
 // Re-export types from pkg/k8score for backward compatibility.
 type WorkloadRevision = k8score.WorkloadRevision
 type UpdateResourceOptions = k8score.UpdateResourceOptions
+type PreviewUpdateResourceResult = k8score.PreviewUpdateResourceResult
 type DeleteResourceOptions = k8score.DeleteResourceOptions
 type ApplyResourceOptions = k8score.ApplyResourceOptions
 type ApplyResourceResult = k8score.ApplyResourceResult
+type WorkloadImageInventory = k8score.WorkloadImageInventory
+type WorkloadImageUpdate = k8score.WorkloadImageUpdate
+type SetWorkloadImagesResult = k8score.SetWorkloadImagesResult
 
 func getWorkloadManager() *k8score.WorkloadManager {
 	var disc *k8score.ResourceDiscovery
@@ -52,6 +57,10 @@ func UpdateResourceWithClient(ctx context.Context, opts UpdateResourceOptions, c
 	return getWorkloadManagerWithClient(client).UpdateResource(ctx, opts)
 }
 
+func PreviewUpdateResourceWithClient(ctx context.Context, opts UpdateResourceOptions, client dynamic.Interface) (*PreviewUpdateResourceResult, error) {
+	return getWorkloadManagerWithClient(client).PreviewUpdateResource(ctx, opts)
+}
+
 // DeleteResource deletes a Kubernetes resource.
 func DeleteResource(ctx context.Context, opts DeleteResourceOptions) error {
 	return getWorkloadManager().DeleteResource(ctx, opts)
@@ -73,12 +82,15 @@ func ApplyResourceWithClient(ctx context.Context, opts ApplyResourceOptions, cli
 	return getWorkloadManagerWithClient(client).ApplyResource(ctx, opts)
 }
 
-// SplitYAMLDocuments splits multi-document YAML on "---" separators.
+var yamlDocumentSeparator = regexp.MustCompile(`(?m)^---(?:[ \t]+#.*|[ \t]*)\r?$`)
+
+// SplitYAMLDocuments preserves each manifest exactly apart from surrounding
+// whitespace so preview and apply use identical document indices and content.
 func SplitYAMLDocuments(content string) []string {
 	var docs []string
-	for _, doc := range strings.Split(content, "\n---") {
+	for _, doc := range yamlDocumentSeparator.Split(content, -1) {
 		doc = strings.TrimSpace(doc)
-		if doc != "" && doc != "---" {
+		if doc != "" {
 			docs = append(docs, doc)
 		}
 	}
@@ -113,6 +125,14 @@ func RestartWorkload(ctx context.Context, kind, namespace, name string) error {
 // RestartWorkloadWithClient performs a rolling restart using the provided client.
 func RestartWorkloadWithClient(ctx context.Context, kind, namespace, name string, client dynamic.Interface) error {
 	return getWorkloadManagerWithClient(client).RestartWorkload(ctx, kind, namespace, name)
+}
+
+func GetWorkloadImagesWithClient(ctx context.Context, kind, namespace, name string, client dynamic.Interface) (*WorkloadImageInventory, error) {
+	return getWorkloadManagerWithClient(client).GetWorkloadImages(ctx, kind, namespace, name)
+}
+
+func SetWorkloadImagesWithClient(ctx context.Context, kind, namespace, name string, updates []WorkloadImageUpdate, client dynamic.Interface) (*SetWorkloadImagesResult, error) {
+	return getWorkloadManagerWithClient(client).SetWorkloadImages(ctx, kind, namespace, name, updates)
 }
 
 // ScaleWorkload scales a Deployment or StatefulSet to the specified replica count.

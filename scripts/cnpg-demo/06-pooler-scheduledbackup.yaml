@@ -1,0 +1,49 @@
+---
+# Pooler.
+#
+# NOT named `pg-healthy-rw`. CNPG already creates `<cluster>-rw`, `-ro` and
+# `-r` Services for every cluster, and a Pooler creates a Service of its own
+# name — so `pg-healthy-rw` finds a Service it does not own and refuses to
+# reconcile forever with `invalid ownership for managed resources`. No status,
+# no Deployment, no error surfaced on the CR itself.
+#
+# Its positive state is labelled "Scheduled", not "Ready":
+# `status.instances` counts pods the controller is TRYING to schedule, not
+# ready ones, so it reads N/N while every pod is Pending. Real readiness lives
+# on the generated Deployment, which the Pooler CR cannot see.
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: pg-healthy-pooler
+  namespace: pg
+spec:
+  cluster:
+    name: pg-healthy
+  instances: 2
+  type: rw
+  pgbouncer:
+    poolMode: transaction
+---
+# ScheduledBackup with `method: plugin`.
+#
+# Chosen over the default barmanObjectStore method on purpose: the
+# `cnpgNoDeclarativeBackup` audit check must count ALL THREE method values as
+# declarative backup configuration. A fixture that only ever uses the default
+# would pass whether or not the check is plugin-aware, so it would prove
+# nothing about the branch most likely to be wrong.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: pg-nightly
+  namespace: pg
+spec:
+  schedule: "0 0 2 * * *"
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+    # Names the ObjectStore this schedule writes into. Without it the plugin
+    # path is only half-declared and the UI has no destination to link to.
+    parameters:
+      barmanObjectName: pg-store
+  cluster:
+    name: pg-wal-failing

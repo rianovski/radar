@@ -4,48 +4,93 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/validation"
+
 	"github.com/skyhook-io/radar/internal/auth"
 	"github.com/skyhook-io/radar/internal/config"
+	"github.com/skyhook-io/radar/internal/errorlog"
 	"github.com/skyhook-io/radar/internal/helm"
+	"github.com/skyhook-io/radar/internal/investigationrefs"
 	"github.com/skyhook-io/radar/internal/k8s"
 	mcppkg "github.com/skyhook-io/radar/internal/mcp"
+	internalopencost "github.com/skyhook-io/radar/internal/opencost"
 	prometheuspkg "github.com/skyhook-io/radar/internal/prometheus"
 	"github.com/skyhook-io/radar/internal/server"
+	"github.com/skyhook-io/radar/internal/settings"
 	"github.com/skyhook-io/radar/internal/static"
 	"github.com/skyhook-io/radar/internal/timeline"
 	"github.com/skyhook-io/radar/internal/traffic"
 	versionpkg "github.com/skyhook-io/radar/internal/version"
+	"github.com/skyhook-io/radar/pkg/prom"
 )
+
+var clusterConnectionProbe = k8s.TestClusterConnection
 
 // AppConfig holds all parsed configuration for the Radar application.
 type AppConfig struct {
-	Kubeconfig           string
-	KubeconfigDirs       []string
-	Namespace            string
-	Port                 int
-	NoBrowser            bool
-	DevMode              bool
-	HistoryLimit         int
-	DebugEvents          bool
-	FakeInCluster        bool
-	DisableHelmWrite     bool
-	DisableExec          bool
-	DisableLocalTerminal bool
-	PodShellDefault      string
-	TimelineStorage      string
-	TimelineDBPath       string
-	TimelineRetention    time.Duration
-	PrometheusURL        string
-	Version              string
-	MCPEnabled           bool
-	AuthConfig           auth.Config
+	Kubeconfig     string
+	KubeconfigDirs []string
+	// Zero value is the deliberate one: an entrypoint that never sets this
+	// starts on the kubeconfig's current-context. Only cmd/desktop opts in.
+	RestoreLastDesktopContext bool
+	Namespace                 string
+	Namespaces                []string
+	Port                      int
+	PortFallback              bool // Port is a preference, not a requirement (Desktop's remembered port)
+	ListenAddress             string
+	ShowRemoteAccessHint      bool
+	BasePath                  string
+	NoBrowser                 bool
+	Browser                   string
+	DevMode                   bool
+	HistoryLimit              int
+	DebugEvents               bool
+	FakeInCluster             bool
+	DisableHelmWrite          bool
+	DisableExec               bool
+	DisableLocalTerminal      bool
+	PodShellDefault           string
+	DebugImage                string
+	ReachabilityImage         string
+	ListPageSize              int64
+	NamespaceScope            bool
+	TimelineStorage           string
+	TimelineDBPath            string
+	TimelinePostgresDSN       string
+	TimelineRetention         time.Duration
+	TimelineMaxSizeBytes      int64
+	PrometheusURL             string
+	OpenCostCurrency          string
+	OpenCostFlagSet           bool
+	CostSource                string
+	KubecostURL               string
+	KubecostAPIKey            string
+	KubecostAPIKeyContext     string
+	KubecostClusterID         string
+	KubecostClusterIDContext  string
+	PrometheusHeaders         map[string]string
+	PrometheusHeadersFromEnv  map[string]string
+	PrometheusURLFlag         bool
+	PrometheusHeaderFlags     bool
+	BeylaJobSelector          string
+	WorkloadMetricsScope      prom.WorkloadMetricsScope
+	Version                   string
+	MCPEnabled                bool
+	AIHistory                 bool   // persist AI investigations across restarts
+	AIHistoryDBPath           string // "" = ~/.radar/ai-runs.db
+	AuthConfig                auth.Config
+	HubAPIURL                 string // Hub API origin override ("" = hosted default)
+	HubAppURL                 string // Hub frontend origin override ("" = derived)
+	CloudTunnelConfigured     bool   // --cloud-url was set on this process
 }
 
 // appPool is created in CreateServer and seeded after InitAllSubsystems completes.
@@ -56,34 +101,64 @@ var appPool *k8s.CachePool
 func SetGlobals(cfg AppConfig) {
 	k8s.DebugEvents = cfg.DebugEvents
 	k8s.TimingLogs = cfg.DevMode
+	// Init-only write, before any goroutine reads it; later reads happen under
+	// clientMu and assume no concurrent mutation.
 	k8s.ForceInCluster = cfg.FakeInCluster
 	k8s.ForceDisableHelmWrite = cfg.DisableHelmWrite
 	k8s.ForceDisableExec = cfg.DisableExec
 	k8s.ForceDisableLocalTerminal = cfg.DisableLocalTerminal
+	k8s.ListPageSize = cfg.ListPageSize
+	k8s.ForceNamespaceScope = cfg.NamespaceScope
 	server.DefaultPodShellCommand = cfg.PodShellDefault
 	versionpkg.SetCurrent(cfg.Version)
 }
 
+// validateNamespaceFanout rejects a --namespaces list that cannot fully fit
+// in the probe candidate cap. The kubeconfig context namespace is prepended
+// to the candidates, so a distinct one occupies a cap slot the flag-time
+// length check could not account for (kubeconfig wasn't parsed yet). Failing
+// here beats silently dropping the last configured namespace from probing.
+func validateNamespaceFanout(namespaces []string, ctxNs string, maxCandidates int) error {
+	slots := len(namespaces)
+	if ctxNs != "" && !slices.Contains(namespaces, ctxNs) {
+		slots++
+	}
+	if slots > maxCandidates {
+		return fmt.Errorf("--namespaces lists %d namespaces and the kubeconfig context namespace %q adds one more probe candidate, exceeding the fanout cap of %d; raise --max-scope-candidates or include the context namespace in the list", len(namespaces), ctxNs, maxCandidates)
+	}
+	return nil
+}
+
 // InitializeK8s creates and configures the Kubernetes client.
 func InitializeK8s(cfg AppConfig) error {
-	err := k8s.Initialize(k8s.InitOptions{
-		KubeconfigPath: cfg.Kubeconfig,
-		KubeconfigDirs: cfg.KubeconfigDirs,
+	preferredContext, err := startupContextPreference(cfg)
+	if err != nil {
+		log.Printf("[context] failed to read the remembered Desktop context: %v", err)
+		errorlog.Record("k8s-init", "warning",
+			"could not read the Desktop cluster memory from local settings. Starting on the kubeconfig's current-context instead; check ~/.radar/settings.json.")
+	}
+	err = k8s.Initialize(k8s.InitOptions{
+		KubeconfigPath:   cfg.Kubeconfig,
+		KubeconfigDirs:   cfg.KubeconfigDirs,
+		PreferredContext: preferredContext,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize K8s client: %w", err)
 	}
 
-	if cfg.Namespace != "" {
+	if len(cfg.Namespaces) > 0 {
+		k8s.SetFallbackNamespaces(cfg.Namespaces)
+		if err := validateNamespaceFanout(cfg.Namespaces, k8s.GetContextNamespace(), k8s.MaxScopeCandidates); err != nil {
+			return err
+		}
+	} else if cfg.Namespace != "" {
 		k8s.SetFallbackNamespace(cfg.Namespace)
 	}
-
-	if len(cfg.KubeconfigDirs) > 0 {
-		log.Printf("Using kubeconfigs from directories: %v", cfg.KubeconfigDirs)
-	} else if kubepath := k8s.GetKubeconfigPath(); kubepath != "" {
-		log.Printf("Using kubeconfig: %s", kubepath)
-	} else {
-		log.Printf("Using in-cluster config")
+	configureNamespaceScopePreferenceResolver(cfg)
+	if cfg.NamespaceScope {
+		if err := validateNamespaceScopeTarget(k8s.GetNamespaceScopeTarget()); err != nil {
+			return err
+		}
 	}
 
 	k8s.SetConnectionStatus(k8s.ConnectionStatus{
@@ -95,13 +170,72 @@ func InitializeK8s(cfg AppConfig) error {
 	return nil
 }
 
+// validateNamespaceScopeTarget enforces that --namespace-scope resolves to
+// exactly one valid namespace. Multiple namespaces (e.g. --namespace=a,b) are
+// not supported yet — the informer cache pins to a single namespace — so reject
+// them at startup with a clear message instead of silently caching an invalid one.
+func validateNamespaceScopeTarget(target string) error {
+	if target == "" {
+		return fmt.Errorf("--namespace-scope requires --namespace or a namespace on the current kubeconfig context")
+	}
+	if errs := validation.IsDNS1123Label(target); len(errs) > 0 {
+		return fmt.Errorf("--namespace-scope supports a single namespace; %q is not a valid namespace name (multiple namespaces are not supported yet): %s", target, strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func configureNamespaceScopePreferenceResolver(cfg AppConfig) {
+	k8s.SetNamespaceScopePreferenceResolver(nil)
+	if !cfg.NamespaceScope || cfg.AuthConfig.Enabled() {
+		return
+	}
+	// Resolve the scoped namespace from the local per-context pick. Registered
+	// even when --namespace is set, so a UI rescope (which persists its pick)
+	// survives a reconnect / context switch instead of snapping back.
+	k8s.SetNamespaceScopePreferenceResolver(func(ctxName string) (string, bool) {
+		activeNamespaces := settings.Load().ActiveNamespaces
+		if len(activeNamespaces[ctxName]) == 1 && activeNamespaces[ctxName][0] != "" {
+			return activeNamespaces[ctxName][0], true
+		}
+		return "", false
+	})
+	// Treat an explicit --namespace like a UI pick of that namespace: seed it as
+	// this run's authoritative starting scope (overwriting a stale pick from a
+	// previous run). A later UI rescope overwrites it, and that rescope is what
+	// then survives reconnects.
+	if cfg.Namespace != "" {
+		seedNamespaceScopePick(k8s.GetContextName(), cfg.Namespace)
+	}
+	k8s.RestoreNamespaceScopePreference(k8s.GetContextName())
+}
+
+// seedNamespaceScopePick persists ns as the single active namespace for ctxName,
+// mirroring what a UI namespace pick stores. No-op on an empty context name.
+func seedNamespaceScopePick(ctxName, ns string) {
+	if ctxName == "" {
+		return
+	}
+	if _, err := settings.Update(func(st *settings.Settings) {
+		if st.ActiveNamespaces == nil {
+			st.ActiveNamespaces = map[string][]string{}
+		}
+		st.ActiveNamespaces[ctxName] = []string{ns}
+	}); err != nil {
+		log.Printf("[namespace] failed to seed namespace pick for context %q: %v", ctxName, err)
+	}
+}
+
 // BuildTimelineStoreConfig creates the timeline store configuration from app config.
-func BuildTimelineStoreConfig(cfg AppConfig) timeline.StoreConfig {
+func BuildTimelineStoreConfig(cfg AppConfig) (timeline.StoreConfig, error) {
 	storeCfg := timeline.StoreConfig{
 		Type:    timeline.StoreTypeMemory,
 		MaxSize: cfg.HistoryLimit,
 	}
-	if cfg.TimelineStorage == "sqlite" {
+
+	switch cfg.TimelineStorage {
+	case "", "memory":
+		return storeCfg, nil
+	case "sqlite":
 		storeCfg.Type = timeline.StoreTypeSQLite
 		dbPath := cfg.TimelineDBPath
 		if dbPath == "" {
@@ -110,8 +244,19 @@ func BuildTimelineStoreConfig(cfg AppConfig) timeline.StoreConfig {
 		}
 		storeCfg.Path = dbPath
 		storeCfg.RetentionAge = cfg.TimelineRetention
+		storeCfg.MaxStorageBytes = cfg.TimelineMaxSizeBytes
+		return storeCfg, nil
+	case "postgres":
+		if cfg.TimelinePostgresDSN == "" {
+			return timeline.StoreConfig{}, fmt.Errorf("PostgreSQL timeline storage requires a DSN")
+		}
+		storeCfg.Type = timeline.StoreTypePostgres
+		storeCfg.DSN = cfg.TimelinePostgresDSN
+		storeCfg.RetentionAge = cfg.TimelineRetention
+		return storeCfg, nil
+	default:
+		return timeline.StoreConfig{}, fmt.Errorf("unknown timeline storage %q", cfg.TimelineStorage)
 	}
-	return storeCfg
 }
 
 // RegisterCallbacks registers Helm, timeline, traffic, and Prometheus reset/reinit
@@ -120,12 +265,31 @@ func BuildTimelineStoreConfig(cfg AppConfig) timeline.StoreConfig {
 func RegisterCallbacks(cfg AppConfig, timelineStoreCfg timeline.StoreConfig) {
 	k8s.RegisterHelmFuncs(helm.ResetClient, helm.ReinitClient)
 
-	k8s.RegisterTimelineFuncs(timeline.ResetStore, func() error {
-		return timeline.ReinitStore(timelineStoreCfg)
+	RegisterLastContextMemory(cfg)
+
+	k8s.RegisterTimelineFuncs(func() {
+		// Reset the store AND the per-cluster event-pipeline metrics: RecentDrops
+		// name resources from the previous cluster and must not survive the switch.
+		timeline.ResetStore()
+		timeline.ResetMetricsForContextSwitch()
+	}, func() error {
+		if err := timeline.ReinitStore(timelineStoreCfg); err != nil {
+			// PostgreSQL deliberately does not degrade to memory: an operator who
+			// pointed Radar at an external database must not silently get an
+			// in-memory timeline that vanishes on restart. Every other backend
+			// keeps the historical behaviour — warn and continue degraded rather
+			// than fail the whole subsystem bring-up, which would also take down
+			// cluster browsing.
+			if timelineStoreCfg.Type == timeline.StoreTypePostgres {
+				return err
+			}
+			log.Printf("Warning: timeline init failed, continuing degraded: %v", err)
+		}
+		return nil
 	})
 
 	// Initialize Prometheus metrics client (must come before SetManualURL)
-	prometheuspkg.Initialize(k8s.GetClient(), k8s.GetConfig(), k8s.GetContextName())
+	prometheuspkg.Initialize(k8s.GetClientInterface(), k8s.GetConfig(), k8s.GetContextName())
 
 	if cfg.PrometheusURL != "" {
 		u, err := url.Parse(cfg.PrometheusURL)
@@ -135,52 +299,181 @@ func RegisterCallbacks(cfg AppConfig, timelineStoreCfg timeline.StoreConfig) {
 		traffic.SetMetricsURL(cfg.PrometheusURL)
 		prometheuspkg.SetManualURL(cfg.PrometheusURL)
 	}
+	if len(cfg.PrometheusHeaders) > 0 {
+		traffic.SetMetricsHeaders(cfg.PrometheusHeaders)
+		prometheuspkg.SetHeaders(cfg.PrometheusHeaders)
+		if prom.HeadersRequireURL(cfg.PrometheusURL, cfg.PrometheusHeaders) {
+			log.Printf("[prometheus] Warning: %v", prom.ErrHeadersRequireURL)
+		}
+	}
+	cfg = persistKubecostContextBindings(cfg)
+	if err := internalopencost.ConfigureStartup(internalopencost.ManagerConfig{
+		Source:           internalopencost.Source(cfg.CostSource),
+		URL:              cfg.KubecostURL,
+		APIKey:           cfg.KubecostAPIKey,
+		APIKeyContext:    cfg.KubecostAPIKeyContext,
+		ClusterID:        cfg.KubecostClusterID,
+		ClusterIDContext: cfg.KubecostClusterIDContext,
+	}); err != nil {
+		log.Printf("[opencost] Invalid cost source configuration: %v", err)
+	}
+	if cfg.BeylaJobSelector != "" {
+		traffic.SetBeylaJobSelector(cfg.BeylaJobSelector)
+	}
+	if cfg.WorkloadMetricsScope.SingleCluster || len(cfg.WorkloadMetricsScope.ClusterLabels) > 0 {
+		if err := prometheuspkg.SetWorkloadMetricsScope(cfg.WorkloadMetricsScope, cfg.BeylaJobSelector); err != nil {
+			log.Fatalf("Invalid workload metrics scope: %v", err)
+		}
+	}
 
 	k8s.RegisterTrafficFuncs(traffic.Reset, func() error {
-		return traffic.ReinitializeWithConfig(k8s.GetClient(), k8s.GetConfig(), k8s.GetContextName())
+		return traffic.ReinitializeWithConfig(k8s.GetClientInterface(), k8s.GetConfig(), k8s.GetContextName())
 	})
 
+	// Reinitialize carries the current manual URL + headers forward (including any
+	// applied live via /integrations/prometheus). Re-applying the captured startup
+	// cfg here would revert a live change on context switch, so we don't.
 	k8s.RegisterPrometheusFuncs(prometheuspkg.Reset, func() error {
-		prometheuspkg.Reinitialize(k8s.GetClient(), k8s.GetConfig(), k8s.GetContextName())
-		if cfg.PrometheusURL != "" {
-			prometheuspkg.SetManualURL(cfg.PrometheusURL)
-		}
+		prometheuspkg.Reinitialize(k8s.GetClientInterface(), k8s.GetConfig(), k8s.GetContextName())
 		return nil
 	})
+	// Reinitialize only builds the new client; discovery for the new cluster has
+	// to be started explicitly, and the callback fires once subsystem init is
+	// done so the run sees a populated cache.
+	k8s.OnContextSwitch(func(_ string) { prometheuspkg.Prewarm() })
+	k8s.OnNamespaceRescope(func(_ string) { prometheuspkg.Prewarm() })
+	k8s.RegisterCostResetFunc(internalopencost.Reset)
+}
+
+func persistKubecostContextBindings(cfg AppConfig) AppConfig {
+	contextName := strings.TrimSpace(k8s.GetContextName())
+	if contextName == "" {
+		return cfg
+	}
+	stored := config.Load()
+	bindAPIKey := strings.TrimSpace(cfg.KubecostURL) == "" && cfg.KubecostAPIKey != "" && strings.TrimSpace(cfg.KubecostAPIKeyContext) == "" &&
+		strings.TrimSpace(stored.KubecostURL) == "" && stored.KubecostAPIKey == cfg.KubecostAPIKey && strings.TrimSpace(stored.KubecostAPIKeyContext) == ""
+	bindClusterID := strings.TrimSpace(cfg.KubecostClusterID) != "" && strings.TrimSpace(cfg.KubecostClusterIDContext) == "" &&
+		stored.KubecostClusterID == cfg.KubecostClusterID && strings.TrimSpace(stored.KubecostClusterIDContext) == ""
+	if !bindAPIKey && !bindClusterID {
+		return cfg
+	}
+	updated, err := config.Update(func(c *config.Config) {
+		if bindAPIKey && strings.TrimSpace(c.KubecostURL) == "" && c.KubecostAPIKey == cfg.KubecostAPIKey && strings.TrimSpace(c.KubecostAPIKeyContext) == "" {
+			c.KubecostAPIKeyContext = contextName
+		}
+		if bindClusterID && c.KubecostClusterID == cfg.KubecostClusterID && strings.TrimSpace(c.KubecostClusterIDContext) == "" {
+			c.KubecostClusterIDContext = contextName
+		}
+	})
+	if err != nil {
+		log.Printf("[opencost] Failed to persist Kubecost context binding: %v", err)
+		return cfg
+	}
+	if updated.KubecostAPIKey == cfg.KubecostAPIKey && strings.TrimSpace(updated.KubecostURL) == strings.TrimSpace(cfg.KubecostURL) {
+		cfg.KubecostAPIKeyContext = updated.KubecostAPIKeyContext
+	}
+	if updated.KubecostClusterID == cfg.KubecostClusterID {
+		cfg.KubecostClusterIDContext = updated.KubecostClusterIDContext
+	}
+	return cfg
 }
 
 // CreateServer creates the HTTP server with the given configuration.
 func CreateServer(cfg AppConfig) *server.Server {
+	if err := loadOperatorSettings(cfg); err != nil {
+		log.Fatalf("Invalid operator settings: %v", err)
+	}
+	restoreLastDesktopContext := remembersLastContext(cfg)
+	costSource := cfg.CostSource
+	kubecostURL := cfg.KubecostURL
+	kubecostAPIKey := cfg.KubecostAPIKey
+	kubecostAPIKeyContext := cfg.KubecostAPIKeyContext
+	kubecostClusterID := cfg.KubecostClusterID
+	kubecostClusterIDContext := cfg.KubecostClusterIDContext
+	if internalopencost.IsEnvManaged() {
+		costConfig := internalopencost.ConfigSnapshot()
+		costSource = string(costConfig.Source)
+		kubecostURL = costConfig.URL
+		kubecostAPIKey = costConfig.APIKey
+		kubecostAPIKeyContext = costConfig.APIKeyContext
+		kubecostClusterID = costConfig.ClusterID
+		kubecostClusterIDContext = costConfig.ClusterIDContext
+	}
 	effectiveCfg := &config.Config{
-		Kubeconfig:      cfg.Kubeconfig,
-		KubeconfigDirs:  cfg.KubeconfigDirs,
-		Namespace:       cfg.Namespace,
-		Port:            cfg.Port,
-		NoBrowser:       cfg.NoBrowser,
-		TimelineStorage: cfg.TimelineStorage,
-		TimelineDBPath:  cfg.TimelineDBPath,
-		HistoryLimit:    cfg.HistoryLimit,
-		PrometheusURL:   cfg.PrometheusURL,
-		MCP:             &cfg.MCPEnabled,
+		Kubeconfig:                cfg.Kubeconfig,
+		KubeconfigDirs:            cfg.KubeconfigDirs,
+		Namespace:                 cfg.Namespace,
+		Namespaces:                cfg.Namespaces,
+		Port:                      cfg.Port,
+		NoBrowser:                 cfg.NoBrowser,
+		Browser:                   cfg.Browser,
+		TimelineStorage:           cfg.TimelineStorage,
+		TimelineDBPath:            cfg.TimelineDBPath,
+		TimelineMaxSize:           fmt.Sprintf("%d", cfg.TimelineMaxSizeBytes),
+		HistoryLimit:              cfg.HistoryLimit,
+		PrometheusURL:             cfg.PrometheusURL,
+		OpenCostCurrency:          cfg.OpenCostCurrency,
+		CostSource:                costSource,
+		KubecostURL:               kubecostURL,
+		KubecostAPIKey:            kubecostAPIKey,
+		KubecostAPIKeyContext:     kubecostAPIKeyContext,
+		KubecostClusterID:         kubecostClusterID,
+		KubecostClusterIDContext:  kubecostClusterIDContext,
+		PrometheusHeaders:         cfg.PrometheusHeaders,
+		PrometheusHeadersFromEnv:  cfg.PrometheusHeadersFromEnv,
+		DebugImage:                cfg.DebugImage,
+		ReachabilityImage:         cfg.ReachabilityImage,
+		MCP:                       &cfg.MCPEnabled,
+		RestoreLastDesktopContext: &restoreLastDesktopContext,
 	}
 
 	serverCfg := server.Config{
-		Port:            cfg.Port,
-		DevMode:         cfg.DevMode,
-		StaticFS:        static.FS,
-		StaticRoot:      "dist",
-		EffectiveConfig: effectiveCfg,
+		Port:                  cfg.Port,
+		PortFallback:          cfg.PortFallback,
+		ListenAddress:         cfg.ListenAddress,
+		BasePath:              cfg.BasePath,
+		StartupLog:            true,
+		RemoteAccessHint:      cfg.ShowRemoteAccessHint,
+		DevMode:               cfg.DevMode,
+		StaticFS:              static.FS,
+		StaticRoot:            "dist",
+		EffectiveConfig:       effectiveCfg,
+		PrometheusURLFlag:     cfg.PrometheusURLFlag,
+		PrometheusHeaderFlags: cfg.PrometheusHeaderFlags,
+		OpenCostCurrency:      cfg.OpenCostCurrency,
+		OpenCostManaged:       cfg.OpenCostFlagSet,
 		DiagConfig: &server.DiagConfig{
-			Port:             cfg.Port,
-			DevMode:          cfg.DevMode,
-			Namespace:        cfg.Namespace,
-			TimelineStorage:  cfg.TimelineStorage,
-			HistoryLimit:     cfg.HistoryLimit,
-			DebugEvents:      cfg.DebugEvents,
-			MCPEnabled:       cfg.MCPEnabled,
-			HasPrometheusURL: cfg.PrometheusURL != "",
+			Port:                 cfg.Port,
+			DevMode:              cfg.DevMode,
+			Namespace:            cfg.Namespace,
+			TimelineStorage:      cfg.TimelineStorage,
+			HistoryLimit:         cfg.HistoryLimit,
+			DebugEvents:          cfg.DebugEvents,
+			MCPEnabled:           cfg.MCPEnabled,
+			OpenCostCurrency:     cfg.OpenCostCurrency,
+			HasPrometheusURL:     cfg.PrometheusURL != "",
+			HasPrometheusHeaders: len(cfg.PrometheusHeaders) > 0,
 		},
 		AuthConfig: cfg.AuthConfig,
+		CloudConnect: server.CloudConnectConfig{
+			HubAPIURL:             cfg.HubAPIURL,
+			HubAppURL:             cfg.HubAppURL,
+			Kubeconfig:            cfg.Kubeconfig,
+			CloudTunnelConfigured: cfg.CloudTunnelConfigured,
+		},
+	}
+
+	// AI-history DB path: resolved here (like the timeline DB) so the server
+	// only sees a ready-to-open path. Only meaningful where the AI engine can
+	// actually enable (no-auth + MCP mounted) — the server checks that gate.
+	if cfg.AIHistory {
+		dbPath := cfg.AIHistoryDBPath
+		if dbPath == "" {
+			homeDir, _ := os.UserHomeDir()
+			dbPath = filepath.Join(homeDir, ".radar", "ai-runs.db")
+		}
+		serverCfg.AIHistoryDB = dbPath
 	}
 
 	// Pool is only useful for multi-context switching; skip for in-cluster deployments
@@ -191,12 +484,15 @@ func CreateServer(cfg AppConfig) *server.Server {
 	}
 
 	if cfg.MCPEnabled {
-		serverCfg.MCPHandler = mcppkg.NewHandler(appPool)
-		if cfg.Port != 0 {
-			log.Printf("MCP server enabled at http://localhost:%d/mcp", cfg.Port)
-		} else {
-			log.Printf("MCP server enabled (port will be assigned at startup)")
-		}
+		// The same in-memory registry must back both ends of Radar's private
+		// evidence protocol: DiagnoseStream owns active turn scopes, while the MCP
+		// handler records exactly what Radar returned inside those scopes.
+		evidenceRefs := investigationrefs.NewRegistry()
+		serverCfg.InvestigationRefs = evidenceRefs
+		mcppkg.SetPool(appPool)
+		serverCfg.MCPHandler = mcppkg.NewHandler()
+		serverCfg.MCPReadOnlyHandler = mcppkg.NewReadOnlyHandler()
+		serverCfg.MCPInvestigationHandler = mcppkg.NewInvestigationHandler(evidenceRefs)
 	}
 
 	srv := server.New(serverCfg)
@@ -212,12 +508,13 @@ func CreateServer(cfg AppConfig) *server.Server {
 // (RBAC checks + informer sync) so neither blocks the other. If the
 // connectivity check fails, subsystem init is canceled immediately.
 func InitializeCluster() {
+	log.Printf("── Kubernetes initialization · %s ─────────────────────────", k8s.SanitizeForLog(k8s.GetContextName()))
+
 	// Cancel any in-flight API calls from previous attempts (e.g., browser
 	// polling /api/capabilities with RBAC checks through a broken exec plugin).
 	k8s.CancelOngoingOperations()
 
 	clusterStart := time.Now()
-	log.Printf("[ops] InitializeCluster START (context=%s)", k8s.GetContextName())
 
 	k8s.SetConnectionStatus(k8s.ConnectionStatus{
 		State:       k8s.StateConnecting,
@@ -275,13 +572,14 @@ func InitializeCluster() {
 		// Update status IMMEDIATELY so the UI shows the error page.
 		// Don't wait for subsystem drain — exec credential plugins serialize
 		// API calls, so draining 20+ RBAC checks can take 30+ seconds.
+		errorType := k8s.ClassifyError(err)
 		k8s.SetConnectionStatus(k8s.ConnectionStatus{
 			State:     k8s.StateDisconnected,
 			Context:   k8s.GetContextName(),
 			Error:     err.Error(),
-			ErrorType: k8s.ClassifyError(err),
+			ErrorType: errorType,
 		})
-		log.Printf("[ops] InitializeCluster FAILED: %v (errorType=%s, %v elapsed)", err, k8s.ClassifyError(err), time.Since(clusterStart))
+		log.Printf("[ops] InitializeCluster FAILED: %v (errorType=%s, %v elapsed)", err, errorType, time.Since(clusterStart))
 
 		// Drain subsystem goroutine in background to prevent goroutine leak.
 		// Cleanup is handled by the next context switch or retry.
@@ -334,45 +632,51 @@ func InitializeCluster() {
 		}, func() {})
 	}
 
-	// Auto-discover Prometheus in the background so charts are ready immediately
-	go func() {
-		pt := time.Now()
-		promCtx, promCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer promCancel()
-		client := prometheuspkg.GetClient()
-		if client == nil {
-			return
-		}
-		if _, _, err := client.EnsureConnected(promCtx); err != nil {
-			log.Printf("[prometheus] Auto-discovery failed (%v): %v", time.Since(pt), err)
-		} else {
-			log.Printf("[prometheus] Auto-discovery succeeded (%v)", time.Since(pt))
-		}
-	}()
+	prometheuspkg.Prewarm()
 }
 
-// WriteMCPPortFile writes the actual server port to ~/.radar/mcp-port so MCP
-// clients can discover the running instance without hardcoding a port.
-func WriteMCPPortFile(port int) {
+// mcpPortFileDisabled suppresses port-file writes AND removals — an ephemeral
+// instance (radar diagnose --standalone) must never clobber or delete the slot
+// a real long-running Radar owns.
+var mcpPortFileDisabled bool
+
+// DisableMCPPortFile makes Write/RemoveMCPPortFile no-ops for this process.
+func DisableMCPPortFile() { mcpPortFileDisabled = true }
+
+// Desktop and CLI installations share this file and can update independently.
+// Keep localhost discovery port-only unless a base path is needed; an explicit
+// host occupies line 3.
+func WriteMCPPortFile(address string, basePath string) {
 	path := mcpPortFilePath()
-	if path == "" {
+	if path == "" || mcpPortFileDisabled {
+		return
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		log.Printf("[mcp] Invalid discovery address %q: %v", address, err)
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		log.Printf("[mcp] Failed to create directory for port file: %v", err)
 		return
 	}
-	if err := os.WriteFile(path, fmt.Appendf(nil, "%d\n", port), 0o644); err != nil {
+	contents := fmt.Appendf(nil, "%s\n", port)
+	if basePath != "" || host != "localhost" {
+		contents = fmt.Appendf(contents, "%s\n", basePath)
+	}
+	if host != "localhost" {
+		contents = fmt.Appendf(contents, "%s\n", host)
+	}
+	if err := os.WriteFile(path, contents, 0o644); err != nil {
 		log.Printf("[mcp] Failed to write port file: %v", err)
 		return
 	}
-	log.Printf("[mcp] Port file written: %s (port %d)", path, port)
 }
 
 // RemoveMCPPortFile removes the port discovery file on shutdown.
 func RemoveMCPPortFile() {
 	path := mcpPortFilePath()
-	if path == "" {
+	if path == "" || mcpPortFileDisabled {
 		return
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -403,16 +707,12 @@ func Shutdown(srv *server.Server) {
 // EKS) is still blocking.
 //
 // Retries once after a 2-second pause to handle transient timeouts.
-// Deterministic errors (auth, RBAC, network) skip the retry — retrying
-// expired credentials or unreachable hosts won't help. Exception: exec auth
-// timeouts ARE retried because the first call triggers a token refresh
-// (e.g., AWS SSO), and the cached token is available on the next attempt.
+// Deterministic errors (config, auth, RBAC, network, TLS) skip the retry —
+// retrying missing config, bad credentials, denied permissions, bad certs, or
+// unreachable hosts won't help. Timeout-shaped exec-auth failures are still
+// retryable because the first call may trigger a token refresh, with the cached
+// token ready by retry.
 func CheckClusterAccess(ctx context.Context) error {
-	clientset := k8s.GetClient()
-	if clientset == nil {
-		return fmt.Errorf("kubernetes client not initialized")
-	}
-
 	execAuth := k8s.UsesExecAuth()
 
 	// Exec credential plugins (EKS aws, GKE gcloud) may need 7-10s on first
@@ -429,10 +729,7 @@ func CheckClusterAccess(ctx context.Context) error {
 			// Exception: exec auth timeouts are retryable — the first call
 			// triggers a token refresh, and the cached token is ready by retry.
 			errType := k8s.ClassifyError(lastErr)
-			if errType == "rbac" || errType == "network" {
-				break
-			}
-			if errType == "auth" && !execAuth {
+			if errType == "config" || errType == "auth" || errType == "auth-rejected" || errType == "rbac" || errType == "network" || errType == "tls" {
 				break
 			}
 			// Don't retry if the parent context is already done
@@ -454,33 +751,20 @@ func CheckClusterAccess(ctx context.Context) error {
 			}
 		}
 
-		t := time.Now()
 		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
-
-		// Run the API call in a goroutine so we can select on the parent
-		// context. This guarantees we return when the deadline hits even
-		// if the exec credential plugin blocks beyond the HTTP timeout.
-		resultCh := make(chan error, 1)
-		go func() {
-			_, err := clientset.Discovery().RESTClient().Get().AbsPath("/version").Do(attemptCtx).Raw()
-			resultCh <- err
-		}()
-
-		var err error
-		select {
-		case err = <-resultCh:
-		case <-ctx.Done():
-			cancel()
-			if lastErr != nil {
-				return fmt.Errorf("failed to connect to cluster: %w", lastErr)
-			}
-			return fmt.Errorf("failed to connect to cluster: %w", ctx.Err())
-		}
+		t := time.Now()
+		err := clusterConnectionProbe(attemptCtx)
 		cancel()
 
 		if err == nil {
 			k8s.LogTiming("   Cluster /version check (attempt %d): %v", attempt+1, time.Since(t))
 			return nil
+		}
+		if ctx.Err() != nil {
+			if lastErr != nil {
+				return fmt.Errorf("failed to connect to cluster: %w", lastErr)
+			}
+			return fmt.Errorf("failed to connect to cluster: %w", err)
 		}
 		log.Printf("Cluster connectivity check failed (attempt %d/2): %v (%v)", attempt+1, err, time.Since(t))
 		lastErr = err
@@ -502,4 +786,65 @@ func ParseKubeconfigDirs(dirs string) []string {
 		}
 	}
 	return result
+}
+
+// ResolveKubeconfigSelection applies CLI-over-config precedence across the
+// kubeconfig source pair. Passing one non-empty flag replaces the saved source
+// pair; an explicit empty value clears only that member for compatibility.
+func ResolveKubeconfigSelection(kubeconfig, kubeconfigDirs string, kubeconfigSet, kubeconfigDirsSet bool) (string, []string) {
+	parsedDirs := ParseKubeconfigDirs(kubeconfigDirs)
+	if kubeconfigSet && !kubeconfigDirsSet {
+		if kubeconfig == "" {
+			return "", parsedDirs
+		}
+		return kubeconfig, nil
+	}
+	if kubeconfigDirsSet && !kubeconfigSet {
+		if len(parsedDirs) == 0 {
+			return kubeconfig, nil
+		}
+		return "", parsedDirs
+	}
+	return kubeconfig, parsedDirs
+}
+
+// ParseNamespaces splits a comma-separated namespace string into a de-duplicated
+// slice. Empty items are ignored so flags like "--namespaces a,,b" behave like
+// kubectl's comma-separated lists instead of creating an empty namespace pick.
+func ParseNamespaces(namespaces string) []string {
+	if namespaces == "" {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var result []string
+	for ns := range strings.SplitSeq(namespaces, ",") {
+		ns = strings.TrimSpace(ns)
+		if ns == "" {
+			continue
+		}
+		if _, ok := seen[ns]; ok {
+			continue
+		}
+		seen[ns] = struct{}{}
+		result = append(result, ns)
+	}
+	return result
+}
+
+// ResolveNamespaceSelection applies CLI/config precedence for --namespace and
+// --namespaces. Explicit flags win over config defaults; setting both flags
+// explicitly is ambiguous and returns an error.
+func ResolveNamespaceSelection(namespace, namespaces string, namespaceSet, namespacesSet bool) (string, []string, error) {
+	namespace = strings.TrimSpace(namespace)
+	parsedNamespaces := ParseNamespaces(namespaces)
+	if namespaceSet && namespacesSet && namespace != "" && len(parsedNamespaces) > 0 {
+		return "", nil, fmt.Errorf("--namespace and --namespaces are mutually exclusive")
+	}
+	if len(parsedNamespaces) > 0 && (namespacesSet || !namespaceSet) {
+		return "", parsedNamespaces, nil
+	}
+	if namespace == "" {
+		return "", nil, nil
+	}
+	return namespace, nil, nil
 }

@@ -1,0 +1,143 @@
+# ImageValidatingPolicy, MutatingPolicy and GeneratingPolicy — the families
+# whose specs diverge enough to need their own renderers.
+---
+# Supply-chain posture. Reads nothing like a validation rule, which is why it
+# gets its own renderer: attestors (who must have signed), attestations (what
+# metadata must exist), and image references (what it applies to).
+#
+# Note the cosign shape — `keyless.identities[]` with issuer/subject, NOT
+# `keyless.issuer`. The flatter form is rejected by strict decoding.
+apiVersion: policies.kyverno.io/v1
+kind: ImageValidatingPolicy
+metadata:
+  name: verify-signed-images
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  evaluation:
+    admission:
+      enabled: true
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchImageReferences:
+    - glob: "ghcr.io/skyhook-io/*"
+  images:
+    - name: containers
+      expression: "object.spec.containers.map(c, c.image)"
+  attestors:
+    - name: skyhook-keyless
+      cosign:
+        keyless:
+          identities:
+            - issuer: "https://token.actions.githubusercontent.com"
+              subjectRegExp: "https://github.com/skyhook-io/.*"
+    - name: notary-authority
+      notary:
+        certs:
+          value: |
+            -----BEGIN CERTIFICATE-----
+            PLACEHOLDER
+            -----END CERTIFICATE-----
+  attestations:
+    - name: sbom
+      referrer:
+        type: "sbom/cyclone-dx"
+    - name: provenance
+      intoto:
+        type: "https://slsa.dev/provenance/v1"
+  validations:
+    - expression: "images.containers.map(image, verifyImageSignatures(image, [attestors.skyhook_keyless])).all(e, e > 0)"
+      message: "Images must carry a valid keyless cosign signature"
+---
+# Ordinary mutating policy — admission on. Renders "Mutates on admission".
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: add-default-labels
+spec:
+  failurePolicy: Ignore
+  reinvocationPolicy: IfNeeded
+  evaluation:
+    admission:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >
+          Object{ metadata: Object.metadata{ labels: {"managed-by": "kyverno"} } }
+---
+# Admission DISABLED but mutateExisting ON — a policy that rewrites resources
+# that already exist, independently of the admission path.
+#
+# This used to render "Inactive — modifies nothing" while actively rewriting
+# the cluster. Now renders "Mutates existing". Note the default: unlike
+# admission/background, `mutateExisting.enabled` defaults to FALSE, so it has
+# to be set explicitly for this case to exist at all.
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: backfill-cost-center-existing
+spec:
+  failurePolicy: Ignore
+  evaluation:
+    admission:
+      enabled: false
+    mutateExisting:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["configmaps"]
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >
+          Object{ metadata: Object.metadata{ labels: {"cost-center": "platform"} } }
+---
+# GeneratingPolicy. Its evaluation block is a different shape again — the
+# keys are generation-lifecycle concerns (generateExisting, synchronize,
+# orphanDownstreamOnPolicyDelete), each an object with .enabled rather than a
+# bare boolean, which is why it doesn't share the validating renderer.
+#
+# The generate expression needs dyn() wrapping: CEL infers a homogeneous map
+# type otherwise and rejects the mixed-value object literal.
+apiVersion: policies.kyverno.io/v1
+kind: GeneratingPolicy
+metadata:
+  name: generate-default-netpol
+spec:
+  evaluation:
+    generateExisting:
+      enabled: false
+    synchronize:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["namespaces"]
+  generate:
+    - expression: >
+        generator.Apply(string(object.metadata.name), [
+          {
+            "apiVersion": dyn("networking.k8s.io/v1"),
+            "kind": dyn("NetworkPolicy"),
+            "metadata": dyn({"name": dyn("default-deny"), "namespace": dyn(string(object.metadata.name))}),
+            "spec": dyn({"podSelector": dyn({}), "policyTypes": dyn(["Ingress"])})
+          }
+        ])

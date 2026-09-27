@@ -9,6 +9,26 @@ import (
 	"github.com/skyhook-io/radar/internal/k8s"
 )
 
+// registerContextTools adds list_contexts and switch_context. switch_context
+// is a write: with a pool it moves only the requesting user's context, without
+// one it reconnects the whole process (single-user / no-auth mode only).
+func registerContextTools(server *mcp.Server, includeWrites bool, paramRegistry *toolParamRegistry, readOnly, writeTool *mcp.ToolAnnotations) {
+	addToolWithRegistry(paramRegistry, server, &mcp.Tool{
+		Name:        "list_contexts",
+		Description: "List all available kubeconfig contexts. Shows which context is currently active. Use before switch_context to discover valid context names.",
+		Annotations: readOnly,
+	}, logToolCall("list_contexts", handleListContexts))
+
+	if !includeWrites {
+		return
+	}
+	addToolWithRegistry(paramRegistry, server, &mcp.Tool{
+		Name:        "switch_context",
+		Description: "Switch the active Kubernetes context. All subsequent tool calls will target the new cluster. Use list_contexts first to see available context names.",
+		Annotations: writeTool,
+	}, logToolCall("switch_context", handleSwitchContext))
+}
+
 type listContextsInput struct{}
 
 type switchContextInput struct {

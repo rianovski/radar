@@ -8,6 +8,7 @@ import {
   getCNPGPoolerParameters,
   getCNPGPoolerAuthQuery,
   getCNPGPoolerAuthQuerySecret,
+  isCNPGPoolerPaused,
 } from '../resource-utils-cnpg'
 
 interface CNPGPoolerRendererProps {
@@ -17,8 +18,13 @@ interface CNPGPoolerRendererProps {
 
 export function CNPGPoolerRenderer({ data, onNavigate }: CNPGPoolerRendererProps) {
   const desired = data.spec?.instances ?? 0
-  const ready = data.status?.instances ?? 0
-  const isDegraded = desired > 0 && ready < desired
+  // status.instances is the number of pods trying to be SCHEDULED, not ready
+  // pods — a Pooler whose PgBouncer pods are all Pending still reports the full
+  // count. Naming it `ready` here is what let the banner claim a readiness the
+  // CR never establishes.
+  const scheduled = data.status?.instances ?? 0
+  const isDegraded = desired > 0 && scheduled < desired
+  const isPaused = isCNPGPoolerPaused(data)
   const clusterName = getCNPGPoolerCluster(data)
   const parameters = getCNPGPoolerParameters(data)
   const authQuery = getCNPGPoolerAuthQuery(data)
@@ -31,7 +37,15 @@ export function CNPGPoolerRenderer({ data, onNavigate }: CNPGPoolerRendererProps
         <AlertBanner
           variant="warning"
           title="Pooler Degraded"
-          message={`Only ${ready} of ${desired} pooler instances are ready.`}
+          message={`Only ${scheduled} of ${desired} pooler instances are scheduled. Readiness is tracked on the "${data.metadata?.name}" Deployment, not on the Pooler.`}
+        />
+      )}
+
+      {isPaused && (
+        <AlertBanner
+          variant="warning"
+          title="Pooler Paused"
+          message="PgBouncer is paused, so client connections are held rather than served. The pods stay scheduled and Ready throughout, so nothing else about this Pooler will look wrong."
         />
       )}
 
@@ -40,7 +54,8 @@ export function CNPGPoolerRenderer({ data, onNavigate }: CNPGPoolerRendererProps
         <PropertyList>
           <Property label="Type" value={getCNPGPoolerType(data)} />
           <Property label="Pool Mode" value={getCNPGPoolerMode(data)} />
-          <Property label="Instances" value={getCNPGPoolerInstances(data)} />
+          <Property label="Instances Scheduled" value={getCNPGPoolerInstances(data)} />
+          {isPaused && <Property label="PgBouncer" value="Paused" />}
         </PropertyList>
       </Section>
 
@@ -50,7 +65,7 @@ export function CNPGPoolerRenderer({ data, onNavigate }: CNPGPoolerRendererProps
           <PropertyList>
             {authQuery && (
               <Property label="Auth Query" value={
-                <code className="text-xs font-mono bg-theme-elevated px-1.5 py-0.5 rounded break-all">{authQuery}</code>
+                <code className="inline-code text-xs break-all">{authQuery}</code>
               } />
             )}
             {authQuerySecret && (

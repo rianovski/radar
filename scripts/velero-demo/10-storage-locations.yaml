@@ -1,0 +1,58 @@
+# Backup + VolumeSnapshot storage locations.
+#   dr-replica is Unavailable -> the backup-target-unavailable Issue category.
+#   The VSL has no status on purpose: the controller never populates one,
+#   which is why the VSL table has no status column at all.
+---
+apiVersion: velero.io/v1
+kind: BackupStorageLocation
+metadata:
+  name: default
+  namespace: velero
+  labels:
+    app.kubernetes.io/instance: velero
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: velero
+    app.kubernetes.io/version: 1.18.1
+    helm.sh/chart: velero-12.1.0
+  annotations:
+    meta.helm.sh/release-name: velero
+    meta.helm.sh/release-namespace: velero
+spec:
+  accessMode: ReadWrite
+  config:
+    region: us-east-1
+  default: true
+  objectStorage:
+    bucket: radar-demo
+  provider: aws
+status:
+  lastSyncedTime: "@now-1860m"
+  lastValidationTime: "@now-1860m"
+  phase: Available
+---
+apiVersion: velero.io/v1
+kind: BackupStorageLocation
+metadata:
+  name: dr-replica
+  namespace: velero
+spec:
+  accessMode: ReadOnly
+  config:
+    region: eu-west-1
+  objectStorage:
+    bucket: radar-dr
+  provider: aws
+status:
+  message: "BackupStorageLocation \"dr-replica\" is unavailable: rpc error: code = Unknown desc = NoCredentialProviders"
+  phase: Unavailable
+---
+apiVersion: velero.io/v1
+kind: VolumeSnapshotLocation
+metadata:
+  name: default
+  namespace: velero
+spec:
+  config:
+    profile: default
+    region: us-east-1
+  provider: aws

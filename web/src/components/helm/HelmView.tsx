@@ -1,13 +1,13 @@
 import { useState, useMemo, useRef, useEffect, useCallback, forwardRef } from 'react'
-import { useRefreshAnimation } from '../../hooks/useRefreshAnimation'
 import { useRegisterShortcuts } from '../../hooks/useKeyboardShortcuts'
-import { Package, Search, RefreshCw, ArrowUpCircle, LayoutGrid, List, Shield, GitBranch } from 'lucide-react'
-import { PaneLoader } from '@skyhook-io/k8s-ui'
+import { Package, Search, ArrowUpCircle, LayoutGrid, List, Shield, GitBranch, ChevronRight, RotateCcw, Clock } from 'lucide-react'
+import { PaneLoader, PageHeader, SortableTh, FreshnessControl, type SortDir, Input } from '@skyhook-io/k8s-ui'
+import { useConnection } from '../../context/ConnectionContext'
 import { clsx } from 'clsx'
 import { useHelmReleases, useHelmBatchUpgradeInfo, isForbiddenError } from '../../api/client'
-import type { HelmRelease, SelectedHelmRelease, UpgradeInfo, ChartSource } from '../../types'
-import { getStatusColor, formatAge, truncate } from './helm-utils'
-import { SEVERITY_BADGE } from '../../utils/badge-colors'
+import type { HelmOperation, HelmRelease, SelectedHelmRelease, UpgradeInfo, ChartSource } from '../../types'
+import { getStatusColor, formatAge, isHelmReleaseActionable } from './helm-utils'
+import { SEVERITY_BADGE, SEVERITY_DOT, SEVERITY_TEXT } from '../../utils/badge-colors'
 import { Tooltip } from '../ui/Tooltip'
 import { ChartBrowser } from './ChartBrowser'
 import { InstallWizard } from './InstallWizard'
@@ -15,45 +15,59 @@ import { InstallWizard } from './InstallWizard'
 type ViewTab = 'releases' | 'charts'
 
 interface HelmViewProps {
-  namespace: string
+  namespaces: string[]
   selectedRelease?: SelectedHelmRelease | null
   onReleaseClick?: (namespace: string, name: string, storageNamespace?: string) => void
 }
 
-export function HelmView({ namespace, selectedRelease, onReleaseClick }: HelmViewProps) {
+export function HelmView({ namespaces, selectedRelease, onReleaseClick }: HelmViewProps) {
   const [activeTab, setActiveTab] = useState<ViewTab>('releases')
   const [searchTerm, setSearchTerm] = useState('')
   const [selectedChart, setSelectedChart] = useState<{ repo: string; chart: string; version: string; source: ChartSource } | null>(null)
 
-  const { data: releases, isLoading, error: releasesError, refetch: refetchReleases } = useHelmReleases(namespace || undefined)
+  const { data: releases, isLoading, error: releasesError, dataUpdatedAt: releasesUpdatedAt, isFetching: releasesFetching, refetch: refetchReleases } = useHelmReleases(namespaces)
   const isForbidden = isForbiddenError(releasesError)
   const releasesErrorMessage = releasesError instanceof Error ? releasesError.message : 'Failed to load Helm releases'
 
   // Lazy load upgrade info after releases are loaded
   const { data: upgradeInfo, isLoading: upgradeLoading, error: upgradeError, refetch: refetchUpgradeInfo } = useHelmBatchUpgradeInfo(
-    namespace || undefined,
+    namespaces,
     Boolean(releases && releases.length > 0)
   )
   const upgradeErrorMessage = upgradeError instanceof Error ? upgradeError.message : 'Upgrade checks failed'
 
-  const [handleRefresh, isRefreshAnimating] = useRefreshAnimation(async () => {
-    await Promise.all([refetchReleases(), refetchUpgradeInfo()])
-  })
-
-  const isFullyLoaded = !isLoading && !upgradeLoading
+  const { connection } = useConnection()
+  const refetchAll = () => Promise.all([refetchReleases(), refetchUpgradeInfo()])
 
   // Filter releases by search term
+  // Resources-table cycle: asc → desc → off (null restores the server's order).
+  const [sort, setSort] = useState<{ key: HelmSortKey; dir: SortDir } | null>(null)
+  const onSort = useCallback(
+    (key: HelmSortKey) =>
+      setSort((prev) => {
+        if (!prev || prev.key !== key) return { key, dir: 'asc' }
+        if (prev.dir === 'asc') return { key, dir: 'desc' }
+        return null
+      }),
+    [],
+  )
+
   const filteredReleases = useMemo(() => {
     if (!releases) return []
-    if (!searchTerm) return releases
-    const term = searchTerm.toLowerCase()
-    return releases.filter(
-      (r) =>
-        r.name.toLowerCase().includes(term) ||
-        r.namespace.toLowerCase().includes(term) ||
-        r.chart.toLowerCase().includes(term)
-    )
-  }, [releases, searchTerm])
+    const term = searchTerm.trim().toLowerCase()
+    const filtered = term
+      ? releases.filter(
+          (r) =>
+            r.name.toLowerCase().includes(term) ||
+            r.namespace.toLowerCase().includes(term) ||
+            r.chart.toLowerCase().includes(term)
+        )
+      : releases
+
+    if (!sort) return filtered
+    const factor = sort.dir === 'asc' ? 1 : -1
+    return [...filtered].sort((a, b) => compareReleases(a, b, sort.key) * factor)
+  }, [releases, searchTerm, sort])
 
   // Keyboard navigation state
   const searchInputRef = useRef<HTMLInputElement>(null)
@@ -62,8 +76,9 @@ export function HelmView({ namespace, selectedRelease, onReleaseClick }: HelmVie
   const filteredReleasesCountRef = useRef(0)
   filteredReleasesCountRef.current = filteredReleases.length
 
-  // Reset highlight when search changes
-  useEffect(() => { setHighlightedIndex(-1) }, [searchTerm])
+  // Reset highlight when the visible order changes (search or sort) — otherwise
+  // the index would point at whatever release shifted into that row.
+  useEffect(() => { setHighlightedIndex(-1) }, [searchTerm, sort])
 
   // Scroll highlighted row into view
   useEffect(() => {
@@ -167,6 +182,25 @@ export function HelmView({ namespace, selectedRelease, onReleaseClick }: HelmVie
     <div className="flex h-full w-full">
       {/* Main Content */}
       <div className="flex-1 flex flex-col overflow-hidden min-w-0 w-full">
+        {/* Page header — consistent across views; the tabs + search sit below. */}
+        <div className="px-4 pt-4 pb-1">
+          <PageHeader
+            icon={Package}
+            title="Helm"
+            description="Installed Helm releases and the chart catalog for this cluster."
+            actions={
+              activeTab === 'releases' ? (
+                <FreshnessControl
+                  mode="snapshot"
+                  dataUpdatedAt={releasesUpdatedAt}
+                  isFetching={releasesFetching || upgradeLoading}
+                  onRefresh={refetchAll}
+                  connectionState={connection.state}
+                />
+              ) : undefined
+            }
+          />
+        </div>
         {/* Tab bar */}
         <div className="flex items-center gap-1 px-4 pt-3 border-b border-theme-border bg-theme-surface/50">
           <button
@@ -204,32 +238,16 @@ export function HelmView({ namespace, selectedRelease, onReleaseClick }: HelmVie
           <>
             {/* Releases Toolbar */}
             <div className="flex items-center gap-4 px-4 py-3 border-b border-theme-border bg-theme-surface/50 shrink-0">
-              <div className="flex items-center gap-2 text-theme-text-secondary">
-                <Package className="w-5 h-5" />
-                <span className="font-medium">Helm Releases</span>
-                {!isFullyLoaded && (
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-theme-text-tertiary" />
-                )}
-              </div>
               <div className="flex-1 relative">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-theme-text-tertiary" />
-                <input
+                <Input
                   ref={searchInputRef}
-                  type="text"
                   placeholder="Search releases..."
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
                   className="w-full max-w-md pl-10 pr-4 py-2 bg-theme-elevated border border-theme-border-light rounded-lg text-sm text-theme-text-primary placeholder-theme-text-disabled focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
-              <button
-                onClick={handleRefresh}
-                disabled={isRefreshAnimating}
-                className="p-2 text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded-lg disabled:opacity-50"
-                title="Refresh"
-              >
-                <RefreshCw className={clsx('w-4 h-4', isRefreshAnimating && 'animate-spin')} />
-              </button>
             </div>
 
             {/* Releases Table */}
@@ -284,29 +302,15 @@ export function HelmView({ namespace, selectedRelease, onReleaseClick }: HelmVie
                 </div>
               ) : (
                 <table className="w-full table-fixed">
-                  <thead className="bg-theme-surface sticky top-0 z-10">
+                  <thead className="bg-theme-base sticky top-0 z-10">
                     <tr>
-                      <th className="text-left px-4 py-3 text-xs font-medium text-theme-text-secondary uppercase tracking-wide">
-                        Name
-                      </th>
-                      <th className="text-left px-4 py-3 text-xs font-medium text-theme-text-secondary uppercase tracking-wide w-32">
-                        Namespace
-                      </th>
-                      <th className="text-left px-4 py-3 text-xs font-medium text-theme-text-secondary uppercase tracking-wide w-48">
-                        Chart
-                      </th>
-                      <th className="text-left px-4 py-3 text-xs font-medium text-theme-text-secondary uppercase tracking-wide w-24 hidden xl:table-cell">
-                        App Version
-                      </th>
-                      <th className="text-left px-4 py-3 text-xs font-medium text-theme-text-secondary uppercase tracking-wide w-28">
-                        Status
-                      </th>
-                      <th className="text-left px-4 py-3 text-xs font-medium text-theme-text-secondary uppercase tracking-wide w-20">
-                        Rev
-                      </th>
-                      <th className="text-left px-4 py-3 text-xs font-medium text-theme-text-secondary uppercase tracking-wide w-24">
-                        Updated
-                      </th>
+                      <SortableTh label="Name" sortKey="name" activeKey={sort?.key ?? null} direction={sort?.dir ?? 'asc'} onSort={onSort} className="w-[28%]" />
+                      <SortableTh label="Namespace" sortKey="namespace" activeKey={sort?.key ?? null} direction={sort?.dir ?? 'asc'} onSort={onSort} className="w-[18%]" />
+                      <SortableTh label="Chart" sortKey="chart" activeKey={sort?.key ?? null} direction={sort?.dir ?? 'asc'} onSort={onSort} className="w-[22%]" />
+                      <SortableTh label="App Version" sortKey="appVersion" activeKey={sort?.key ?? null} direction={sort?.dir ?? 'asc'} onSort={onSort} className="w-24 hidden xl:table-cell" />
+                      <SortableTh label="Status" sortKey="status" activeKey={sort?.key ?? null} direction={sort?.dir ?? 'asc'} onSort={onSort} className="w-40" />
+                      <SortableTh label="Rev" sortKey="revision" activeKey={sort?.key ?? null} direction={sort?.dir ?? 'asc'} onSort={onSort} className="w-16" />
+                      <SortableTh label="Updated" sortKey="updated" activeKey={sort?.key ?? null} direction={sort?.dir ?? 'asc'} onSort={onSort} className="w-24" />
                     </tr>
                   </thead>
                   <tbody className="table-divide-subtle">
@@ -355,6 +359,23 @@ function releaseIdentityKey(release: Pick<HelmRelease, 'namespace' | 'name' | 's
   return `${release.storageNamespace || release.namespace}/${release.name}`
 }
 
+type HelmSortKey = 'name' | 'namespace' | 'chart' | 'appVersion' | 'status' | 'revision' | 'updated'
+
+function compareReleases(a: HelmRelease, b: HelmRelease, key: HelmSortKey): number {
+  let cmp: number
+  switch (key) {
+    case 'revision':
+      cmp = a.revision - b.revision
+      break
+    case 'updated':
+      cmp = (Date.parse(a.updated) || 0) - (Date.parse(b.updated) || 0)
+      break
+    default:
+      cmp = String(a[key] ?? '').localeCompare(String(b[key] ?? ''))
+  }
+  return cmp || a.name.localeCompare(b.name)
+}
+
 interface ReleaseRowProps {
   release: HelmRelease
   upgradeInfo?: UpgradeInfo
@@ -387,7 +408,7 @@ function getActionableTooltip(issue: string | undefined, summary: string | undef
     <div className="max-w-xs">
       <div className={clsx(
         'font-medium',
-        health === 'unhealthy' ? 'text-red-400' : 'text-yellow-400'
+        health === 'unhealthy' ? SEVERITY_TEXT.error : SEVERITY_TEXT.warning
       )}>
         {summary || issue || health}
       </div>
@@ -406,16 +427,82 @@ function getActionableTooltip(issue: string | undefined, summary: string | undef
   )
 }
 
+function getListOperation(release: HelmRelease): HelmOperation | undefined {
+  if (release.lastOperation) {
+    const releaseStatus = release.status.toLowerCase()
+    if (release.lastOperation.status === 'failed' && releaseStatus === 'failed') {
+      return undefined
+    }
+    if (isListOperation(release.lastOperation)) {
+      return release.lastOperation
+    }
+  }
+  return release.operations?.find(isListOperation)
+}
+
+function isListOperation(operation: HelmOperation): boolean {
+  return operation.kind === 'upgrade_rolled_back' || operation.kind === 'rollback' || operation.status === 'stuck_pending'
+}
+
+function HelmOperationChip({ operation }: { operation: HelmOperation }) {
+  const isPending = operation.status === 'stuck_pending'
+  const isRollback = operation.kind === 'upgrade_rolled_back' || operation.kind === 'rollback'
+  const Icon = isRollback ? RotateCcw : Clock
+  const tone: keyof typeof SEVERITY_BADGE = operation.kind === 'rollback' ? 'info' : isPending ? 'warning' : 'alert'
+  const label = operation.kind === 'upgrade_rolled_back'
+    ? 'rolled back'
+    : operation.kind === 'rollback'
+      ? 'rollback'
+      : 'stuck'
+
+  return (
+    <Tooltip content={
+      <div className="max-w-xs">
+        <div className="font-medium text-theme-text-primary">{operationSummary(operation)}</div>
+        <div className="mt-1 text-[10px] text-theme-text-secondary">{operation.message}</div>
+        {operation.failureDescription && (
+          <div className="mt-1.5 border-t border-theme-border pt-1.5 text-[10px] text-theme-text-tertiary">
+            {operation.failureDescription}
+          </div>
+        )}
+      </div>
+    }>
+      <span className={clsx('badge-sm shrink-0', SEVERITY_BADGE[tone])} aria-label={operationSummary(operation)}>
+        <Icon className="h-3 w-3" />
+        <span className="sr-only">{label}</span>
+        <span className="hidden 2xl:inline" aria-hidden="true">{label}</span>
+      </span>
+    </Tooltip>
+  )
+}
+
+function operationSummary(operation: HelmOperation): string {
+  switch (operation.kind) {
+    case 'upgrade_rolled_back':
+      return 'Helm rolled back after failed upgrade'
+    case 'rollback':
+      return 'Helm rollback applied'
+    case 'pending':
+      return 'Helm operation may be stuck'
+    case 'upgrade_failed':
+      return 'Helm upgrade failed'
+    default:
+      return 'Helm release failed'
+  }
+}
+
 const ReleaseRow = forwardRef<HTMLTableRowElement, ReleaseRowProps>(
   function ReleaseRow({ release, upgradeInfo, isSelected, isHighlighted, onClick, onMouseEnter }, ref) {
+  const listOperation = getListOperation(release)
+
   // Health badge styling
   const getHealthBadge = () => {
     if (!release.resourceHealth || release.resourceHealth === 'unknown') return null
 
-    const healthStyles: Record<string, { bg: string; text: string; dot: string }> = {
-      healthy: { bg: 'bg-green-500/10', text: 'text-green-400', dot: 'bg-green-500' },
-      degraded: { bg: 'bg-yellow-500/10', text: 'text-yellow-400', dot: 'bg-yellow-500' },
-      unhealthy: { bg: 'bg-red-500/10', text: 'text-red-400', dot: 'bg-red-500' },
+    const healthStyles: Record<string, { badge: string; dot: string }> = {
+      healthy: { badge: SEVERITY_BADGE.success, dot: SEVERITY_DOT.success },
+      degraded: { badge: SEVERITY_BADGE.warning, dot: SEVERITY_DOT.warning },
+      unhealthy: { badge: SEVERITY_BADGE.error, dot: SEVERITY_DOT.error },
     }
 
     const style = healthStyles[release.resourceHealth] || healthStyles.healthy
@@ -424,8 +511,8 @@ const ReleaseRow = forwardRef<HTMLTableRowElement, ReleaseRowProps>(
     return (
       <Tooltip content={tooltipContent}>
         <span className={clsx(
-          'flex items-center gap-1 px-1.5 py-0.5 text-xs font-medium rounded shrink-0',
-          style.bg, style.text
+          'badge-sm shrink-0',
+          style.badge
         )}>
           <span className={clsx('w-1.5 h-1.5 rounded-full', style.dot)} />
           {release.healthIssue || (release.resourceHealth !== 'healthy' ? release.healthSummary : null)}
@@ -449,10 +536,11 @@ const ReleaseRow = forwardRef<HTMLTableRowElement, ReleaseRowProps>(
       )}
     >
       <td className="px-4 py-3">
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           <Package className="w-4 h-4 text-theme-text-tertiary shrink-0" />
-          <span className="text-sm text-theme-text-primary font-medium truncate">{release.name}</span>
+          <span className="min-w-0 truncate text-sm font-medium text-theme-text-primary">{release.name}</span>
           {getHealthBadge()}
+          {listOperation && <HelmOperationChip operation={listOperation} />}
           {release.managedByFluxHelmRelease && (
             <Tooltip content={`Installed by Flux helm-controller via HelmRelease ${release.managedByFluxHelmRelease}. Changes here will be reverted at the next reconcile — manage via the GitOps tab.`}>
               <span className="badge-sm shrink-0 border border-theme-border bg-theme-elevated text-theme-text-secondary">
@@ -470,30 +558,49 @@ const ReleaseRow = forwardRef<HTMLTableRowElement, ReleaseRowProps>(
           )}
         </div>
       </td>
-      <td className="px-4 py-3 w-32">
-        <span className="text-sm text-theme-text-secondary">{release.namespace}</span>
+      <td className="px-4 py-3 w-[18%]">
+        <Tooltip content={release.namespace}>
+          <span className="block truncate text-sm text-theme-text-secondary">{release.namespace}</span>
+        </Tooltip>
       </td>
-      <td className="px-4 py-3 w-48">
+      <td className="px-4 py-3 w-[22%]">
         <Tooltip content={`${release.chart}-${release.chartVersion}`}>
           <span className="text-sm text-theme-text-secondary truncate block">
-            {truncate(`${release.chart}-${release.chartVersion}`, 35)}
+            {release.chart}-{release.chartVersion}
           </span>
         </Tooltip>
       </td>
       <td className="px-4 py-3 w-24 hidden xl:table-cell">
-        <span className="text-sm text-theme-text-secondary">{release.appVersion || '-'}</span>
+        {release.appVersion ? (
+          <span className="text-sm text-theme-text-secondary">{release.appVersion}</span>
+        ) : (
+          <Tooltip content="This chart did not declare an appVersion in Chart.yaml.">
+            <span className="text-sm text-theme-text-disabled cursor-help">—</span>
+          </Tooltip>
+        )}
       </td>
-      <td className="px-4 py-3 w-28">
-        <span
-          className={clsx(
-            'badge',
-            getStatusColor(release.status)
-          )}
-        >
-          {release.status}
-        </span>
+      <td className="px-4 py-3 w-40">
+        {isHelmReleaseActionable(release.status) ? (
+          <Tooltip content="Click row to view rollback / history / logs and recover">
+            <span
+              className={clsx('badge inline-flex items-center gap-1', getStatusColor(release.status))}
+            >
+              {release.status}
+              <ChevronRight className="w-3 h-3 opacity-70" />
+            </span>
+          </Tooltip>
+        ) : (
+          <span
+            className={clsx(
+              'badge',
+              getStatusColor(release.status)
+            )}
+          >
+            {release.status}
+          </span>
+        )}
       </td>
-      <td className="px-4 py-3 w-20">
+      <td className="px-4 py-3 w-16">
         <span className="text-sm text-theme-text-secondary">{release.revision}</span>
       </td>
       <td className="px-4 py-3 w-24">

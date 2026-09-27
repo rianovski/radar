@@ -5,19 +5,39 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
-	appsv1 "k8s.io/api/apps/v1"
+	"github.com/skyhook-io/radar/pkg/resourceid"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// informerEventID derives a deterministic id from the resource's observable
+// state (gvk + namespace + name + uid + resourceVersion), not the operation:
+// a relist re-emits the identical id whether the arrival is labeled add or
+// update, so replays and failovers de-dupe instead of duplicating. A delete is
+// a distinct state and gets its own id via the delete marker. The uid alone
+// makes the id cluster-safe (K8s uids are globally unique), so cluster context
+// is deliberately left out of the hash.
+func informerEventID(apiVersion, kind, namespace, name, uid, resourceVersion string, operation EventType) string {
+	hashInput := apiVersion + "|" + kind + "|" + namespace + "|" + name + "|" + uid + "|" + resourceVersion
+	if operation == EventTypeDelete {
+		hashInput += "|delete"
+	}
+	hash := sha256.Sum256([]byte(hashInput))
+	return fmt.Sprintf("ev-%x", hash[:16])
+}
 
 // NewInformerEvent creates a TimelineEvent from an informer callback
 // createdAt is the resource's metadata.creationTimestamp (when K8s actually created it)
 // apiVersion (e.g. "apps/v1", "cluster.x-k8s.io/v1beta1") disambiguates CRD kind
 // collisions on navigation; pass "" if unknown (older callers).
-func NewInformerEvent(kind, apiVersion, namespace, name, uid string, operation EventType, healthState HealthState, diff *DiffInfo, owner *OwnerInfo, labels map[string]string, createdAt *time.Time) TimelineEvent {
+// resourceVersion pins the event id to the resource state; pass "" only when
+// truly unavailable — the stores dedup informer ids keep-first, so with a
+// constant "" every later update of the resource maps to the same id and is
+// DROPPED until the row ages out, not merely collapsed.
+func NewInformerEvent(kind, apiVersion, namespace, name, uid, resourceVersion string, operation EventType, healthState HealthState, diff *DiffInfo, owner *OwnerInfo, labels map[string]string, createdAt *time.Time) TimelineEvent {
 	return TimelineEvent{
-		ID:          uuid.New().String(),
+		ID:          informerEventID(apiVersion, kind, namespace, name, uid, resourceVersion, operation),
 		Timestamp:   time.Now(),
 		Source:      SourceInformer,
 		Kind:        kind,
@@ -34,7 +54,19 @@ func NewInformerEvent(kind, apiVersion, namespace, name, uid string, operation E
 	}
 }
 
-// NewK8sEventTimelineEvent creates a TimelineEvent from a corev1.Event
+// K8sEventSubject is the reference an Event makes to the object it is about.
+func K8sEventSubject(event *corev1.Event) resourceid.Reference {
+	inv := event.InvolvedObject
+	return resourceid.EventSubject(inv.APIVersion, inv.Kind, inv.Namespace, inv.Name, string(inv.UID), event.Namespace)
+}
+
+// NewK8sEventTimelineEvent creates a TimelineEvent from a corev1.Event.
+// The id is the Event uid — one logical row per Event, deliberately NOT one
+// row per count/message revision. The count/lastTimestamp/message mutate in
+// place on the same uid; both local stores upsert a same-uid bump — MemoryStore
+// in appendLocked, SQLiteStore via ON CONFLICT(id) DO UPDATE in AppendBatch — so
+// the row reflects the latest revision instead of dropping the bump, while an
+// identical informer/historical relist dupe stays collapsed to the first row.
 func NewK8sEventTimelineEvent(event *corev1.Event, owner *OwnerInfo) TimelineEvent {
 	// Use lastTimestamp or firstTimestamp
 	ts := event.LastTimestamp.Time
@@ -50,14 +82,16 @@ func NewK8sEventTimelineEvent(event *corev1.Event, owner *OwnerInfo) TimelineEve
 		evtType = EventTypeWarning
 	}
 
+	subject := K8sEventSubject(event)
 	return TimelineEvent{
 		ID:         string(event.UID),
 		Timestamp:  ts,
 		Source:     SourceK8sEvent,
-		Kind:       event.InvolvedObject.Kind,
+		Kind:       subject.Kind,
 		APIVersion: event.InvolvedObject.APIVersion,
-		Namespace:  event.Namespace,
-		Name:       event.InvolvedObject.Name,
+		Namespace:  subject.Namespace,
+		Name:       subject.Name,
+		UID:        subject.UID,
 		EventType:  evtType,
 		Reason:     event.Reason,
 		Message:    event.Message,
@@ -70,9 +104,15 @@ func NewK8sEventTimelineEvent(event *corev1.Event, owner *OwnerInfo) TimelineEve
 // The ID is deterministic based on the event content to avoid duplicates on restart
 // apiVersion (e.g. "apps/v1", "cluster.x-k8s.io/v1beta1") disambiguates CRD kind
 // collisions on navigation; pass "" if unknown.
-func NewHistoricalEvent(kind, apiVersion, namespace, name string, ts time.Time, reason, message string, healthState HealthState, owner *OwnerInfo, labels map[string]string) TimelineEvent {
-	// Create deterministic ID from event attributes to avoid duplicates
-	hashInput := fmt.Sprintf("historical:%s/%s/%s:%d:%s", kind, namespace, name, ts.UnixNano(), reason)
+// clusterContext is folded into the id: historical ids carry no uid, so two
+// clusters with a same-named resource created at the same instant would collide
+// in one persistent store without it.
+func NewHistoricalEvent(clusterContext, kind, apiVersion, namespace, name string, ts time.Time, reason, message string, healthState HealthState, owner *OwnerInfo, labels map[string]string) TimelineEvent {
+	identityKind := kind
+	if group := historicalCollisionGroup(kind, apiVersion); group != "" {
+		identityKind = group + "/" + kind
+	}
+	hashInput := fmt.Sprintf("historical:%s:%s/%s/%s:%d:%s", clusterContext, identityKind, namespace, name, ts.UnixNano(), reason)
 	hash := sha256.Sum256([]byte(hashInput))
 	id := fmt.Sprintf("hist-%x", hash[:8]) // Use first 8 bytes for shorter ID
 
@@ -93,46 +133,46 @@ func NewHistoricalEvent(kind, apiVersion, namespace, name string, ts time.Time, 
 	}
 }
 
-// ExtractOwner gets the controller owner reference from an object
-// For K8s Events, it extracts the involvedObject instead
-func ExtractOwner(obj any) *OwnerInfo {
-	// Special case: K8s Events use involvedObject, not ownerReferences
-	if event, ok := obj.(*corev1.Event); ok {
-		if event.InvolvedObject.Kind != "" && event.InvolvedObject.Name != "" {
-			return &OwnerInfo{
-				Kind: event.InvolvedObject.Kind,
-				Name: event.InvolvedObject.Name,
-			}
-		}
-		return nil
+// Historical IDs of generic unstructured Kinds stay group-less, so the IDs of
+// history already stored for them never change. Only the Kinds with typed
+// extractors, whose same-named CRDs otherwise produced no history, take the
+// API group of a foreign-group object into the ID.
+func historicalCollisionGroup(kind, apiVersion string) string {
+	switch kind {
+	case "Pod", "Deployment", "ReplicaSet", "StatefulSet", "DaemonSet",
+		"Service", "Ingress", "CronJob", "HorizontalPodAutoscaler", "Job":
+	default:
+		return ""
 	}
+	group := resourceid.GroupFromAPIVersion(apiVersion)
+	if builtin, _ := resourceid.BuiltinGroup(kind); group == "" || group == builtin {
+		return ""
+	}
+	return group
+}
 
+// ExtractOwner returns an object's owner as its ownerReferences name it: the
+// controller when one is marked, otherwise the first reference. Scope is left
+// for the caller, which can consult discovery.
+func ExtractOwner(obj any) *OwnerInfo {
 	meta, ok := obj.(metav1.Object)
 	if !ok {
 		return nil
 	}
-
 	refs := meta.GetOwnerReferences()
-
-	// First, try to find a controller owner (most accurate)
 	for _, ref := range refs {
 		if ref.Controller != nil && *ref.Controller {
-			return &OwnerInfo{
-				Kind: ref.Kind,
-				Name: ref.Name,
-			}
+			return ownerFromReference(ref)
 		}
 	}
-
-	// Fallback: use first owner reference if no controller is marked
 	if len(refs) > 0 {
-		return &OwnerInfo{
-			Kind: refs[0].Kind,
-			Name: refs[0].Name,
-		}
+		return ownerFromReference(refs[0])
 	}
-
 	return nil
+}
+
+func ownerFromReference(ref metav1.OwnerReference) *OwnerInfo {
+	return &OwnerInfo{Kind: ref.Kind, Name: ref.Name, APIVersion: ref.APIVersion, UID: string(ref.UID)}
 }
 
 // ExtractLabels extracts labels useful for grouping from an object
@@ -147,15 +187,26 @@ func ExtractLabels(obj any) map[string]string {
 		return nil
 	}
 
-	// Only keep labels that are useful for grouping
+	// Only keep labels that are useful for grouping. The GitOps identity
+	// labels must ride along or the app-membership matchKeys the server ships
+	// for Argo/Flux-primary apps (applications.go collectExactMatchKeys) have
+	// nothing to match against on a deleted member's events. Native Helm
+	// identity is an annotation (meta.helm.sh/release-name), which events
+	// deliberately never carry.
 	relevant := make(map[string]string)
 	interestingLabels := []string{
 		"app.kubernetes.io/name",
 		"app.kubernetes.io/instance",
+		"app.kubernetes.io/part-of",
 		"app.kubernetes.io/component",
 		"app",
 		"name",
 		"component",
+		"argocd.argoproj.io/instance",
+		"helm.toolkit.fluxcd.io/name",
+		"karpenter.sh/nodepool",
+		"karpenter.sh/nodeclaim",
+		"karpenter.sh/capacity-type",
 	}
 
 	for _, key := range interestingLabels {
@@ -170,82 +221,11 @@ func ExtractLabels(obj any) map[string]string {
 	return relevant
 }
 
-// DetermineHealthState determines health state from an object
-func DetermineHealthState(kind string, obj any) HealthState {
-	switch kind {
-	case "Pod":
-		if pod, ok := obj.(*corev1.Pod); ok {
-			switch pod.Status.Phase {
-			case corev1.PodRunning:
-				for _, cs := range pod.Status.ContainerStatuses {
-					if !cs.Ready {
-						return HealthDegraded
-					}
-				}
-				return HealthHealthy
-			case corev1.PodSucceeded:
-				return HealthHealthy
-			case corev1.PodFailed:
-				return HealthUnhealthy
-			case corev1.PodPending:
-				return HealthDegraded
-			}
-		}
-	case "Deployment":
-		if dep, ok := obj.(*appsv1.Deployment); ok {
-			desired := int32(1)
-			if dep.Spec.Replicas != nil {
-				desired = *dep.Spec.Replicas
-			}
-			if dep.Status.ReadyReplicas == desired && dep.Status.AvailableReplicas == desired {
-				return HealthHealthy
-			}
-			if dep.Status.ReadyReplicas > 0 {
-				return HealthDegraded
-			}
-			return HealthUnhealthy
-		}
-	case "ReplicaSet":
-		if rs, ok := obj.(*appsv1.ReplicaSet); ok {
-			desired := int32(1)
-			if rs.Spec.Replicas != nil {
-				desired = *rs.Spec.Replicas
-			}
-			if rs.Status.ReadyReplicas == desired {
-				return HealthHealthy
-			}
-			if rs.Status.ReadyReplicas > 0 {
-				return HealthDegraded
-			}
-			return HealthUnhealthy
-		}
-	case "DaemonSet":
-		if ds, ok := obj.(*appsv1.DaemonSet); ok {
-			if ds.Status.NumberReady == ds.Status.DesiredNumberScheduled && ds.Status.DesiredNumberScheduled > 0 {
-				return HealthHealthy
-			}
-			if ds.Status.NumberReady > 0 {
-				return HealthDegraded
-			}
-			return HealthUnhealthy
-		}
-	case "StatefulSet":
-		if sts, ok := obj.(*appsv1.StatefulSet); ok {
-			desired := int32(1)
-			if sts.Spec.Replicas != nil {
-				desired = *sts.Spec.Replicas
-			}
-			if sts.Status.ReadyReplicas == desired {
-				return HealthHealthy
-			}
-			if sts.Status.ReadyReplicas > 0 {
-				return HealthDegraded
-			}
-			return HealthUnhealthy
-		}
-	}
-	return HealthUnknown
-}
+// Resource health classification for timeline events lives with the canonical
+// classifiers in internal/k8s (classifyTimelineHealth → ClassifyPodHealth), not
+// here: the timeline package can't reach that logic across the module boundary,
+// so the caller computes health and the event just stores it. A duplicate copy
+// here previously drifted and misclassified completing Job pods as degraded.
 
 // OperationToEventType converts an operation string to EventType
 func OperationToEventType(op string) EventType {

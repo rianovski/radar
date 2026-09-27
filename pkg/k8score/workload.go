@@ -3,6 +3,7 @@ package k8score
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -10,6 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/skyhook-io/radar/pkg/resourceid"
+
+	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -17,6 +21,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"sigs.k8s.io/yaml"
+
+	"github.com/skyhook-io/radar/pkg/rollouts"
 )
 
 // WorkloadRevision represents a single revision in a workload's rollout history.
@@ -27,19 +33,37 @@ type WorkloadRevision struct {
 	IsCurrent bool      `json:"isCurrent"`
 	Replicas  int64     `json:"replicas"`
 	Template  string    `json:"template,omitempty"` // Pod template spec as YAML (for revision diff)
+	// Rollouts only: mid-canary IsCurrent (rolling out) and IsStable (serving
+	// traffic, what an abort reverts to) are different revisions.
+	IsStable bool   `json:"isStable,omitempty"`
+	PodHash  string `json:"podHash,omitempty"`
 }
 
 // UpdateResourceOptions contains options for updating a resource.
 type UpdateResourceOptions struct {
-	Kind      string
-	Namespace string
-	Name      string
-	YAML      string // YAML content to apply
+	Kind                    string
+	Namespace               string
+	Name                    string
+	YAML                    string // YAML content to apply
+	Force                   bool   // Force SSA field ownership conflicts (override Helm/Flux/Argo/kubectl)
+	DryRun                  bool
+	ExpectedResourceVersion string
 }
+
+type PreviewUpdateResourceResult struct {
+	Object          *unstructured.Unstructured
+	Live            *unstructured.Unstructured
+	Submitted       *unstructured.Unstructured
+	ResourceVersion string
+	Warnings        []string
+}
+
+const radarOwnershipReclaimedWarning = "Radar reclaimed field ownership left by an earlier Radar write. No external manager ownership was overridden."
 
 // DeleteResourceOptions contains options for deleting a resource.
 type DeleteResourceOptions struct {
 	Kind      string
+	Group     string // API group, disambiguates kinds that collide across groups (e.g. Knative vs core Service)
 	Namespace string
 	Name      string
 	Force     bool // Force delete with grace period 0
@@ -47,18 +71,34 @@ type DeleteResourceOptions struct {
 
 // ApplyResourceOptions contains options for creating or applying a resource.
 type ApplyResourceOptions struct {
-	YAML              string // Raw YAML manifest
-	Mode              string // "apply" (server-side apply, default) or "create" (strict create)
-	DryRun            bool   // Validate without persisting
-	NamespaceOverride string // If set, overrides the namespace in the YAML
+	YAML                    string // Raw YAML manifest
+	Mode                    string // "apply" (server-side apply, default) or "create" (strict create)
+	DryRun                  bool   // Validate without persisting
+	NamespaceOverride       string // If set, overrides the namespace in the YAML
+	Force                   bool   // Force SSA field ownership conflicts
+	ExpectedResourceVersion string
+	ExpectedResourceAbsent  bool
+	UseCreateForAbsent      bool // Match a guarded create when the preflight confirms absence
 }
 
 // ApplyResourceResult contains the result of a create/apply operation.
 type ApplyResourceResult struct {
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
-	Kind      string `json:"kind"`
-	Created   bool   `json:"created"` // true if newly created, false if updated
+	Name       string                     `json:"name"`
+	Namespace  string                     `json:"namespace"`
+	Kind       string                     `json:"kind"`
+	APIVersion string                     `json:"apiVersion"`
+	Created    bool                       `json:"created"` // true if newly created, false if updated
+	Action     string                     `json:"action,omitempty"`
+	Object     *unstructured.Unstructured `json:"-"`
+	Previous   *unstructured.Unstructured `json:"-"`
+	Submitted  *unstructured.Unstructured `json:"-"`
+
+	// Warnings are advisory notes derived from the actual state of the cluster
+	// (e.g., "this resource is reconciled by Helm" or "field X you omitted is
+	// still present after apply because manager Y owns it"). They never block
+	// the apply — the apply succeeded if no error was returned. Treat each
+	// entry as a self-contained sentence.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // WorkloadManager provides workload lifecycle operations using injected clients.
@@ -77,51 +117,141 @@ func NewWorkloadManager(dynClient dynamic.Interface, discovery *ResourceDiscover
 // kubectl apply --server-side / Lens semantics. Force=true takes ownership of
 // fields the user is editing even if another field manager last wrote them.
 func (m *WorkloadManager) UpdateResource(ctx context.Context, opts UpdateResourceOptions) (*unstructured.Unstructured, error) {
+	obj, gvr, ri, err := m.prepareUpdateResource(opts)
+	if err != nil {
+		return nil, err
+	}
+	result, _, err := m.patchUpdateResource(ctx, opts, obj, gvr, ri)
+	return result, err
+}
+
+func (m *WorkloadManager) PreviewUpdateResource(ctx context.Context, opts UpdateResourceOptions) (*PreviewUpdateResourceResult, error) {
+	opts.DryRun = true
+	obj, gvr, ri, err := m.prepareUpdateResource(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	submitted := obj.DeepCopy()
+	live, err := ri.Get(ctx, opts.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read resource before preview: %w", err)
+	}
+	obj.SetResourceVersion(live.GetResourceVersion())
+	predicted, reclaimedRadarOwnership, err := m.patchUpdateResource(ctx, opts, obj, gvr, ri)
+	if err != nil {
+		return nil, err
+	}
+
+	warnings := append(
+		EnrichObjectWarnings(predicted),
+		checkFieldRemoval(obj, live, predicted)...,
+	)
+	if reclaimedRadarOwnership {
+		warnings = append([]string{radarOwnershipReclaimedWarning}, warnings...)
+	}
+	return &PreviewUpdateResourceResult{
+		Object:          predicted,
+		Live:            live,
+		Submitted:       submitted,
+		ResourceVersion: live.GetResourceVersion(),
+		Warnings:        warnings,
+	}, nil
+}
+
+func (m *WorkloadManager) prepareUpdateResource(opts UpdateResourceOptions) (*unstructured.Unstructured, schema.GroupVersionResource, dynamic.ResourceInterface, error) {
 	if m.discovery == nil {
-		return nil, fmt.Errorf("resource discovery not initialized")
+		return nil, schema.GroupVersionResource{}, nil, fmt.Errorf("resource discovery not initialized")
 	}
 	if m.dynClient == nil {
-		return nil, fmt.Errorf("dynamic client not initialized")
+		return nil, schema.GroupVersionResource{}, nil, fmt.Errorf("dynamic client not initialized")
 	}
 
 	obj := &unstructured.Unstructured{}
 	if err := yaml.Unmarshal([]byte(opts.YAML), &obj.Object); err != nil {
-		return nil, fmt.Errorf("invalid YAML: %w", err)
+		return nil, schema.GroupVersionResource{}, nil, fmt.Errorf("invalid YAML: %w", err)
 	}
 
-	gvr, ok := m.discovery.GetGVR(opts.Kind)
+	kindForLookup := opts.Kind
+	if obj.GetKind() != "" {
+		kindForLookup = obj.GetKind()
+	}
+	apiGroup := resourceid.GroupFromAPIVersion(obj.GetAPIVersion())
+	var gvr schema.GroupVersionResource
+	var ok bool
+	if apiGroup != "" {
+		gvr, ok = m.discovery.GetGVRWithGroup(kindForLookup, apiGroup)
+		if !ok {
+			if fallbackGVR, fallbackOK := m.discovery.GetGVR(kindForLookup); fallbackOK && fallbackGVR.Group == apiGroup {
+				gvr, ok = fallbackGVR, true
+			}
+		}
+	} else {
+		gvr, ok = m.discovery.GetGVR(kindForLookup)
+	}
 	if !ok {
-		return nil, fmt.Errorf("unknown resource kind: %s", opts.Kind)
+		return nil, schema.GroupVersionResource{}, nil, fmt.Errorf("unknown resource kind: %s", kindForLookup)
+	}
+	requestedGVR, requestedOK := m.discovery.GetGVRWithGroup(opts.Kind, apiGroup)
+	if !requestedOK {
+		requestedGVR, requestedOK = m.discovery.GetGVR(opts.Kind)
+	}
+	if !requestedOK {
+		return nil, schema.GroupVersionResource{}, nil, fmt.Errorf("unknown resource kind: %s", opts.Kind)
+	}
+	if requestedGVR.Group != gvr.Group || requestedGVR.Resource != gvr.Resource {
+		return nil, schema.GroupVersionResource{}, nil, fmt.Errorf("resource kind mismatch: expected %s, got %s", opts.Kind, kindForLookup)
 	}
 
 	if obj.GetName() != opts.Name {
-		return nil, fmt.Errorf("resource name mismatch: expected %s, got %s", opts.Name, obj.GetName())
+		return nil, schema.GroupVersionResource{}, nil, fmt.Errorf("resource name mismatch: expected %s, got %s", opts.Name, obj.GetName())
 	}
 	if opts.Namespace != "" && obj.GetNamespace() != opts.Namespace {
-		return nil, fmt.Errorf("resource namespace mismatch: expected %s, got %s", opts.Namespace, obj.GetNamespace())
+		return nil, schema.GroupVersionResource{}, nil, fmt.Errorf("resource namespace mismatch: expected %s, got %s", opts.Namespace, obj.GetNamespace())
 	}
 
 	stripServerManagedFields(obj)
-
-	body, err := json.Marshal(obj.Object)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal resource: %w", err)
-	}
-
 	var ri dynamic.ResourceInterface
 	if opts.Namespace != "" {
 		ri = m.dynClient.Resource(gvr).Namespace(opts.Namespace)
 	} else {
 		ri = m.dynClient.Resource(gvr)
 	}
-	result, err := ri.Patch(ctx, opts.Name, types.ApplyPatchType, body, metav1.PatchOptions{
-		FieldManager: "radar",
-		Force:        boolPtr(true),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to update resource: %w", err)
+	return obj, gvr, ri, nil
+}
+
+func (m *WorkloadManager) patchUpdateResource(ctx context.Context, opts UpdateResourceOptions, obj *unstructured.Unstructured, gvr schema.GroupVersionResource, ri dynamic.ResourceInterface) (*unstructured.Unstructured, bool, error) {
+	if opts.ExpectedResourceVersion != "" {
+		live, err := ri.Get(ctx, opts.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to verify reviewed resource version: %w", err)
+		}
+		if live.GetResourceVersion() != opts.ExpectedResourceVersion {
+			return nil, false, apierrors.NewConflict(
+				gvr.GroupResource(),
+				opts.Name,
+				fmt.Errorf("resource changed after review; review the latest version before applying"),
+			)
+		}
+		obj.SetResourceVersion(opts.ExpectedResourceVersion)
 	}
-	return result, nil
+
+	dryRun := []string(nil)
+	if opts.DryRun {
+		dryRun = []string{metav1.DryRunAll}
+	}
+	result, reclaimedRadarOwnership, err := patchWithRadarOwnershipReclaim(
+		ctx,
+		ri,
+		opts.Name,
+		obj,
+		opts.Force,
+		dryRun,
+	)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to update resource: %w", err)
+	}
+	return result, reclaimedRadarOwnership, nil
 }
 
 // stripServerManagedFields removes metadata fields the apiserver owns. SSA
@@ -177,10 +307,7 @@ func (m *WorkloadManager) ApplyResource(ctx context.Context, opts ApplyResourceO
 	}
 
 	// Resolve GVR using group from apiVersion for disambiguation
-	group := ""
-	if parts := strings.SplitN(apiVersion, "/", 2); len(parts) == 2 {
-		group = parts[0]
-	}
+	group := resourceid.GroupFromAPIVersion(apiVersion)
 
 	var gvr schema.GroupVersionResource
 	var ok bool
@@ -205,9 +332,11 @@ func (m *WorkloadManager) ApplyResource(ctx context.Context, opts ApplyResourceO
 	}
 
 	result := &ApplyResourceResult{
-		Name:      name,
-		Namespace: ns,
-		Kind:      kind,
+		Name:       name,
+		Namespace:  ns,
+		Kind:       kind,
+		APIVersion: apiVersion,
+		Submitted:  obj.DeepCopy(),
 	}
 
 	var client dynamic.ResourceInterface
@@ -216,39 +345,235 @@ func (m *WorkloadManager) ApplyResource(ctx context.Context, opts ApplyResourceO
 	} else {
 		client = m.dynClient.Resource(gvr)
 	}
+	// Pre-apply GET: feeds create/update classification, the external-manager warning, and the SSA
+	// field-removal verification. Best-effort — a NotFound just means the
+	// resource is being newly created, and other errors shouldn't block the
+	// apply itself.
+	var pre *unstructured.Unstructured
+	var preGetErr error
+	got, getErr := client.Get(ctx, name, metav1.GetOptions{})
+	if getErr == nil {
+		pre = got
+		result.Action = "update"
+	} else if apierrors.IsNotFound(getErr) {
+		result.Action = "create"
+	} else {
+		preGetErr = getErr
+		result.Action = "unknown"
+		log.Printf("[k8s] apply_resource: pre-apply GET %s/%s/%s failed: %v", kind, ns, name, getErr)
+	}
+	result.Previous = pre
+	if opts.ExpectedResourceAbsent {
+		if preGetErr != nil {
+			return result, fmt.Errorf("failed to verify reviewed resource absence: %w", preGetErr)
+		}
+		if pre != nil {
+			return result, apierrors.NewConflict(
+				gvr.GroupResource(),
+				name,
+				fmt.Errorf("resource was created after review; review the latest version before applying"),
+			)
+		}
+	} else if opts.ExpectedResourceVersion != "" {
+		if preGetErr != nil {
+			return result, fmt.Errorf("failed to verify reviewed resource version: %w", preGetErr)
+		}
+		if pre == nil || pre.GetResourceVersion() != opts.ExpectedResourceVersion {
+			return result, apierrors.NewConflict(
+				gvr.GroupResource(),
+				name,
+				fmt.Errorf("resource changed after review; review the latest version before applying"),
+			)
+		}
+		obj.SetResourceVersion(opts.ExpectedResourceVersion)
+	}
 
 	if mode == "create" {
-		_, err := client.Create(ctx, obj, metav1.CreateOptions{DryRun: dryRun})
+		created, err := client.Create(ctx, obj, metav1.CreateOptions{
+			DryRun:          dryRun,
+			FieldManager:    "radar",
+			FieldValidation: metav1.FieldValidationStrict,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to create resource: %w", err)
+			return result, fmt.Errorf("failed to create resource: %w", err)
 		}
 		result.Created = true
+		result.Action = "create"
+		result.Object = created
+		m.populateApplyWarnings(ctx, result, obj, pre, created, ns, kind, name, opts.DryRun)
+		return result, nil
+	}
+
+	if opts.ExpectedResourceAbsent || (opts.UseCreateForAbsent && pre == nil && preGetErr == nil) {
+		// SSA has no must-not-exist precondition, so Create makes the reviewed
+		// absence check atomic. Preview uses the same operation when absence is
+		// observed so its admitted object matches the final write.
+		created, err := client.Create(ctx, obj, metav1.CreateOptions{
+			DryRun:          dryRun,
+			FieldManager:    "radar",
+			FieldValidation: metav1.FieldValidationStrict,
+		})
+		if err != nil {
+			return result, fmt.Errorf("failed to apply reviewed create: %w", err)
+		}
+		result.Created = true
+		result.Action = "create"
+		result.Object = created
+		m.populateApplyWarnings(ctx, result, obj, pre, created, ns, kind, name, opts.DryRun)
 		return result, nil
 	}
 
 	// Apply mode: server-side apply
-	objJSON, err := json.Marshal(obj.Object)
+	applied, reclaimedRadarOwnership, err := patchWithRadarOwnershipReclaim(
+		ctx,
+		client,
+		name,
+		obj,
+		opts.Force,
+		dryRun,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal resource: %w", err)
+		return result, fmt.Errorf("failed to apply resource: %w", err)
+	}
+	if reclaimedRadarOwnership {
+		result.Warnings = append(result.Warnings, radarOwnershipReclaimedWarning)
 	}
 
-	_, err = client.Patch(ctx, name, types.ApplyPatchType, objJSON, metav1.PatchOptions{
-		FieldManager: "radar",
-		Force:        boolPtr(true),
-		DryRun:       dryRun,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to apply resource: %w", err)
-	}
-
-	// Determine if this was a create or update by checking if the resource existed before.
-	// With server-side apply we can't easily distinguish, so we default to false (updated).
-	// The caller can check if the resource was newly created by other means if needed.
+	// SSA results report "applied"; Action carries create/update classification.
 	result.Created = false
+	result.Object = applied
+
+	// Post-apply GET feeds the state-derived warnings (run against what
+	// actually landed) and the field-removal diff. Fetch it for creates too,
+	// not just updates — an SSA apply that creates a resource still wants the
+	// external-manager / terminating-namespace warnings (field-removal stays
+	// gated on pre != nil below).
+	var post *unstructured.Unstructured
+	if opts.DryRun {
+		post = applied
+	} else {
+		got, getErr := client.Get(ctx, name, metav1.GetOptions{})
+		if getErr == nil {
+			post = got
+			result.Object = got
+		} else {
+			log.Printf("[k8s] apply_resource: post-apply GET %s/%s/%s failed: %v", kind, ns, name, getErr)
+		}
+	}
+
+	// A non-NotFound pre-apply GET error means the object likely existed but we
+	// couldn't read it, so field-retention can't be diffed (pre is nil). Tell the
+	// agent the verification was skipped rather than letting silence imply a clean
+	// apply — a partial manifest may have dropped fields without warning.
+	if !opts.DryRun && pre == nil && preGetErr != nil {
+		result.Warnings = append(result.Warnings, "Pre-apply GET failed; Radar could not compute field-retention warnings — a partial manifest may have silently dropped fields.")
+	}
+
+	m.populateApplyWarnings(ctx, result, obj, pre, post, ns, kind, name, opts.DryRun)
 	return result, nil
 }
 
+// populateApplyWarnings appends advisory warnings to result.Warnings.
+//
+//   - State-derived warnings (external manager, deletionTimestamp, etc.) come
+//     from the shared EnrichObjectWarnings; we run it against the admitted
+//     object so the caller sees the resource the way any read of it would.
+//   - Apply-specific checks (SSA field-removal verification, ConfigMap/Secret
+//     consumer reload reminder) require knowledge of what was submitted vs.
+//     what landed and so live here.
+//
+// Best-effort throughout — a failed check never fails the apply itself.
+func (m *WorkloadManager) populateApplyWarnings(ctx context.Context, result *ApplyResourceResult, submitted, pre, post *unstructured.Unstructured, namespace, kind, name string, dryRun bool) {
+	// State-derived: prefer the admitted object, then fall back to the prior live
+	// object only when post-apply verification failed.
+	target := post
+	if target == nil {
+		target = pre
+	}
+	result.Warnings = append(result.Warnings, EnrichObjectWarnings(target)...)
+
+	if pre != nil && post != nil {
+		result.Warnings = append(result.Warnings, checkFieldRemoval(submitted, pre, post)...)
+	} else if !dryRun && pre != nil && post == nil {
+		result.Warnings = append(result.Warnings, "Post-apply verification GET failed; Radar could not compute field-retention warnings from the live object.")
+	}
+	// The consumer-reload reminder only makes sense for a persisted edit — on a
+	// dry run nothing landed, so the "restart consumers" advice would be
+	// premature (and the namespace-wide LISTs wasted).
+	if !dryRun && (kind == "ConfigMap" || kind == "Secret") && namespace != "" {
+		consumers, partial := findConfigMapSecretConsumers(ctx, m.dynClient, m.discovery, namespace, kind, name)
+		if w := formatConsumerWarning(kind, name, consumers, partial); w != "" {
+			result.Warnings = append(result.Warnings, w)
+		}
+	}
+}
+
 func boolPtr(b bool) *bool { return &b }
+
+func patchWithRadarOwnershipReclaim(
+	ctx context.Context,
+	client dynamic.ResourceInterface,
+	name string,
+	obj *unstructured.Unstructured,
+	force bool,
+	dryRun []string,
+) (*unstructured.Unstructured, bool, error) {
+	patch := func(body []byte, patchForce bool) (*unstructured.Unstructured, error) {
+		return client.Patch(ctx, name, types.ApplyPatchType, body, metav1.PatchOptions{
+			FieldManager:    "radar",
+			FieldValidation: metav1.FieldValidationStrict,
+			Force:           boolPtr(patchForce),
+			DryRun:          dryRun,
+		})
+	}
+	body, err := json.Marshal(obj.Object)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to marshal resource: %w", err)
+	}
+	applied, err := patch(body, force)
+	if err == nil || force || !isOnlyRadarFieldManagerConflict(err) {
+		return applied, false, err
+	}
+
+	retryObj := obj
+	if retryObj.GetResourceVersion() == "" {
+		live, getErr := client.Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			return nil, false, err
+		}
+		retryObj = obj.DeepCopy()
+		retryObj.SetResourceVersion(live.GetResourceVersion())
+		body, err = json.Marshal(retryObj.Object)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to marshal resource: %w", err)
+		}
+		applied, err = patch(body, false)
+		if err == nil || !isOnlyRadarFieldManagerConflict(err) {
+			return applied, false, err
+		}
+	}
+
+	applied, err = patch(body, true)
+	return applied, err == nil, err
+}
+
+func isOnlyRadarFieldManagerConflict(err error) bool {
+	var statusErr *apierrors.StatusError
+	if !errors.As(err, &statusErr) || statusErr.ErrStatus.Details == nil {
+		return false
+	}
+	causes := statusErr.ErrStatus.Details.Causes
+	if len(causes) == 0 {
+		return false
+	}
+	for _, cause := range causes {
+		if cause.Type != metav1.CauseTypeFieldManagerConflict ||
+			!strings.Contains(cause.Message, `conflict with "radar"`) {
+			return false
+		}
+	}
+	return true
+}
 
 // DeleteResource deletes a Kubernetes resource.
 func (m *WorkloadManager) DeleteResource(ctx context.Context, opts DeleteResourceOptions) error {
@@ -259,7 +584,7 @@ func (m *WorkloadManager) DeleteResource(ctx context.Context, opts DeleteResourc
 		return fmt.Errorf("dynamic client not initialized")
 	}
 
-	gvr, ok := m.discovery.GetGVR(opts.Kind)
+	gvr, ok := m.discovery.GetGVRWithGroup(opts.Kind, opts.Group)
 	if !ok {
 		return fmt.Errorf("unknown resource kind: %s", opts.Kind)
 	}
@@ -420,6 +745,13 @@ func (m *WorkloadManager) RestartWorkload(ctx context.Context, kind, namespace, 
 	if m.dynClient == nil {
 		return fmt.Errorf("dynamic client not initialized")
 	}
+	// A Rollout's restart is spec.restartAt; the pod-template annotation below
+	// would change the template hash and re-run every canary step instead.
+	if NormalizeWorkloadKind(kind) == "rollouts" {
+		_, err := rollouts.Restart(ctx, m.dynClient, namespace, name)
+		return err
+	}
+
 	if m.discovery == nil {
 		return fmt.Errorf("resource discovery not initialized")
 	}
@@ -442,30 +774,35 @@ func (m *WorkloadManager) RestartWorkload(ctx context.Context, kind, namespace, 
 	return nil
 }
 
-// ScaleWorkload scales a Deployment or StatefulSet to the specified replica count.
+// ScaleWorkload scales a Deployment, StatefulSet, or Rollout to the specified replica count.
 func (m *WorkloadManager) ScaleWorkload(ctx context.Context, kind, namespace, name string, replicas int32) error {
 	if m.dynClient == nil {
 		return fmt.Errorf("dynamic client not initialized")
 	}
-	if m.discovery == nil {
-		return fmt.Errorf("resource discovery not initialized")
-	}
 
 	normalizedKind := NormalizeWorkloadKind(kind)
-	if normalizedKind != "deployments" && normalizedKind != "statefulsets" {
-		return fmt.Errorf("scaling not supported for %s (only deployments and statefulsets)", kind)
-	}
-
-	gvr, ok := m.discovery.GetGVR(normalizedKind)
-	if !ok {
-		return fmt.Errorf("unknown resource kind: %s", kind)
+	var gvr schema.GroupVersionResource
+	switch normalizedKind {
+	case "rollouts":
+		// Fixed, not discovered: the CRD may not be in discovery's cache yet.
+		gvr = rollouts.GVR
+	case "deployments", "statefulsets":
+		if m.discovery == nil {
+			return fmt.Errorf("resource discovery not initialized")
+		}
+		found, ok := m.discovery.GetGVR(normalizedKind)
+		if !ok {
+			return fmt.Errorf("unknown resource kind: %s", kind)
+		}
+		gvr = found
+	default:
+		return fmt.Errorf("scaling not supported for %s (only deployments, statefulsets, and rollouts)", kind)
 	}
 
 	patch := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
-	_, err := m.dynClient.Resource(gvr).Namespace(namespace).Patch(
+	if _, err := m.dynClient.Resource(gvr).Namespace(namespace).Patch(
 		ctx, name, types.MergePatchType, []byte(patch), metav1.PatchOptions{},
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("failed to scale workload: %w", err)
 	}
 
@@ -502,16 +839,23 @@ func ScaleWorkloadDirect(ctx context.Context, dynClient dynamic.Interface, kind,
 	return nil
 }
 
-// ListWorkloadRevisions returns the revision history for a Deployment, StatefulSet, or DaemonSet.
+// ListWorkloadRevisions returns the revision history for a Deployment, StatefulSet, DaemonSet, or Rollout.
 func (m *WorkloadManager) ListWorkloadRevisions(ctx context.Context, kind, namespace, name string) ([]WorkloadRevision, error) {
 	if m.dynClient == nil {
 		return nil, fmt.Errorf("dynamic client not initialized")
 	}
+
+	normalizedKind := NormalizeWorkloadKind(kind)
+
+	// pkg/rollouts carries its own GVR, so this path works before discovery has
+	// cached the Rollout CRD.
+	if normalizedKind == "rollouts" {
+		return m.listRolloutRevisions(ctx, namespace, name)
+	}
+
 	if m.discovery == nil {
 		return nil, fmt.Errorf("resource discovery not initialized")
 	}
-
-	normalizedKind := NormalizeWorkloadKind(kind)
 
 	workloadGVR, ok := m.discovery.GetGVR(normalizedKind)
 	if !ok {
@@ -532,6 +876,27 @@ func (m *WorkloadManager) ListWorkloadRevisions(ctx context.Context, kind, names
 	default:
 		return nil, fmt.Errorf("revision history not supported for %s", kind)
 	}
+}
+
+func (m *WorkloadManager) listRolloutRevisions(ctx context.Context, namespace, name string) ([]WorkloadRevision, error) {
+	revisions, err := rollouts.ListRevisions(ctx, m.dynClient, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]WorkloadRevision, 0, len(revisions))
+	for _, r := range revisions {
+		out = append(out, WorkloadRevision{
+			Number:    r.Number,
+			CreatedAt: r.CreatedAt,
+			Image:     r.Image,
+			IsCurrent: r.IsCurrent,
+			IsStable:  r.IsStable,
+			PodHash:   r.PodHash,
+			Replicas:  r.Replicas,
+			Template:  r.Template,
+		})
+	}
+	return out, nil
 }
 
 func (m *WorkloadManager) listDeploymentRevisions(ctx context.Context, namespace, name, workloadUID string) ([]WorkloadRevision, error) {
@@ -597,6 +962,7 @@ func BuildDeploymentRevisions(rsList []unstructured.Unstructured, workloadUID st
 			Image:     image,
 			Replicas:  replicas,
 			Template:  templateStr,
+			PodHash:   rs.GetLabels()["pod-template-hash"],
 		})
 	}
 
@@ -609,6 +975,67 @@ func BuildDeploymentRevisions(rsList []unstructured.Unstructured, workloadUID st
 	sort.Slice(revisions, func(i, j int) bool { return revisions[i].Number > revisions[j].Number })
 
 	return revisions
+}
+
+func CurrentDeploymentRevisionPodHashes(replicaSets []*appsv1.ReplicaSet) map[types.UID]string {
+	type revisionHash struct {
+		revision int64
+		hash     string
+	}
+	current := make(map[types.UID]revisionHash)
+	for _, replicaSet := range replicaSets {
+		revision, err := strconv.ParseInt(replicaSet.Annotations["deployment.kubernetes.io/revision"], 10, 64)
+		if err != nil {
+			continue
+		}
+		for _, owner := range replicaSet.OwnerReferences {
+			if owner.Kind != "Deployment" || owner.UID == "" {
+				continue
+			}
+			if existing, ok := current[owner.UID]; !ok || revision > existing.revision {
+				current[owner.UID] = revisionHash{revision: revision, hash: replicaSet.Labels[appsv1.DefaultDeploymentUniqueLabelKey]}
+			}
+			break
+		}
+	}
+	hashes := make(map[types.UID]string, len(current))
+	for uid, revision := range current {
+		if revision.hash != "" {
+			hashes[uid] = revision.hash
+		}
+	}
+	return hashes
+}
+
+func CurrentControllerRevisionPodHashes(revisions []unstructured.Unstructured) map[types.UID]string {
+	type revisionHash struct {
+		revision int64
+		hash     string
+	}
+	current := make(map[types.UID]revisionHash)
+	for i := range revisions {
+		revision := &revisions[i]
+		number, found, _ := unstructured.NestedInt64(revision.Object, "revision")
+		if !found {
+			continue
+		}
+		for _, owner := range revision.GetOwnerReferences() {
+			if (owner.Kind != "StatefulSet" && owner.Kind != "DaemonSet") || owner.UID == "" {
+				continue
+			}
+			if existing, ok := current[owner.UID]; !ok || number > existing.revision {
+				current[owner.UID] = revisionHash{revision: number, hash: revision.GetLabels()[appsv1.ControllerRevisionHashLabelKey]}
+			}
+			break
+		}
+	}
+	hashes := make(map[types.UID]string, len(current))
+	for uid, revision := range current {
+		if revision.hash != "" {
+			hashes[uid] = revision.hash
+		}
+	}
+	return hashes
 }
 
 func (m *WorkloadManager) listControllerRevisions(ctx context.Context, namespace, name, workloadUID string) ([]WorkloadRevision, error) {
@@ -632,11 +1059,13 @@ func BuildControllerRevisions(crList []unstructured.Unstructured, workloadUID st
 	var maxRevision int64
 
 	for _, cr := range crList {
+		ownerKind := ""
 		if workloadUID != "" {
 			owned := false
 			for _, ref := range cr.GetOwnerReferences() {
 				if string(ref.UID) == workloadUID {
 					owned = true
+					ownerKind = ref.Kind
 					break
 				}
 			}
@@ -669,11 +1098,16 @@ func BuildControllerRevisions(crList []unstructured.Unstructured, workloadUID st
 			maxRevision = revNum
 		}
 
+		podHash := cr.GetLabels()[appsv1.ControllerRevisionHashLabelKey]
+		if ownerKind == "StatefulSet" {
+			podHash = cr.GetName()
+		}
 		revisions = append(revisions, WorkloadRevision{
 			Number:    revNum,
 			CreatedAt: cr.GetCreationTimestamp().Time,
 			Image:     image,
 			Template:  templateStr,
+			PodHash:   podHash,
 		})
 	}
 
@@ -688,16 +1122,22 @@ func BuildControllerRevisions(crList []unstructured.Unstructured, workloadUID st
 	return revisions
 }
 
-// RollbackWorkload rolls back a Deployment, StatefulSet, or DaemonSet to a specific revision.
+// RollbackWorkload rolls back a Deployment, StatefulSet, DaemonSet, or Rollout to a specific revision.
 func (m *WorkloadManager) RollbackWorkload(ctx context.Context, kind, namespace, name string, revision int64) error {
 	if m.dynClient == nil {
 		return fmt.Errorf("dynamic client not initialized")
 	}
+
+	normalizedKind := NormalizeWorkloadKind(kind)
+
+	if normalizedKind == "rollouts" {
+		_, err := rollouts.Undo(ctx, m.dynClient, namespace, name, revision)
+		return err
+	}
+
 	if m.discovery == nil {
 		return fmt.Errorf("resource discovery not initialized")
 	}
-
-	normalizedKind := NormalizeWorkloadKind(kind)
 
 	workloadGVR, ok := m.discovery.GetGVR(normalizedKind)
 	if !ok {
@@ -862,6 +1302,8 @@ func NormalizeWorkloadKind(kind string) string {
 		return "statefulsets"
 	case "DaemonSet", "daemonset", "daemonsets":
 		return "daemonsets"
+	case "Rollout", "rollout", "rollouts":
+		return "rollouts"
 	default:
 		return kind
 	}

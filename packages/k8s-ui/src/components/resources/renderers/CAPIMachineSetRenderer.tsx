@@ -1,5 +1,5 @@
 import { Server, Settings } from 'lucide-react'
-import { Section, PropertyList, Property, ConditionsSection, AlertBanner, ResourceLink } from '../../ui/drawer-components'
+import { Section, PropertyList, Property, ConditionsSection, AlertBanner, ResourceLink, useOperationalIssuesShown} from '../../ui/drawer-components'
 import { kindToPlural } from '../../../utils/navigation'
 import { formatAge } from '../resource-utils'
 import { getMachineSetStatus, getMachineClusterName } from '../resource-utils-capi'
@@ -16,6 +16,7 @@ export function CAPIMachineSetRenderer({ data, onNavigate }: Props) {
 
   const msStatus = getMachineSetStatus(data)
   const isFailed = msStatus.level === 'unhealthy'
+  const operationalIssuesShown = useOperationalIssuesShown()
   const readyCond = conditions.find((c: any) => c.type === 'Ready')
 
   const clusterName = getMachineClusterName(data)
@@ -29,7 +30,7 @@ export function CAPIMachineSetRenderer({ data, onNavigate }: Props) {
 
   return (
     <>
-      {isFailed && (
+      {isFailed && !operationalIssuesShown && (
         <AlertBanner
           variant="error"
           title="MachineSet Not Ready"
@@ -92,7 +93,7 @@ export function CAPIMachineSetRenderer({ data, onNavigate }: Props) {
 
       {/* Owned Machines hint */}
       <div className="px-3 py-1.5 text-xs text-theme-text-tertiary">
-        Machines with label <code className="bg-theme-surface px-1 py-0.5 rounded text-[10px] font-mono select-all">cluster.x-k8s.io/set-name={data.metadata?.name}</code>
+        Machines with label <code className="inline-code text-[10px] select-all">cluster.x-k8s.io/set-name={data.metadata?.name}</code>
       </div>
 
       <ConditionsSection conditions={conditions} />

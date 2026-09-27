@@ -1,0 +1,151 @@
+// LeaderWorkerSet (leaderworkerset.x-k8s.io/v1) and JobSet (jobset.x-k8s.io/v1alpha2) utility functions
+
+import type { StatusBadge } from './resource-utils'
+import { healthColors } from './resource-utils'
+
+export const JOBSET_API_VERSION = 'jobset.x-k8s.io/v1alpha2'
+
+export function isJobSetV1Alpha2(resource: any): boolean {
+  return resource?.kind === 'JobSet' && resource?.apiVersion === JOBSET_API_VERSION
+}
+
+// ============================================================================
+// LEADERWORKERSET UTILITIES
+// ============================================================================
+
+export function getLeaderWorkerSetStatus(resource: any): StatusBadge {
+  const conditions = resource.status?.conditions || []
+
+  const availableCond = conditions.find((c: any) => c.type === 'Available')
+  if (availableCond?.status === 'True') {
+    return { text: 'Available', color: healthColors.healthy, level: 'healthy' }
+  }
+
+  const updateCond = conditions.find((c: any) => c.type === 'UpdateInProgress')
+  if (updateCond?.status === 'True') {
+    return { text: 'Updating', color: healthColors.degraded, level: 'degraded' }
+  }
+
+  const progressingCond = conditions.find((c: any) => c.type === 'Progressing')
+  if (progressingCond?.status === 'True') {
+    return { text: 'Progressing', color: healthColors.degraded, level: 'degraded' }
+  }
+
+  if (availableCond?.status === 'False') {
+    return { text: availableCond.reason || 'Unavailable', color: healthColors.unhealthy, level: 'unhealthy' }
+  }
+
+  return { text: 'Unknown', color: healthColors.unknown, level: 'unknown' }
+}
+
+export function getLeaderWorkerSetReplicas(resource: any): string {
+  const replicas = resource.spec?.replicas
+  return replicas !== undefined && replicas !== null ? String(replicas) : '1'
+}
+
+export function getLeaderWorkerSetSize(resource: any): string {
+  const size = resource.spec?.leaderWorkerTemplate?.size
+  return size !== undefined && size !== null ? String(size) : '1'
+}
+
+export function getLeaderWorkerSetReady(resource: any): string {
+  const ready = resource.status?.readyReplicas ?? 0
+  const desired = resource.spec?.replicas ?? 1
+  return `${ready}/${desired}`
+}
+
+export function getLeaderWorkerSetUpdated(resource: any): string {
+  const updated = resource.status?.updatedReplicas
+  return updated !== undefined && updated !== null ? String(updated) : '0'
+}
+
+// ============================================================================
+// JOBSET UTILITIES
+// ============================================================================
+
+export function getJobSetStatus(resource: any): StatusBadge {
+  const conditions = resource.status?.conditions || []
+
+  const failedCond = conditions.find((c: any) => c.type === 'Failed')
+  const completedCond = conditions.find((c: any) => c.type === 'Completed')
+
+  if (resource.status?.terminalState === 'Failed') {
+    return { text: failedCond?.status === 'True' ? failedCond.reason || 'Failed' : 'Failed', color: healthColors.unhealthy, level: 'unhealthy' }
+  }
+
+  if (resource.status?.terminalState === 'Completed') {
+    return { text: 'Completed', color: healthColors.neutral, level: 'neutral' }
+  }
+
+  if (resource.status?.terminalState) {
+    return { text: 'Unknown', color: healthColors.unknown, level: 'unknown' }
+  }
+
+  if (failedCond?.status === 'True') {
+    return { text: failedCond.reason || 'Failed', color: healthColors.unhealthy, level: 'unhealthy' }
+  }
+
+  if (completedCond?.status === 'True') {
+    return { text: 'Completed', color: healthColors.neutral, level: 'neutral' }
+  }
+
+  const startupCond = conditions.find((c: any) => c.type === 'StartupPolicyInProgress')
+  // In-order resume retains Suspended until every role starts.
+  if (startupCond?.status === 'True' && resource.spec?.suspend !== true) {
+    return { text: 'Starting', color: healthColors.degraded, level: 'degraded' }
+  }
+
+  const suspendedCond = conditions.find((c: any) => c.type === 'Suspended')
+  if (suspendedCond?.status === 'True') {
+    return { text: 'Suspended', color: healthColors.neutral, level: 'neutral' }
+  }
+
+  const restartingCond = conditions.find((c: any) => c.type === 'RestartingJobSet')
+  if (restartingCond?.status === 'True') {
+    return { text: 'Restarting', color: healthColors.degraded, level: 'degraded' }
+  }
+
+  if (startupCond?.status === 'True') {
+    return { text: 'Starting', color: healthColors.degraded, level: 'degraded' }
+  }
+
+  const statuses = resource.status?.replicatedJobsStatus
+  if (Array.isArray(statuses)) {
+    // Child activity includes Pending Pods and cleanup, not application health.
+    const activity = ['active', 'ready', 'succeeded', 'failed', 'suspended']
+      .some((field) => sumReplicatedJobsField(resource, field) > 0)
+    return activity
+      ? { text: 'Active', color: healthColors.neutral, level: 'neutral' }
+      : { text: 'Pending', color: healthColors.neutral, level: 'neutral' }
+  }
+
+  return { text: 'Unknown', color: healthColors.unknown, level: 'unknown' }
+}
+
+export function getJobSetReplicatedJobs(resource: any): string {
+  const jobs = resource.spec?.replicatedJobs
+  if (!Array.isArray(jobs) || jobs.length === 0) return '-'
+  return String(jobs.length)
+}
+
+function sumReplicatedJobsField(resource: any, field: string): number {
+  const statuses = resource.status?.replicatedJobsStatus
+  if (!Array.isArray(statuses)) return 0
+  return statuses.reduce((sum: number, s: any) => sum + (s?.[field] ?? 0), 0)
+}
+
+export function getJobSetReadyJobs(resource: any): number {
+  return sumReplicatedJobsField(resource, 'ready')
+}
+
+export function getJobSetSucceededJobs(resource: any): number {
+  return sumReplicatedJobsField(resource, 'succeeded')
+}
+
+export function getJobSetFailedJobs(resource: any): number {
+  return sumReplicatedJobsField(resource, 'failed')
+}
+
+export function getJobSetRestarts(resource: any): number {
+  return resource.status?.restarts ?? 0
+}

@@ -113,6 +113,24 @@ func TestCapabilitiesAlignment_TypedVsDynamic(t *testing.T) {
 	}
 }
 
+// TestCapabilitiesAlignment_AllTypedInformersProbed asserts every typed
+// informer key is represented in resourceProbeTargets. Without this,
+// ResourceScopes disables the omitted informer even when the apiserver would
+// allow it.
+func TestCapabilitiesAlignment_AllTypedInformersProbed(t *testing.T) {
+	probeKeys := make(map[string]bool)
+	for _, p := range resourceProbeTargets(&ResourcePermissions{}) {
+		probeKeys[p.key] = true
+	}
+
+	for _, key := range k8score.InformerResourceKeys() {
+		if !probeKeys[key] {
+			t.Errorf("typed informer %q has no probe in resourceProbeTargets — "+
+				"ResourceScopes will disable it even when list access is allowed.", key)
+		}
+	}
+}
+
 // TestCapabilitiesAlignment_JSONTagMatchesProbeKey asserts the JSON tag,
 // lowercased, equals the probe key. This is the actual contract — a future
 // field that breaks it (e.g. tag "snake_case") will fail this test.
@@ -158,7 +176,7 @@ func TestCapabilitiesAlignment_JSONTagMatchesProbeKey(t *testing.T) {
 func TestCapabilitiesAlignment_FullyAllowedProbeSetsEveryField(t *testing.T) {
 	dyn := fakeDyn(t, func(_ schema.GroupVersionResource, _ string) bool { return true })
 
-	result, hadErrors := probeResourceAccess(context.Background(), dyn, "", false)
+	result, hadErrors := probeResourceAccess(context.Background(), dyn, nil, false)
 	if hadErrors {
 		t.Fatalf("hadErrors should be false on a fully-allowed run")
 	}

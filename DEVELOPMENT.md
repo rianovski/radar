@@ -141,7 +141,7 @@ radar/
 
 ## API Reference
 
-For the full API reference, see [CLAUDE.md](CLAUDE.md#api-endpoints).
+See the operator-facing [HTTP API reference](https://radarhq.io/docs/reference/api). Route definitions in [`internal/server/server.go`](internal/server/server.go) remain the source of truth when adding or changing an endpoint.
 
 ## Adding Features
 
@@ -211,10 +211,11 @@ make release-binaries-dry
 ### Release Checklist
 
 1. Ensure tests pass: `make test`
+1. For a minor or major release (`vX.Y.0`), add its What's New entry to `web/src/components/whats-new/releaseNotes.ts` and merge it first. Lead with the highlight most users will care about; give highlights that open a feature a `path` and `cta`. Preview with `?whats-new=vX.Y.0` on a local build. `scripts/check-whats-new.sh` enforces this: `make release` refuses to tag without the entry, and the release workflows fail before building. Patch releases need no entry.
 2. Tag the release: `git tag v0.X.Y && git push origin v0.X.Y`
 3. Run release: `make release`
 
-The `helm` job in `.github/workflows/release.yml` rewrites the chart's `version` / `appVersion` / image-tag annotation to match the release tag and pushes the chart to `skyhook-io/helm-charts`. No manual chart edit is needed; in fact, hand-edited values in `deploy/helm/radar/Chart.yaml` will be overwritten. The job fails fast if `radar-<version>` is already tagged in helm-charts — bump the release version higher in that case.
+The `helm` job in `.github/workflows/release.yml` rewrites the chart's `version` / `appVersion` / image-tag annotation to match the release tag and pushes the chart to `skyhook-io/helm-charts`. No manual chart edit is needed; in fact, hand-edited values in `deploy/helm/radar/Chart.yaml` will be overwritten — which is why those fields sit at the `0.0.0-dev` placeholder on `main`. The job fails fast if `radar-<version>` is already tagged in helm-charts — bump the release version higher in that case.
 
 ## Code Style
 

@@ -67,12 +67,16 @@ LABEL org.opencontainers.image.title="Radar"
 LABEL org.opencontainers.image.description="Modern Kubernetes visibility — topology, traffic, and Helm management"
 LABEL org.opencontainers.image.source="https://github.com/skyhook-io/radar"
 LABEL org.opencontainers.image.vendor="Skyhook"
+# Ownership proof for the official MCP registry — must match the name in server.json.
+LABEL io.modelcontextprotocol.server.name="io.github.skyhook-io/radar"
 
 COPY --from=backend-builder /radar /radar
 
 EXPOSE 9280
 USER nonroot:nonroot
-ENTRYPOINT ["/radar"]
+# Keep the container networking invariant in ENTRYPOINT so docker run arguments
+# and Compose command overrides cannot silently replace the shared listener.
+ENTRYPOINT ["/radar", "--listen-address=0.0.0.0"]
 CMD ["--no-browser"]
 
 # =============================================================================
@@ -86,11 +90,15 @@ LABEL org.opencontainers.image.title="Radar"
 LABEL org.opencontainers.image.description="Modern Kubernetes visibility — topology, traffic, and Helm management"
 LABEL org.opencontainers.image.source="https://github.com/skyhook-io/radar"
 LABEL org.opencontainers.image.vendor="Skyhook"
+# Ownership proof for the official MCP registry — must match the name in server.json.
+LABEL io.modelcontextprotocol.server.name="io.github.skyhook-io/radar"
 
 ARG TARGETARCH
 COPY radar-${TARGETARCH} /radar
 
 EXPOSE 9280
 USER nonroot:nonroot
-ENTRYPOINT ["/radar"]
+# Keep the container networking invariant in ENTRYPOINT so docker run arguments
+# and Compose command overrides cannot silently replace the shared listener.
+ENTRYPOINT ["/radar", "--listen-address=0.0.0.0"]
 CMD ["--no-browser"]

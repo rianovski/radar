@@ -4,12 +4,15 @@ import { clsx } from 'clsx'
 import { stringify as yamlStringify } from 'yaml'
 import { Section, PropertyList, Property, AlertBanner } from '../../ui/drawer-components'
 import { ConfirmDialog } from '../../ui/ConfirmDialog'
-import type { SecretCertificateInfo, CertificateInfo } from '../../../types'
+import { ReflectorSummary, ReflectorSection, isReflectorMirror, reflectorEditNotice } from './ReflectorSection'
+import type { SecretCertificateInfo, CertificateInfo, Relationships, ResourceRef } from '../../../types'
 import { pluralize } from '../../../utils/pluralize'
 import { cleanResourceForYaml } from '../../../utils/yaml'
 
 interface SecretRendererProps {
   data: any
+  relationships?: Relationships
+  onNavigate?: (ref: ResourceRef) => void
   certificateInfo?: SecretCertificateInfo
   resourceData?: any
   onSaveSecretValue?: (yaml: string) => Promise<void>
@@ -22,7 +25,7 @@ function formatDate(dateStr: string): string {
   return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
 }
 
-export function SecretRenderer({ data, certificateInfo, resourceData, onSaveSecretValue, isSaving }: SecretRendererProps) {
+export function SecretRenderer({ data, relationships, onNavigate, certificateInfo, resourceData, onSaveSecretValue, isSaving }: SecretRendererProps) {
   const [revealed, setRevealed] = useState<Set<string>>(new Set())
   const [copied, setCopied] = useState<string | null>(null)
   const [editingKey, setEditingKey] = useState<string | null>(null)
@@ -137,6 +140,8 @@ export function SecretRenderer({ data, certificateInfo, resourceData, onSaveSecr
         />
       )}
 
+      <ReflectorSummary data={data} reflection={relationships?.reflection} onNavigate={onNavigate} />
+
       {/* Certificate info section */}
       {certs && certs.length > 0 && (
         <>
@@ -217,6 +222,8 @@ export function SecretRenderer({ data, certificateInfo, resourceData, onSaveSecr
                       ref={textareaRef}
                       value={editValue}
                       onChange={(e) => setEditValue(e.target.value)}
+                      autoCorrect="off"
+                      autoCapitalize="off"
                       className="w-full bg-theme-base rounded p-2 text-xs text-theme-text-secondary font-mono border border-blue-500/50 focus:border-blue-500 focus:outline-none resize-none overflow-hidden whitespace-pre-wrap"
                       style={{ minHeight: '60px' }}
                       disabled={isSaving}
@@ -258,6 +265,8 @@ export function SecretRenderer({ data, certificateInfo, resourceData, onSaveSecr
         </div>
       </Section>
 
+      <ReflectorSection data={data} reflection={relationships?.reflection} onNavigate={onNavigate} />
+
       {editingKey && (
         <ConfirmDialog
           open={showSaveConfirm}
@@ -265,7 +274,7 @@ export function SecretRenderer({ data, certificateInfo, resourceData, onSaveSecr
           onConfirm={() => handleSave(editingKey, editValue)}
           title="Update Secret"
           message={`Update key "${editingKey}" in secret "${data.metadata?.name || 'unknown'}"?`}
-          details="This will modify the secret value in the cluster immediately."
+          details={isReflectorMirror(data) ? `This will modify the secret value immediately. ${reflectorEditNotice}` : "This will modify the secret value in the cluster immediately."}
           confirmLabel="Update"
           variant="warning"
           isLoading={isSaving}

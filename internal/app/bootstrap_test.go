@@ -1,0 +1,533 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/skyhook-io/radar/internal/auth"
+	"github.com/skyhook-io/radar/internal/config"
+	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/internal/settings"
+	"github.com/skyhook-io/radar/internal/timeline"
+)
+
+func TestBuildTimelineStoreConfig(t *testing.T) {
+	t.Run("memory preserves history limit", func(t *testing.T) {
+		got, err := BuildTimelineStoreConfig(AppConfig{
+			TimelineStorage:      "memory",
+			HistoryLimit:         321,
+			TimelineRetention:    48 * time.Hour,
+			TimelineMaxSizeBytes: 12345,
+		})
+		if err != nil {
+			t.Fatalf("BuildTimelineStoreConfig: %v", err)
+		}
+		if got.Type != timeline.StoreTypeMemory || got.MaxSize != 321 {
+			t.Fatalf("memory config = %+v, want type=memory maxSize=321", got)
+		}
+		if got.RetentionAge != 0 || got.MaxStorageBytes != 0 {
+			t.Fatalf("memory config applied SQLite cleanup settings: %+v", got)
+		}
+	})
+
+	t.Run("empty storage keeps memory default", func(t *testing.T) {
+		got, err := BuildTimelineStoreConfig(AppConfig{HistoryLimit: 123})
+		if err != nil {
+			t.Fatalf("BuildTimelineStoreConfig: %v", err)
+		}
+		if got.Type != timeline.StoreTypeMemory || got.MaxSize != 123 {
+			t.Fatalf("default config = %+v, want type=memory maxSize=123", got)
+		}
+	})
+
+	t.Run("sqlite preserves path and cleanup settings", func(t *testing.T) {
+		got, err := BuildTimelineStoreConfig(AppConfig{
+			TimelineStorage:      "sqlite",
+			TimelineDBPath:       "/tmp/radar-test.db",
+			TimelineRetention:    72 * time.Hour,
+			TimelineMaxSizeBytes: 8 << 20,
+		})
+		if err != nil {
+			t.Fatalf("BuildTimelineStoreConfig: %v", err)
+		}
+		if got.Type != timeline.StoreTypeSQLite || got.Path != "/tmp/radar-test.db" {
+			t.Fatalf("sqlite config = %+v, want explicit SQLite path", got)
+		}
+		if got.RetentionAge != 72*time.Hour || got.MaxStorageBytes != 8<<20 {
+			t.Fatalf("sqlite cleanup config = %+v, want retention and max bytes preserved", got)
+		}
+	})
+
+	t.Run("sqlite uses home directory default path", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+
+		got, err := BuildTimelineStoreConfig(AppConfig{TimelineStorage: "sqlite"})
+		if err != nil {
+			t.Fatalf("BuildTimelineStoreConfig: %v", err)
+		}
+		wantPath := filepath.Join(home, ".radar", "timeline.db")
+		if got.Path != wantPath {
+			t.Fatalf("sqlite default path = %q, want %q", got.Path, wantPath)
+		}
+	})
+
+	t.Run("postgres carries runtime DSN", func(t *testing.T) {
+		const dsn = "postgres://radar:secret@example.test/radar"
+		got, err := BuildTimelineStoreConfig(AppConfig{
+			TimelineStorage:     "postgres",
+			TimelinePostgresDSN: dsn,
+			TimelineRetention:   72 * time.Hour,
+		})
+		if err != nil {
+			t.Fatalf("BuildTimelineStoreConfig: %v", err)
+		}
+		if got.Type != timeline.StoreTypePostgres || got.DSN != dsn {
+			t.Fatalf("postgres config = %+v, want type=postgres with runtime DSN", got)
+		}
+		if got.RetentionAge != 72*time.Hour {
+			t.Fatalf("postgres retention = %s, want 72h", got.RetentionAge)
+		}
+	})
+
+	t.Run("postgres requires DSN", func(t *testing.T) {
+		_, err := BuildTimelineStoreConfig(AppConfig{TimelineStorage: "postgres"})
+		if err == nil || !strings.Contains(err.Error(), "requires a DSN") {
+			t.Fatalf("BuildTimelineStoreConfig error = %v, want missing DSN error", err)
+		}
+	})
+
+	t.Run("unknown storage is rejected", func(t *testing.T) {
+		_, err := BuildTimelineStoreConfig(AppConfig{TimelineStorage: "mystery"})
+		if err == nil || !strings.Contains(err.Error(), "unknown timeline storage") {
+			t.Fatalf("BuildTimelineStoreConfig error = %v, want unknown storage error", err)
+		}
+	})
+}
+
+func TestValidateNamespaceScopeTarget(t *testing.T) {
+	cases := []struct {
+		name    string
+		target  string
+		wantErr bool
+	}{
+		{"single valid namespace", "team-prod", false},
+		{"empty target", "", true},
+		{"comma-separated (multiple)", "team-a,team-b", true},
+		{"whitespace", "team a", true},
+		{"uppercase invalid", "TeamProd", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateNamespaceScopeTarget(tc.target)
+			if tc.wantErr && err == nil {
+				t.Fatalf("validateNamespaceScopeTarget(%q) = nil, want error", tc.target)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validateNamespaceScopeTarget(%q) = %v, want nil", tc.target, err)
+			}
+		})
+	}
+}
+
+func TestParseNamespaces(t *testing.T) {
+	got := ParseNamespaces(" team-a,team-b,,team-a , team-c ")
+	want := []string{"team-a", "team-b", "team-c"}
+	if len(got) != len(want) {
+		t.Fatalf("ParseNamespaces length = %d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ParseNamespaces[%d] = %q, want %q (all=%v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestResolveKubeconfigSelection(t *testing.T) {
+	tests := []struct {
+		name              string
+		kubeconfig        string
+		dirs              string
+		kubeconfigSet     bool
+		dirsSet           bool
+		wantKubeconfig    string
+		wantKubeconfigDir []string
+	}{
+		{
+			name:              "saved values combine",
+			kubeconfig:        "/saved/config",
+			dirs:              "/saved/a,/saved/b",
+			wantKubeconfig:    "/saved/config",
+			wantKubeconfigDir: []string{"/saved/a", "/saved/b"},
+		},
+		{
+			name:           "explicit file drops saved directories",
+			kubeconfig:     "/flag/config",
+			dirs:           "/saved/a",
+			kubeconfigSet:  true,
+			wantKubeconfig: "/flag/config",
+		},
+		{
+			name:              "explicit directories drop saved file",
+			kubeconfig:        "/saved/config",
+			dirs:              "/flag/a,/flag/b",
+			dirsSet:           true,
+			wantKubeconfigDir: []string{"/flag/a", "/flag/b"},
+		},
+		{
+			name:              "both explicit combine",
+			kubeconfig:        "/flag/config",
+			dirs:              "/flag/a",
+			kubeconfigSet:     true,
+			dirsSet:           true,
+			wantKubeconfig:    "/flag/config",
+			wantKubeconfigDir: []string{"/flag/a"},
+		},
+		{
+			name:              "explicit empty file clears only saved file",
+			dirs:              "/saved/a",
+			kubeconfigSet:     true,
+			wantKubeconfigDir: []string{"/saved/a"},
+		},
+		{
+			name:           "explicit empty directories clear only saved directories",
+			kubeconfig:     "/saved/config",
+			dirsSet:        true,
+			wantKubeconfig: "/saved/config",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotKubeconfig, gotDirs := ResolveKubeconfigSelection(
+				tt.kubeconfig, tt.dirs, tt.kubeconfigSet, tt.dirsSet,
+			)
+			if gotKubeconfig != tt.wantKubeconfig {
+				t.Fatalf("kubeconfig = %q, want %q", gotKubeconfig, tt.wantKubeconfig)
+			}
+			if len(gotDirs) != len(tt.wantKubeconfigDir) {
+				t.Fatalf("directories = %v, want %v", gotDirs, tt.wantKubeconfigDir)
+			}
+			for i := range tt.wantKubeconfigDir {
+				if gotDirs[i] != tt.wantKubeconfigDir[i] {
+					t.Fatalf("directories[%d] = %q, want %q", i, gotDirs[i], tt.wantKubeconfigDir[i])
+				}
+			}
+		})
+	}
+}
+
+func TestPersistKubecostContextBindings(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	k8s.ResetTestState()
+	t.Cleanup(k8s.ResetTestState)
+	k8s.SetTestContextName("cluster-a")
+
+	if err := config.Save(config.Config{
+		CostSource:        "kubecost",
+		KubecostAPIKey:    "secret",
+		KubecostClusterID: "prod-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := persistKubecostContextBindings(AppConfig{
+		CostSource:        "kubecost",
+		KubecostAPIKey:    "secret",
+		KubecostClusterID: "prod-a",
+	})
+	if cfg.KubecostAPIKeyContext != "cluster-a" || cfg.KubecostClusterIDContext != "cluster-a" {
+		t.Fatalf("runtime bindings = api key %q, cluster ID %q; want cluster-a", cfg.KubecostAPIKeyContext, cfg.KubecostClusterIDContext)
+	}
+	stored := config.Load()
+	if stored.KubecostAPIKeyContext != "cluster-a" || stored.KubecostClusterIDContext != "cluster-a" {
+		t.Fatalf("persisted bindings = api key %q, cluster ID %q; want cluster-a", stored.KubecostAPIKeyContext, stored.KubecostClusterIDContext)
+	}
+
+	k8s.SetTestContextName("cluster-b")
+	second := persistKubecostContextBindings(AppConfig{
+		CostSource:               "kubecost",
+		KubecostAPIKey:           stored.KubecostAPIKey,
+		KubecostAPIKeyContext:    stored.KubecostAPIKeyContext,
+		KubecostClusterID:        stored.KubecostClusterID,
+		KubecostClusterIDContext: stored.KubecostClusterIDContext,
+	})
+	if second.KubecostAPIKeyContext != "cluster-a" || second.KubecostClusterIDContext != "cluster-a" {
+		t.Fatalf("restart rebound settings to cluster-b: %#v", second)
+	}
+}
+
+func TestPersistKubecostContextBindingsIgnoresProgrammaticConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	k8s.ResetTestState()
+	t.Cleanup(k8s.ResetTestState)
+	k8s.SetTestContextName("cluster-a")
+
+	cfg := persistKubecostContextBindings(AppConfig{KubecostAPIKey: "not-from-file", KubecostClusterID: "not-from-file"})
+	if cfg.KubecostAPIKeyContext != "" || cfg.KubecostClusterIDContext != "" {
+		t.Fatalf("programmatic config was treated as persisted: %#v", cfg)
+	}
+}
+
+func TestResolveNamespaceSelection(t *testing.T) {
+	t.Run("namespaces default wins over namespace config", func(t *testing.T) {
+		ns, nss, err := ResolveNamespaceSelection("legacy", "team-a,team-b", false, false)
+		if err != nil {
+			t.Fatalf("ResolveNamespaceSelection: %v", err)
+		}
+		if ns != "" || len(nss) != 2 || nss[0] != "team-a" || nss[1] != "team-b" {
+			t.Fatalf("got namespace=%q namespaces=%v, want namespaces team-a/team-b", ns, nss)
+		}
+	})
+	t.Run("explicit namespace overrides namespaces config", func(t *testing.T) {
+		ns, nss, err := ResolveNamespaceSelection("prod", "team-a,team-b", true, false)
+		if err != nil {
+			t.Fatalf("ResolveNamespaceSelection: %v", err)
+		}
+		if ns != "prod" || len(nss) != 0 {
+			t.Fatalf("got namespace=%q namespaces=%v, want prod only", ns, nss)
+		}
+	})
+	t.Run("explicit conflict", func(t *testing.T) {
+		if _, _, err := ResolveNamespaceSelection("prod", "team-a,team-b", true, true); err == nil {
+			t.Fatal("ResolveNamespaceSelection conflict returned nil error")
+		}
+	})
+}
+
+func TestConfigureNamespaceScopePreferenceResolverUsesSingleSavedLocalPick(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	k8s.ResetTestState()
+	t.Cleanup(k8s.ResetTestState)
+	k8s.SetTestContextName("ctx-a")
+
+	if _, err := settings.Update(func(st *settings.Settings) {
+		st.ActiveNamespaces = map[string][]string{"ctx-a": {"prod"}}
+	}); err != nil {
+		t.Fatalf("settings.Update: %v", err)
+	}
+
+	configureNamespaceScopePreferenceResolver(AppConfig{NamespaceScope: true})
+
+	if got := k8s.GetNamespaceScopeTarget(); got != "prod" {
+		t.Fatalf("GetNamespaceScopeTarget() = %q, want prod", got)
+	}
+
+	k8s.ClearNamespaceScopeOverride()
+	k8s.RestoreNamespaceScopePreference("ctx-a")
+	if got := k8s.GetNamespaceScopeTarget(); got != "prod" {
+		t.Fatalf("GetNamespaceScopeTarget() after restore = %q, want prod", got)
+	}
+}
+
+func TestConfigureNamespaceScopePreferenceResolverExplicitNamespaceWins(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	k8s.ResetTestState()
+	t.Cleanup(k8s.ResetTestState)
+	k8s.SetTestContextName("ctx-a")
+	k8s.SetFallbackNamespace("cli-ns")
+
+	if _, err := settings.Update(func(st *settings.Settings) {
+		st.ActiveNamespaces = map[string][]string{"ctx-a": {"saved-ns"}}
+	}); err != nil {
+		t.Fatalf("settings.Update: %v", err)
+	}
+
+	configureNamespaceScopePreferenceResolver(AppConfig{NamespaceScope: true, Namespace: "cli-ns"})
+
+	if got := k8s.GetNamespaceScopeTarget(); got != "cli-ns" {
+		t.Fatalf("GetNamespaceScopeTarget() = %q, want cli-ns", got)
+	}
+
+	k8s.RestoreNamespaceScopePreference("ctx-a")
+	if got := k8s.GetNamespaceScopeTarget(); got != "cli-ns" {
+		t.Fatalf("GetNamespaceScopeTarget() after restore = %q, want cli-ns", got)
+	}
+}
+
+func TestConfigureNamespaceScopePreferenceResolverRescopeSurvivesReconnect(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	k8s.ResetTestState()
+	t.Cleanup(k8s.ResetTestState)
+	k8s.SetTestContextName("ctx-a")
+	k8s.SetFallbackNamespace("foo")
+
+	// --namespace=foo seeds the starting scope, overriding any stale saved pick.
+	if _, err := settings.Update(func(st *settings.Settings) {
+		st.ActiveNamespaces = map[string][]string{"ctx-a": {"stale"}}
+	}); err != nil {
+		t.Fatalf("settings.Update: %v", err)
+	}
+	configureNamespaceScopePreferenceResolver(AppConfig{NamespaceScope: true, Namespace: "foo"})
+	if got := k8s.GetNamespaceScopeTarget(); got != "foo" {
+		t.Fatalf("startup target = %q, want foo (seeded over stale pick)", got)
+	}
+
+	// The user rescopes to bar in the UI, which persists the pick.
+	if _, err := settings.Update(func(st *settings.Settings) {
+		st.ActiveNamespaces["ctx-a"] = []string{"bar"}
+	}); err != nil {
+		t.Fatalf("settings.Update: %v", err)
+	}
+
+	// A reconnect / context switch clears the override then restores from the pick:
+	// the rescope to bar must survive, not snap back to the startup --namespace.
+	k8s.ClearNamespaceScopeOverride()
+	k8s.RestoreNamespaceScopePreference("ctx-a")
+	if got := k8s.GetNamespaceScopeTarget(); got != "bar" {
+		t.Fatalf("target after rescope+reconnect = %q, want bar", got)
+	}
+}
+
+func TestCheckClusterAccessPreservesProbeErrorShape(t *testing.T) {
+	previousProbe := clusterConnectionProbe
+	calls := 0
+	clusterConnectionProbe = func(context.Context) error {
+		calls++
+		return errors.New("cluster unreachable: context deadline exceeded")
+	}
+	t.Cleanup(func() {
+		clusterConnectionProbe = previousProbe
+	})
+
+	err := CheckClusterAccess(context.Background())
+	if err == nil {
+		t.Fatal("CheckClusterAccess() = nil, want error")
+	}
+	if calls != 2 {
+		t.Fatalf("clusterConnectionProbe calls = %d, want 2 attempts", calls)
+	}
+	if !strings.Contains(err.Error(), "failed to connect to cluster: cluster unreachable: context deadline exceeded") {
+		t.Fatalf("CheckClusterAccess() error = %q, want preserved cluster-unreachable wrapper", err.Error())
+	}
+	if got := k8s.ClassifyError(err); got != "timeout" {
+		t.Fatalf("ClassifyError(CheckClusterAccess error) = %q, want timeout", got)
+	}
+}
+
+func TestCheckClusterAccessDoesNotRetryConcreteExecAuthFailure(t *testing.T) {
+	prevExec := k8s.SetTestContextUsesExec(true)
+	t.Cleanup(func() {
+		k8s.SetTestContextUsesExec(prevExec)
+	})
+	previousProbe := clusterConnectionProbe
+	calls := 0
+	clusterConnectionProbe = func(context.Context) error {
+		calls++
+		return errors.New("getting credentials: exec: executable aws failed with exit code 255")
+	}
+	t.Cleanup(func() {
+		clusterConnectionProbe = previousProbe
+	})
+
+	err := CheckClusterAccess(context.Background())
+	if err == nil {
+		t.Fatal("CheckClusterAccess() = nil, want error")
+	}
+	if calls != 1 {
+		t.Fatalf("clusterConnectionProbe calls = %d, want one attempt for deterministic auth failure", calls)
+	}
+	if got := k8s.ClassifyError(err); got != "auth" {
+		t.Fatalf("ClassifyError(CheckClusterAccess error) = %q, want auth", got)
+	}
+}
+
+func TestCheckClusterAccessDoesNotRetryDeterministicFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		err  string
+		want string
+	}{
+		{
+			name: "config",
+			err:  "no context configured",
+			want: "config",
+		},
+		{
+			name: "rbac",
+			err:  `deployments.apps is forbidden: User "alice" cannot list resource`,
+			want: "rbac",
+		},
+		{
+			name: "network",
+			err:  `cluster unreachable: Get "https://cluster.example/version": dial tcp 10.0.0.1:443: connect: connection refused`,
+			want: "network",
+		},
+		{
+			name: "tls",
+			err:  `cluster unreachable: Get "https://cluster.example/version": tls: failed to verify certificate: x509: certificate signed by unknown authority`,
+			want: "tls",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			previousProbe := clusterConnectionProbe
+			calls := 0
+			clusterConnectionProbe = func(context.Context) error {
+				calls++
+				return errors.New(tt.err)
+			}
+			t.Cleanup(func() {
+				clusterConnectionProbe = previousProbe
+			})
+
+			err := CheckClusterAccess(context.Background())
+			if err == nil {
+				t.Fatal("CheckClusterAccess() = nil, want error")
+			}
+			if calls != 1 {
+				t.Fatalf("clusterConnectionProbe calls = %d, want one attempt for deterministic %s failure", calls, tt.name)
+			}
+			if got := k8s.ClassifyError(err); got != tt.want {
+				t.Fatalf("ClassifyError(CheckClusterAccess error) = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfigureNamespaceScopePreferenceResolverAuthDoesNotUseLocalSettings(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	k8s.ResetTestState()
+	t.Cleanup(k8s.ResetTestState)
+	k8s.SetTestContextName("ctx-a")
+
+	if _, err := settings.Update(func(st *settings.Settings) {
+		st.ActiveNamespaces = map[string][]string{"ctx-a": {"saved-ns"}}
+	}); err != nil {
+		t.Fatalf("settings.Update: %v", err)
+	}
+
+	configureNamespaceScopePreferenceResolver(AppConfig{
+		NamespaceScope: true,
+		AuthConfig:     auth.Config{Mode: "proxy"},
+	})
+
+	k8s.RestoreNamespaceScopePreference("ctx-a")
+	if got := k8s.GetNamespaceScopeTarget(); got != "" {
+		t.Fatalf("GetNamespaceScopeTarget() = %q, want empty", got)
+	}
+}
+
+func TestValidateNamespaceFanout(t *testing.T) {
+	full := make([]string, 20)
+	for i := range full {
+		full[i] = fmt.Sprintf("ns-%d", i)
+	}
+	if err := validateNamespaceFanout(full, "", 20); err != nil {
+		t.Fatalf("full list without context namespace should fit: %v", err)
+	}
+	if err := validateNamespaceFanout(full, "ns-3", 20); err != nil {
+		t.Fatalf("context namespace inside the list must not consume a slot: %v", err)
+	}
+	if err := validateNamespaceFanout(full, "other", 20); err == nil {
+		t.Fatal("distinct context namespace pushing past the cap must error")
+	}
+	if err := validateNamespaceFanout(full[:19], "other", 20); err != nil {
+		t.Fatalf("cap-1 list with distinct context namespace should fit: %v", err)
+	}
+}

@@ -1,119 +1,80 @@
-// Package issues unifies cluster health signals from radar's three
-// parallel sources — hardcoded problem detection, audit findings, and
-// K8s Warning events — into a single normalized envelope. It also adds
-// a generic CRD condition-based fallback so any CRD with a False
-// Ready/Available/Reconciled/Healthy/Synced condition surfaces a
-// warning without per-integration code.
+// Package issues unifies cluster health signals into a single
+// normalized envelope. It composes:
+//   - problem    — radar's hardcoded per-kind live-state detection
+//     (failing Deployments, NotReady Nodes, pending PVCs…)
+//   - missing_ref — direct by-name references to objects that do not exist
+//     (missing PVCs, ConfigMaps, Secrets, backend Services, roleRefs…)
+//   - scheduling — why a Pod can't run: unschedulable (arch/taint/resources/
+//     affinity, with the offending node label named), rejected at admission
+//     (quota/LimitRange/PodSecurity/webhook — no Pod is even created), or
+//     stuck post-bind (CNI IP exhaustion, volume attach/mount)
+//   - condition  — generic CRD .status.conditions[].status=False fallback
+//     (Argo/Flux/Knative/Crossplane/cert-manager/KEDA)
+//
+// All four describe LIVE OPERATIONAL STATE — "what is failing right
+// now". Two adjacent signals are deliberately NOT composed here, each
+// with its own home: raw K8s Warning events (get_events + the timeline)
+// and policy/posture — Kyverno PolicyReports + static best-practice
+// findings (runAsRoot, missing probes, no PDB, deprecated APIs, …) which
+// live in pkg/audit + /api/audit + MCP get_cluster_audit. A healthy pod
+// can have many audit findings, a crashing pod can have zero. Combining
+// them would force consumers to disambiguate "is this critical
+// operational or critical posture?" at every callsite.
 //
 // The Issue type is what /api/issues and the hub's fleet_issues MCP
-// tool emit. Severity is normalized to a 3-tier vocabulary
-// (critical/warning/info) so consumers don't need to translate
-// between the parallel severity scales the underlying sources use.
+// tool emit. Severity is normalized to a 2-tier vocabulary
+// (critical/warning) so consumers don't need to translate between the
+// parallel severity scales the underlying sources use. Info-level
+// detections are posture/inert noise and are dropped at compose (see
+// compose.go) — the issue stream is "what's broken now", not an audit.
 package issues
 
-import (
-	"time"
+import "github.com/skyhook-io/radar/pkg/issuesapi"
 
-	"github.com/skyhook-io/radar/internal/filter"
-)
-
-// CELFilter aliased so callers don't need a separate import to set
-// Filters.Filter.
-type CELFilter = filter.Filter
-
-// Severity is the normalized 3-tier severity. Mapping rules:
+// Severity is the normalized issue severity. The public Issues contract is
+// critical|warning only:
 //
-//	critical = problem.critical | audit.danger
-//	warning  = problem.high|medium | audit.warning | event.Warning | CRD-condition False
-//	info     = reserved (currently unused)
-type Severity string
+//	critical = problem.critical
+//	warning  = problem.<any non-critical except info> | CRD-condition False
+//
+// problem severities other than "critical" collapse to warning — see fromProblem
+// (the mapping is non-critical by exclusion, not an explicit allow-list). The one
+// exception is problem.info: inert/posture findings (deprecated-RBAC residue,
+// singleton-StatefulSet headless-DNS trivia) are DROPPED at the Problem→Issue
+// boundary in Compose and never become Issues — they belong to audit/posture,
+// not the live "what's broken now" stream.
+type Severity = issuesapi.Severity
 
 const (
-	SeverityCritical Severity = "critical"
-	SeverityWarning  Severity = "warning"
+	SeverityCritical = issuesapi.SeverityCritical
+	SeverityWarning  = issuesapi.SeverityWarning
 )
 
-// Source records which underlying detection channel emitted this
-// issue. Useful for filtering ("only show me problems, not audit
-// findings") and for SPA copy that explains why a row appeared.
-type Source string
+// Source records which underlying detection channel emitted this issue.
+// It is an OUTPUT label (for frontend copy that explains why a row appeared,
+// and as a CEL filter binding), not an input filter — issues composes all
+// four sources unconditionally; detection provenance is not a triage axis.
+type Source = issuesapi.Source
 
 const (
-	SourceProblem   Source = "problem"   // radar's hardcoded per-kind detection
-	SourceAudit     Source = "audit"     // best-practice audit findings
-	SourceEvent     Source = "event"     // K8s Warning events (recent)
-	SourceCondition Source = "condition" // generic CRD .status.conditions[].status=False fallback
+	SourceProblem    = issuesapi.SourceProblem
+	SourceMissingRef = issuesapi.SourceMissingRef
+	SourceScheduling = issuesapi.SourceScheduling
+	SourceCondition  = issuesapi.SourceCondition
 )
 
-// Ref is a lightweight resource reference, used for owner pointers.
-type Ref struct {
-	Kind      string `json:"kind"`
-	Namespace string `json:"namespace,omitempty"`
-	Name      string `json:"name"`
-}
+// Ref is a lightweight resource reference for the grouping subject and
+// owner pointers. Group is the API group (empty for core) — carried so
+// owner/affected deep-links can disambiguate CRDs from core kinds.
+type Ref = issuesapi.Ref
 
 // Issue is the unified cluster-health record.
 //
-// FirstSeen / LastSeen / Count are populated for events (which arrive
-// pre-aggregated from the K8s API). For problems and audit findings,
-// FirstSeen and LastSeen are both the snapshot time and Count = 1.
-type Issue struct {
-	Severity  Severity  `json:"severity"`
-	Source    Source    `json:"source"`
-	Kind      string    `json:"kind"`
-	Group     string    `json:"group,omitempty"`
-	Namespace string    `json:"namespace,omitempty"`
-	Name      string    `json:"name"`
-	Reason    string    `json:"reason"`
-	Message   string    `json:"message,omitempty"`
-	FirstSeen time.Time `json:"first_seen,omitzero"`
-	LastSeen  time.Time `json:"last_seen,omitzero"`
-	Count     int       `json:"count,omitempty"`
-	Owner     Ref       `json:"owner,omitzero"`
-	// Cluster is left empty here; the hub injects it when emitting
-	// cross-cluster envelopes via fleet_issues.
-	Cluster string `json:"cluster,omitempty"`
-}
-
-// Filters narrows a Compose call. Empty fields are unconstrained.
-type Filters struct {
-	Namespaces []string
-	Severities []Severity
-	Sources    []Source
-	Kinds      []string
-	// Since restricts event-source issues to this lookback window.
-	// Other sources are always current-snapshot, so this only affects
-	// SourceEvent. Zero means "no time restriction" (all cached events).
-	Since time.Duration
-	// Limit caps the returned slice. Zero means default (200).
-	Limit int
-	// IncludeAudit defaults to false — audit findings are loud (50–200
-	// per cluster) and the LLM use case usually wants problems first.
-	// Set true to opt in.
-	IncludeAudit bool
-	// IncludeEvents defaults to false. Warning events are the noisiest
-	// source by an order of magnitude — a single broken Pod emits a
-	// FailedScheduling / BackOff / etc. Event every few seconds, and
-	// the event informer retains them for the cache window (default 1h+).
-	// On a multi-thousand-Pod cluster this floods the Issue list with
-	// rows that mostly duplicate `problem` source (a CrashLoopBackOff
-	// Pod already shows up under SourceProblem). Treat events as opt-in
-	// like audit; when enabled the caller should also pass a Since
-	// window (handler defaults to 1h when events are on and Since is
-	// zero).
-	IncludeEvents bool
-	// Filter is an optional compiled CEL predicate evaluated against
-	// each composed Issue's row bindings. Compile happens in the
-	// handler (and is cached); this layer just runs the program.
-	Filter *CELFilter
-	// CanReadClusterScoped authorizes cluster-scoped Issue rows before
-	// they are returned. Handlers provide a per-user SAR-backed predicate;
-	// nil preserves auth-mode=none and tests where the provider's own
-	// permissions are the only gate.
-	CanReadClusterScoped func(kind, group string) bool
-}
-
-const (
-	DefaultLimit = 200
-	MaxLimit     = 1000
-)
+// Flat (pre-group) rows are snapshot-derived. GroupIssues folds them and sets
+// Count to the affected-resource fan-out EXCLUDING the subject (the subject is
+// the row header, surfaced separately) — so a single-resource issue has
+// Count = 0 (omitted on the wire), and a 50-pod crashloop under one Deployment
+// has Count = 50. FirstSeen is present only when a detector carries an exact
+// event, condition, tracker, deletion, or creation-invariant timestamp;
+// ResourceCreatedAt remains separate context for unknown-onset rows.
+type Issue = issuesapi.Issue

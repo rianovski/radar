@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sort"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/skyhook-io/radar/pkg/capacityapi"
 	"github.com/skyhook-io/radar/pkg/k8score"
 )
 
@@ -28,6 +30,7 @@ type ResourcePermissions struct {
 	StatefulSets             bool `json:"statefulSets"`
 	ReplicaSets              bool `json:"replicaSets"`
 	Ingresses                bool `json:"ingresses"`
+	IngressClasses           bool `json:"ingressClasses"`
 	ConfigMaps               bool `json:"configMaps"`
 	Secrets                  bool `json:"secrets"`
 	Events                   bool `json:"events"`
@@ -47,6 +50,7 @@ type ResourcePermissions struct {
 	RoleBindings             bool `json:"roleBindings"`
 	ClusterRoleBindings      bool `json:"clusterRoleBindings"`
 	LimitRanges              bool `json:"limitRanges"`
+	ResourceQuotas           bool `json:"resourceQuotas"`
 	Gateways                 bool `json:"gateways"`
 	HTTPRoutes               bool `json:"httpRoutes"`
 	VerticalPodAutoscalers   bool `json:"verticalPodAutoscalers"`
@@ -59,40 +63,101 @@ type ResourcePermissions struct {
 //     any scope works; NamespaceScoped=true if at least one kind ended up
 //     namespace-scoped). Used by callers that just want a "can the user see
 //     anything?" answer.
-//   - Scopes: the per-kind authoritative map that drives informer wiring —
-//     some kinds may be cluster-wide while others are namespace-scoped on
-//     the same cluster, which the uniform view cannot express.
+//   - Scopes / ScopeNamespaces: the per-kind authoritative map that drives
+//     informer wiring — some kinds may be cluster-wide while others are
+//     namespace-scoped on the same cluster, and a namespace-scoped kind may
+//     be readable in several explicitly named namespaces.
 type PermissionCheckResult struct {
-	Perms           *ResourcePermissions
-	NamespaceScoped bool   // True if at least one resource type ended up namespace-scoped
-	Namespace       string // The fallback namespace used for namespace-scoped probes
-	Scopes          map[string]k8score.ResourceScope
+	Perms                    *ResourcePermissions
+	NamespaceScoped          bool   // True if at least one resource type ended up namespace-scoped
+	Namespace                string // The fallback namespace used for namespace-scoped probes
+	Scopes                   map[string]k8score.ResourceScope
+	ScopeNamespaces          map[string][]string // Per-kind namespace-scoped informer fanout; nil/empty means use Scopes[key].Namespace
+	ScopeCandidates          []string            // The candidate namespaces the probe walked — the dynamic CRD cache probes these per-GVR as its namespace fallbacks
+	ScopeCandidatesTruncated bool                // Candidate set is incomplete: namespace enumeration was non-authoritative or MaxScopeCandidates omitted entries
 }
 
 // Capabilities represents the features available based on RBAC permissions
 type Capabilities struct {
-	Exec          bool                 `json:"exec"`                  // Can create pods/exec (terminal feature)
-	LocalTerminal bool                 `json:"localTerminal"`         // Local terminal available (not in-cluster, not disabled)
-	Logs          bool                 `json:"logs"`                  // Can get pods/log (log viewer)
-	PortForward   bool                 `json:"portForward"`           // Can create pods/portforward
-	Secrets       bool                 `json:"secrets"`               // Can list secrets
-	SecretsUpdate bool                 `json:"secretsUpdate"`         // Can update secrets (inline editing)
-	HelmWrite     bool                 `json:"helmWrite"`             // Helm write ops (detected via secrets/create as sentinel RBAC check)
-	NodeWrite     bool                 `json:"nodeWrite"`             // Can patch nodes (cordon/uncordon/drain)
-	MCPEnabled    bool                 `json:"mcpEnabled"`            // MCP server is running
-	Deployment    DeploymentInfo       `json:"deployment"`            // How / where this Radar binary is running. Tells the UI which chrome to render or suppress (e.g. embedded mode hides the cluster headline + local-MCP card because the hub already renders both).
-	AuthEnabled   bool                 `json:"authEnabled,omitempty"` // Auth is enabled on the server
-	Username      string               `json:"username,omitempty"`    // Authenticated username (when auth enabled)
-	Resources     *ResourcePermissions `json:"resources,omitempty"`   // Per-resource-type permissions
+	ConfigManagement string                   `json:"configManagement"`
+	Exec             bool                     `json:"exec"`                    // Can create pods/exec (terminal feature)
+	LocalTerminal    bool                     `json:"localTerminal"`           // Local terminal available (not in-cluster, not disabled)
+	Logs             bool                     `json:"logs"`                    // Can get pods/log (log viewer)
+	PortForward      bool                     `json:"portForward"`             // Can create pods/portforward
+	Secrets          bool                     `json:"secrets"`                 // Can list secrets
+	SecretsUpdate    bool                     `json:"secretsUpdate"`           // Can update secrets (inline editing)
+	HelmWrite        bool                     `json:"helmWrite"`               // Helm write ops (detected via secrets/create as sentinel RBAC check)
+	NodeWrite        bool                     `json:"nodeWrite"`               // Can patch nodes (cordon/uncordon/drain)
+	WorkloadWrites   WorkloadWritePermissions `json:"workloadWrites"`          // Can patch workload kinds (restart/scale controls)
+	MCPEnabled       bool                     `json:"mcpEnabled"`              // MCP server is running
+	Deployment       DeploymentInfo           `json:"deployment"`              // How / where this Radar binary is running. Tells the UI which chrome to render or suppress (e.g. embedded mode hides the cluster headline + local-MCP card because the hub already renders both).
+	Features         FeatureCapabilities      `json:"features"`                // Versioned server features that newer embedded frontends must negotiate
+	AuthEnabled      bool                     `json:"authEnabled,omitempty"`   // Auth is enabled on the server
+	Username         string                   `json:"username,omitempty"`      // Authenticated username (when auth enabled)
+	Resources        *ResourcePermissions     `json:"resources,omitempty"`     // Per-resource-type permissions
+	Visibility       *VisibilitySummary       `json:"visibility,omitempty"`    // Present when resource visibility is limited enough to make diagnostics incomplete
+	Karpenter        IntegrationCapability    `json:"karpenter"`               // Per-request Karpenter discovery + NodePool read state; populated by the HTTP layer after user SAR.
+	PolicyReports    *PolicyReportStatus      `json:"policyReports,omitempty"` // Why the Kyverno PolicyReport index is (or is not) populated, so an empty policy view can say which.
+	CloudConnect     *CloudConnectCapability  `json:"cloudConnect,omitempty"`
 }
 
-// NamespaceCapabilities holds the effective exec/logs/portForward capabilities
-// for a specific namespace. When global checks deny these capabilities,
-// namespace-scoped RBAC re-checks may grant them.
+type IntegrationCapability struct {
+	State      capacityapi.IntegrationState `json:"state"`
+	ReasonCode string                       `json:"reasonCode,omitempty"`
+	// CacheUnavailable marks "integration detected but its cache cannot serve
+	// right now" — a distinct condition every consumer must map to unavailable
+	// coverage, never to an observed/available source.
+	CacheUnavailable bool `json:"cacheUnavailable,omitempty"`
+}
+
+// CloudConnectCapability tells the frontend which Cloud-connect lane this
+// deployment gets: "driver" (the in-product connect flow can run here) or
+// "wizard" (route to the Hub's connect wizard at AppURL instead).
+type CloudConnectCapability struct {
+	Lane   string `json:"lane"`
+	AppURL string `json:"appUrl"`
+	// APIURL is the Hub API origin the connect dialog reads its live copy
+	// from. Omitted when the dialog must not fetch — the frontend treats its
+	// absence as "render the compiled-in copy", so disabling the fetch is a
+	// server-side decision rather than client policy.
+	APIURL string `json:"apiUrl,omitempty"`
+}
+
+type FeatureCapabilities struct {
+	YAMLReview     bool `json:"yamlReview"`
+	YAMLSchemas    bool `json:"yamlSchemas"`
+	WorkloadImages bool `json:"workloadImages"`
+}
+
+// WorkloadWritePermissions indicates which workload resources the user can patch.
+type WorkloadWritePermissions struct {
+	Deployments  bool `json:"deployments"`
+	DaemonSets   bool `json:"daemonSets"`
+	StatefulSets bool `json:"statefulSets"`
+	Rollouts     bool `json:"rollouts"`
+}
+
+type WorkloadWriteCapabilityErrors struct {
+	Deployments  bool
+	DaemonSets   bool
+	StatefulSets bool
+	Rollouts     bool
+}
+
+type NamespaceCapabilityErrors struct {
+	Exec           bool
+	Logs           bool
+	PortForward    bool
+	WorkloadWrites WorkloadWriteCapabilityErrors
+}
+
+// NamespaceCapabilities holds the effective capabilities for a specific namespace.
 type NamespaceCapabilities struct {
-	Exec        bool `json:"exec"`
-	Logs        bool `json:"logs"`
-	PortForward bool `json:"portForward"`
+	Exec           bool                      `json:"exec"`
+	Logs           bool                      `json:"logs"`
+	PortForward    bool                      `json:"portForward"`
+	WorkloadWrites WorkloadWritePermissions  `json:"workloadWrites"`
+	Errors         NamespaceCapabilityErrors `json:"-"`
 }
 
 // DeploymentInfo describes how / where this Radar binary is running.
@@ -150,7 +215,7 @@ var (
 	ForceDisableHelmWrite bool
 	// ForceDisableExec overrides the exec capability to false (for dev testing)
 	ForceDisableExec bool
-	// ForceDisableLocalTerminal overrides the localTerminal capability to false (for dev testing)
+	// ForceDisableLocalTerminal turns the local terminal off (--disable-local-terminal)
 	ForceDisableLocalTerminal bool
 )
 
@@ -205,20 +270,26 @@ func CheckCapabilities(ctx context.Context) (*Capabilities, error) {
 	var hadErrors atomic.Bool
 
 	type capCheck struct {
-		resource string
-		verb     string
-		result   *bool
+		group             string
+		resource          string
+		verb              string
+		result            *bool
+		namespaceFallback bool
 	}
 
 	caps := &Capabilities{}
 	checks := []capCheck{
-		{"pods/exec", "create", &caps.Exec},
-		{"pods/log", "get", &caps.Logs},
-		{"pods/portforward", "create", &caps.PortForward},
-		{"secrets", "list", &caps.Secrets},
-		{"secrets", "update", &caps.SecretsUpdate},
-		{"secrets", "create", &caps.HelmWrite},
-		{"nodes", "patch", &caps.NodeWrite},
+		{resource: "pods/exec", verb: "create", result: &caps.Exec, namespaceFallback: true},
+		{resource: "pods/log", verb: "get", result: &caps.Logs, namespaceFallback: true},
+		{resource: "pods/portforward", verb: "create", result: &caps.PortForward, namespaceFallback: true},
+		{resource: "secrets", verb: "list", result: &caps.Secrets, namespaceFallback: true},
+		{resource: "secrets", verb: "update", result: &caps.SecretsUpdate, namespaceFallback: true},
+		{resource: "secrets", verb: "create", result: &caps.HelmWrite, namespaceFallback: true},
+		{resource: "nodes", verb: "patch", result: &caps.NodeWrite, namespaceFallback: true},
+		{group: "apps", resource: "deployments", verb: "patch", result: &caps.WorkloadWrites.Deployments},
+		{group: "apps", resource: "daemonsets", verb: "patch", result: &caps.WorkloadWrites.DaemonSets},
+		{group: "apps", resource: "statefulsets", verb: "patch", result: &caps.WorkloadWrites.StatefulSets},
+		{group: "argoproj.io", resource: "rollouts", verb: "patch", result: &caps.WorkloadWrites.Rollouts},
 	}
 
 	var wg sync.WaitGroup
@@ -227,13 +298,13 @@ func CheckCapabilities(ctx context.Context) (*Capabilities, error) {
 	for _, check := range checks {
 		go func(c capCheck) {
 			defer wg.Done()
-			allowed, apiErr := canI(checkCtx, "", "", c.resource, c.verb)
+			allowed, apiErr := canI(checkCtx, "", c.group, c.resource, c.verb)
 			if allowed {
 				*c.result = true
 				return
 			}
-			if fallbackNs != "" {
-				allowed, nsApiErr := canI(checkCtx, fallbackNs, "", c.resource, c.verb)
+			if fallbackNs != "" && c.namespaceFallback {
+				allowed, nsApiErr := canI(checkCtx, fallbackNs, c.group, c.resource, c.verb)
 				if allowed {
 					*c.result = true
 					return
@@ -251,6 +322,14 @@ func CheckCapabilities(ctx context.Context) (*Capabilities, error) {
 
 	// Local terminal is not RBAC-gated — it depends on runtime mode only
 	caps.LocalTerminal = !IsInCluster() && !ForceDisableLocalTerminal
+
+	// Port-forward binds a local TCP listener on the radar host; like the local
+	// terminal it's meaningless in-cluster (the listener would be on the radar
+	// pod, not the user's machine), so force it off regardless of RBAC. The HTTP
+	// capabilities handler re-applies this after its namespace merge.
+	if IsInCluster() {
+		caps.PortForward = false
+	}
 
 	if ForceDisableHelmWrite {
 		caps.HelmWrite = false
@@ -306,22 +385,14 @@ func InvalidateCapabilitiesCache() {
 	nsCapMu.Lock()
 	nsCapCache = nil
 	nsCapMu.Unlock()
+
+	InvalidateUserCapabilitiesCache()
 }
 
-// CheckNamespaceCapabilities performs namespace-scoped RBAC checks for capabilities
-// that were denied by global checks (cluster-wide + effective-namespace fallback).
-// This enables lazy re-checking when a user views a resource in a specific namespace —
-// they may have namespace-scoped RoleBindings that grant exec/logs/portForward in
-// namespaces other than the kubeconfig default.
-//
-// Returns nil if no namespace-scoped re-check is needed (all capabilities already allowed).
-func CheckNamespaceCapabilities(ctx context.Context, namespace string, globalCaps *Capabilities) (*NamespaceCapabilities, error) {
+// CheckNamespaceCapabilities performs namespace-scoped RBAC checks for
+// capabilities that drive resource-level controls.
+func CheckNamespaceCapabilities(ctx context.Context, namespace string) (*NamespaceCapabilities, error) {
 	if namespace == "" {
-		return nil, nil
-	}
-
-	// If all three are already allowed globally, no need for namespace check
-	if globalCaps.Exec && globalCaps.Logs && globalCaps.PortForward {
 		return nil, nil
 	}
 
@@ -343,33 +414,28 @@ func CheckNamespaceCapabilities(ctx context.Context, namespace string, globalCap
 	checkCtx, cancel := NewOperationContext(10 * time.Second)
 	defer cancel()
 
-	result := &NamespaceCapabilities{
-		Exec:        globalCaps.Exec,
-		Logs:        globalCaps.Logs,
-		PortForward: globalCaps.PortForward,
-	}
+	result := &NamespaceCapabilities{}
 
-	// Only re-check capabilities that were denied globally
 	type capCheck struct {
+		group    string
 		resource string
 		verb     string
 		result   *bool
+		apiError *bool
 	}
 
 	var checks []capCheck
-	if !globalCaps.Exec && !ForceDisableExec {
-		checks = append(checks, capCheck{"pods/exec", "create", &result.Exec})
+	if !ForceDisableExec {
+		checks = append(checks, capCheck{resource: "pods/exec", verb: "create", result: &result.Exec, apiError: &result.Errors.Exec})
 	}
-	if !globalCaps.Logs {
-		checks = append(checks, capCheck{"pods/log", "get", &result.Logs})
-	}
-	if !globalCaps.PortForward {
-		checks = append(checks, capCheck{"pods/portforward", "create", &result.PortForward})
-	}
-
-	if len(checks) == 0 {
-		return result, nil
-	}
+	checks = append(checks,
+		capCheck{resource: "pods/log", verb: "get", result: &result.Logs, apiError: &result.Errors.Logs},
+		capCheck{resource: "pods/portforward", verb: "create", result: &result.PortForward, apiError: &result.Errors.PortForward},
+		capCheck{group: "apps", resource: "deployments", verb: "patch", result: &result.WorkloadWrites.Deployments, apiError: &result.Errors.WorkloadWrites.Deployments},
+		capCheck{group: "apps", resource: "daemonsets", verb: "patch", result: &result.WorkloadWrites.DaemonSets, apiError: &result.Errors.WorkloadWrites.DaemonSets},
+		capCheck{group: "apps", resource: "statefulsets", verb: "patch", result: &result.WorkloadWrites.StatefulSets, apiError: &result.Errors.WorkloadWrites.StatefulSets},
+		capCheck{group: "argoproj.io", resource: "rollouts", verb: "patch", result: &result.WorkloadWrites.Rollouts, apiError: &result.Errors.WorkloadWrites.Rollouts},
+	)
 
 	var hadErrors atomic.Bool
 	var wg sync.WaitGroup
@@ -377,11 +443,12 @@ func CheckNamespaceCapabilities(ctx context.Context, namespace string, globalCap
 	for _, check := range checks {
 		go func(c capCheck) {
 			defer wg.Done()
-			allowed, apiErr := canI(checkCtx, namespace, "", c.resource, c.verb)
+			allowed, apiErr := canI(checkCtx, namespace, c.group, c.resource, c.verb)
 			if allowed {
 				*c.result = true
 			}
 			if apiErr {
+				*c.apiError = true
 				hadErrors.Store(true)
 			}
 		}(check)
@@ -410,13 +477,23 @@ func CheckNamespaceCapabilities(ctx context.Context, namespace string, globalCap
 
 // Per-user capabilities cache (keyed by username)
 var (
-	userCapabilitiesCache sync.Map // map[string]*userCapEntry
-	userCapabilitiesTTL   = 60 * time.Second
+	userCapabilitiesCache          sync.Map // map[string]*userCapEntry
+	userNamespaceCapabilitiesCache sync.Map // map[string]*userNSCapEntry
+	userCapabilitiesTTL            = 60 * time.Second
 )
 
 type userCapEntry struct {
 	caps      *Capabilities
 	expiresAt time.Time
+}
+
+type userNSCapEntry struct {
+	caps      NamespaceCapabilities
+	expiresAt time.Time
+}
+
+func userNamespaceCapabilitiesCacheKey(username, namespace string) string {
+	return username + "\x00" + namespace
 }
 
 // CheckCapabilitiesForUser runs SubjectAccessReview as the given user
@@ -445,20 +522,26 @@ func CheckCapabilitiesForUser(ctx context.Context, username string, groups []str
 	defer cancel()
 
 	type capCheck struct {
-		resource string
-		verb     string
-		result   *bool
+		group             string
+		resource          string
+		verb              string
+		result            *bool
+		namespaceFallback bool
 	}
 
 	caps := &Capabilities{}
 	checks := []capCheck{
-		{"pods/exec", "create", &caps.Exec},
-		{"pods/log", "get", &caps.Logs},
-		{"pods/portforward", "create", &caps.PortForward},
-		{"secrets", "list", &caps.Secrets},
-		{"secrets", "update", &caps.SecretsUpdate},
-		{"secrets", "create", &caps.HelmWrite},
-		{"nodes", "patch", &caps.NodeWrite},
+		{resource: "pods/exec", verb: "create", result: &caps.Exec, namespaceFallback: true},
+		{resource: "pods/log", verb: "get", result: &caps.Logs, namespaceFallback: true},
+		{resource: "pods/portforward", verb: "create", result: &caps.PortForward, namespaceFallback: true},
+		{resource: "secrets", verb: "list", result: &caps.Secrets, namespaceFallback: true},
+		{resource: "secrets", verb: "update", result: &caps.SecretsUpdate, namespaceFallback: true},
+		{resource: "secrets", verb: "create", result: &caps.HelmWrite, namespaceFallback: true},
+		{resource: "nodes", verb: "patch", result: &caps.NodeWrite, namespaceFallback: true},
+		{group: "apps", resource: "deployments", verb: "patch", result: &caps.WorkloadWrites.Deployments},
+		{group: "apps", resource: "daemonsets", verb: "patch", result: &caps.WorkloadWrites.DaemonSets},
+		{group: "apps", resource: "statefulsets", verb: "patch", result: &caps.WorkloadWrites.StatefulSets},
+		{group: "argoproj.io", resource: "rollouts", verb: "patch", result: &caps.WorkloadWrites.Rollouts},
 	}
 
 	var wg sync.WaitGroup
@@ -467,14 +550,14 @@ func CheckCapabilitiesForUser(ctx context.Context, username string, groups []str
 	for _, check := range checks {
 		go func(c capCheck) {
 			defer wg.Done()
-			allowed, _ := canIAs(checkCtx, k8sClient, username, groups, "", "", c.resource, c.verb)
+			allowed, _ := canIAs(checkCtx, k8sClient, username, groups, "", c.group, c.resource, c.verb)
 			if allowed {
 				*c.result = true
 				return
 			}
 			// Try namespace-scoped fallback
-			if fallbackNs := GetEffectiveNamespace(); fallbackNs != "" {
-				allowed, _ = canIAs(checkCtx, k8sClient, username, groups, fallbackNs, "", c.resource, c.verb)
+			if fallbackNs := GetEffectiveNamespace(); fallbackNs != "" && c.namespaceFallback {
+				allowed, _ = canIAs(checkCtx, k8sClient, username, groups, fallbackNs, c.group, c.resource, c.verb)
 				if allowed {
 					*c.result = true
 				}
@@ -495,6 +578,88 @@ func CheckCapabilitiesForUser(ctx context.Context, username string, groups []str
 	})
 
 	return caps, nil
+}
+
+// CheckNamespaceCapabilitiesForUser runs namespace-scoped SubjectAccessReview
+// checks as the authenticated user.
+func CheckNamespaceCapabilitiesForUser(ctx context.Context, username string, groups []string, namespace string) (*NamespaceCapabilities, error) {
+	if namespace == "" {
+		return nil, nil
+	}
+
+	cacheKey := userNamespaceCapabilitiesCacheKey(username, namespace)
+	if entry, ok := userNamespaceCapabilitiesCache.Load(cacheKey); ok {
+		e := entry.(*userNSCapEntry)
+		if time.Now().Before(e.expiresAt) {
+			result := e.caps
+			return &result, nil
+		}
+	}
+
+	k8sClient := GetClient()
+	if k8sClient == nil {
+		return nil, nil
+	}
+
+	if GetConnectionStatus().State == StateDisconnected {
+		return nil, nil
+	}
+
+	checkCtx, cancel := NewOperationContext(10 * time.Second)
+	defer cancel()
+
+	result := &NamespaceCapabilities{}
+
+	type capCheck struct {
+		group    string
+		resource string
+		verb     string
+		result   *bool
+		apiError *bool
+	}
+
+	var checks []capCheck
+	if !ForceDisableExec {
+		checks = append(checks, capCheck{resource: "pods/exec", verb: "create", result: &result.Exec, apiError: &result.Errors.Exec})
+	}
+	checks = append(checks,
+		capCheck{resource: "pods/log", verb: "get", result: &result.Logs, apiError: &result.Errors.Logs},
+		capCheck{resource: "pods/portforward", verb: "create", result: &result.PortForward, apiError: &result.Errors.PortForward},
+		capCheck{group: "apps", resource: "deployments", verb: "patch", result: &result.WorkloadWrites.Deployments, apiError: &result.Errors.WorkloadWrites.Deployments},
+		capCheck{group: "apps", resource: "daemonsets", verb: "patch", result: &result.WorkloadWrites.DaemonSets, apiError: &result.Errors.WorkloadWrites.DaemonSets},
+		capCheck{group: "apps", resource: "statefulsets", verb: "patch", result: &result.WorkloadWrites.StatefulSets, apiError: &result.Errors.WorkloadWrites.StatefulSets},
+		capCheck{group: "argoproj.io", resource: "rollouts", verb: "patch", result: &result.WorkloadWrites.Rollouts, apiError: &result.Errors.WorkloadWrites.Rollouts},
+	)
+
+	var hadErrors atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(len(checks))
+	for _, check := range checks {
+		go func(c capCheck) {
+			defer wg.Done()
+			allowed, apiErr := canIAs(checkCtx, k8sClient, username, groups, namespace, c.group, c.resource, c.verb)
+			if allowed {
+				*c.result = true
+			}
+			if apiErr {
+				*c.apiError = true
+				hadErrors.Store(true)
+			}
+		}(check)
+	}
+	wg.Wait()
+
+	ttl := userCapabilitiesTTL
+	if hadErrors.Load() {
+		ttl = capabilitiesErrorTTL
+		log.Printf("Warning: namespace %s capability checks for user %s had API errors, using short cache TTL (%v)", SanitizeForLog(namespace), SanitizeForLog(username), ttl)
+	}
+	userNamespaceCapabilitiesCache.Store(cacheKey, &userNSCapEntry{
+		caps:      *result,
+		expiresAt: time.Now().Add(ttl),
+	})
+
+	return result, nil
 }
 
 // canIAs checks if a specific user can perform an action using SubjectAccessReview.
@@ -536,6 +701,10 @@ func canIAs(ctx context.Context, client *kubernetes.Clientset, username string, 
 func InvalidateUserCapabilitiesCache() {
 	userCapabilitiesCache.Range(func(key, _ any) bool {
 		userCapabilitiesCache.Delete(key)
+		return true
+	})
+	userNamespaceCapabilitiesCache.Range(func(key, _ any) bool {
+		userNamespaceCapabilitiesCache.Delete(key)
 		return true
 	})
 }
@@ -580,6 +749,7 @@ func resourceProbeTargets(perms *ResourcePermissions) []resourceProbe {
 		{key: k8score.PersistentVolumeClaims, gvr: schema.GroupVersionResource{Version: "v1", Resource: "persistentvolumeclaims"}, field: &perms.PersistentVolumeClaims},
 		{key: k8score.ServiceAccounts, gvr: schema.GroupVersionResource{Version: "v1", Resource: "serviceaccounts"}, field: &perms.ServiceAccounts},
 		{key: k8score.LimitRanges, gvr: schema.GroupVersionResource{Version: "v1", Resource: "limitranges"}, field: &perms.LimitRanges},
+		{key: k8score.ResourceQuotas, gvr: schema.GroupVersionResource{Version: "v1", Resource: "resourcequotas"}, field: &perms.ResourceQuotas},
 		{key: k8score.Nodes, gvr: schema.GroupVersionResource{Version: "v1", Resource: "nodes"}, clusterOnly: true, field: &perms.Nodes},
 		{key: k8score.Namespaces, gvr: schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}, clusterOnly: true, field: &perms.Namespaces},
 		{key: k8score.PersistentVolumes, gvr: schema.GroupVersionResource{Version: "v1", Resource: "persistentvolumes"}, clusterOnly: true, field: &perms.PersistentVolumes},
@@ -588,6 +758,7 @@ func resourceProbeTargets(perms *ResourcePermissions) []resourceProbe {
 		{key: k8score.StatefulSets, gvr: schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "statefulsets"}, field: &perms.StatefulSets},
 		{key: k8score.ReplicaSets, gvr: schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "replicasets"}, field: &perms.ReplicaSets},
 		{key: k8score.Ingresses, gvr: schema.GroupVersionResource{Group: "networking.k8s.io", Version: "v1", Resource: "ingresses"}, field: &perms.Ingresses},
+		{key: k8score.IngressClasses, gvr: schema.GroupVersionResource{Group: "networking.k8s.io", Version: "v1", Resource: "ingressclasses"}, clusterOnly: true, field: &perms.IngressClasses},
 		{key: k8score.NetworkPolicies, gvr: schema.GroupVersionResource{Group: "networking.k8s.io", Version: "v1", Resource: "networkpolicies"}, field: &perms.NetworkPolicies},
 		{key: k8score.Jobs, gvr: schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "jobs"}, field: &perms.Jobs},
 		{key: k8score.CronJobs, gvr: schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "cronjobs"}, field: &perms.CronJobs},
@@ -758,11 +929,18 @@ func CheckResourcePermissions(ctx context.Context) *PermissionCheckResult {
 		for k, v := range cachedPermResult.Scopes {
 			scopesCopy[k] = v
 		}
+		scopeNamespacesCopy := make(map[string][]string, len(cachedPermResult.ScopeNamespaces))
+		for k, v := range cachedPermResult.ScopeNamespaces {
+			scopeNamespacesCopy[k] = append([]string(nil), v...)
+		}
 		result := &PermissionCheckResult{
-			Perms:           &permsCopy,
-			NamespaceScoped: cachedPermResult.NamespaceScoped,
-			Namespace:       cachedPermResult.Namespace,
-			Scopes:          scopesCopy,
+			Perms:                    &permsCopy,
+			NamespaceScoped:          cachedPermResult.NamespaceScoped,
+			Namespace:                cachedPermResult.Namespace,
+			Scopes:                   scopesCopy,
+			ScopeNamespaces:          scopeNamespacesCopy,
+			ScopeCandidates:          append([]string(nil), cachedPermResult.ScopeCandidates...),
+			ScopeCandidatesTruncated: cachedPermResult.ScopeCandidatesTruncated,
 		}
 		resourcePermsMu.RUnlock()
 		return result
@@ -779,14 +957,18 @@ func CheckResourcePermissions(ctx context.Context) *PermissionCheckResult {
 		return &PermissionCheckResult{Perms: &ResourcePermissions{}, Scopes: map[string]k8score.ResourceScope{}}
 	}
 
-	// scopeNs comes from the kubeconfig context namespace or --namespace
-	// flag — a fallback used when cluster-wide access is denied. The cache
-	// boots cluster-wide and per-user view filtering happens at the HTTP
-	// layer (see internal/server/namespace_scope.go), so the probe never
-	// pins informers to a single namespace on behalf of one user.
-	scopeNs := GetEffectiveNamespace()
+	forceNamespace := ForceNamespaceScope
+	scopeNamespaces, scopeCandidatesIncomplete := buildScopeCandidates(ctx)
+	if forceNamespace {
+		if target := GetNamespaceScopeTarget(); target != "" {
+			scopeNamespaces = mergeForcedScopeCandidate(target, scopeNamespaces)
+		} else {
+			log.Printf("Warning: --namespace-scope enabled but no namespace target is configured")
+		}
+	}
 
-	result, hadErrors := probeResourceAccess(ctx, GetDynamicClient(), scopeNs, false)
+	result, hadErrors := probeResourceAccess(ctx, GetDynamicClient(), scopeNamespaces, forceNamespace)
+	result.ScopeCandidatesTruncated = scopeCandidatesIncomplete
 
 	resourcePermsMu.Lock()
 	cachedPermResult = result
@@ -807,40 +989,180 @@ func CheckResourcePermissions(ctx context.Context) *PermissionCheckResult {
 // scopeNs is the kubeconfig context's default namespace used as a fallback
 // when cluster-wide list access is denied.
 func CheckPermissionsForDynClient(ctx context.Context, dyn dynamic.Interface, scopeNs string) *PermissionCheckResult {
-	result, _ := probeResourceAccess(ctx, dyn, scopeNs, false)
+	var scopeNamespaces []string
+	if scopeNs != "" {
+		scopeNamespaces = []string{scopeNs}
+	}
+	result, _ := probeResourceAccess(ctx, dyn, scopeNamespaces, false)
 	return result
 }
 
+// MaxScopeCandidates was promoted to a package variable in deadlines.go
+// (default 20) so operators with clusters carrying more namespaces than the
+// original cap can widen the fanout via flag/env without recompiling.
+
+// buildScopeCandidates returns the namespace candidates for the fallback
+// probe when cluster-wide list is denied. Kubeconfig context (or
+// --namespace) first; then namespaces from GetAccessibleNamespaces, in the
+// cluster-list order (alphabetical). The bool reports an incomplete candidate
+// set: either namespace enumeration was non-authoritative or the safety cap
+// omitted candidates. Empty and incomplete is materially different from an
+// authoritative empty set — dynamic-resource denial must remain partial.
+func buildScopeCandidates(ctx context.Context) ([]string, bool) {
+	// GetEffectiveNamespace would return only one (kubeconfig context wins
+	// over --namespace). Reach into both globals so when an operator sets
+	// `--namespace` distinct from the context, both surface as candidates.
+	clientMu.RLock()
+	ctxNs := contextNamespace
+	flagNamespaces := fallbackNamespaceCandidatesLocked()
+	clientMu.RUnlock()
+
+	accessible, authoritative := GetAccessibleNamespaces(ctx)
+	out, dropped := mergeScopeCandidateLists(ctxNs, flagNamespaces, accessible, authoritative)
+	if dropped > 0 {
+		// Capped: kinds the user can list only in a dropped namespace stay
+		// marked denied. This must log on the non-authoritative path too —
+		// that is where operator-named --namespaces entries get dropped
+		// (e.g. a full-cap list plus a distinct kubeconfig context ns).
+		log.Printf("RBAC: candidate namespaces truncated (cap=%d, %d dropped); kinds reachable only in dropped namespaces will be marked denied", MaxScopeCandidates, dropped)
+	}
+	if !authoritative {
+		// Authoritative=false means the user can't list namespaces. Without
+		// that list the probe can only try whatever the operator named
+		// explicitly — log it so an operator diagnosing "Radar disabled my
+		// kinds" has a breadcrumb instead of silence.
+		log.Printf("RBAC: namespace discovery non-authoritative (cluster-wide list namespaces denied); fallback candidates limited to %v", out)
+	}
+	return out, scopeCandidateSetIncomplete(authoritative, dropped)
+}
+
+func scopeCandidateSetIncomplete(authoritative bool, dropped int) bool {
+	return !authoritative || dropped > 0
+}
+
+func mergeForcedScopeCandidate(target string, candidates []string) []string {
+	if target == "" {
+		return candidates
+	}
+	out := []string{target}
+	for _, ns := range candidates {
+		if ns == "" || ns == target {
+			continue
+		}
+		out = append(out, ns)
+	}
+	return out
+}
+
+// mergeScopeCandidates is the pure-function core of buildScopeCandidates:
+// dedup + cap + drop-counting with no globals or network calls. When
+// authoritative is false the accessible list is ignored — the caller has
+// already decided that list is not trustworthy as a probe target.
+func mergeScopeCandidates(ctxNs, flagNs string, accessible []string, authoritative bool) (out []string, dropped int) {
+	return mergeScopeCandidateLists(ctxNs, []string{flagNs}, accessible, authoritative)
+}
+
+func mergeScopeCandidateLists(ctxNs string, flagNamespaces []string, accessible []string, authoritative bool) (out []string, dropped int) {
+	seen := map[string]bool{}
+	out = make([]string, 0, MaxScopeCandidates)
+	atCap := false
+	add := func(ns string) {
+		if ns == "" || seen[ns] {
+			return
+		}
+		if atCap {
+			dropped++
+			return
+		}
+		seen[ns] = true
+		out = append(out, ns)
+		if len(out) >= MaxScopeCandidates {
+			atCap = true
+		}
+	}
+	add(ctxNs)
+	for _, ns := range flagNamespaces {
+		add(ns)
+	}
+	if !authoritative {
+		// Operator-named namespaces can exceed the cap too — report those
+		// drops instead of discarding the count, or the truncation warning
+		// can never fire for exactly the users who typed the list out.
+		return out, dropped
+	}
+	// Iterate the full accessible list after cap so add() counts drops.
+	for _, ns := range accessible {
+		add(ns)
+	}
+	return out, dropped
+}
+
+// pickPrimaryNs picks the namespace that PermissionCheckResult.Namespace
+// reports — the stable primary for single-namespace consumers (legacy
+// diagnostics, the dynamic cache's last-resort single fallback). The dynamic
+// CRD cache fans out across ScopeCandidates per-GVR, so this is no longer
+// the only namespace CRDs can watch. Walk candidates in order and pick the
+// first one any typed kind landed in. Fall back to scopeNamespaces[0] when
+// nothing was granted — the dynamic cache short-circuits on
+// NamespaceScoped=false in that case, so the value is only used by the
+// diagnostics page (preserves prior shape).
+func pickPrimaryNs(scopeNamespaces []string, scopes map[string]k8score.ResourceScope) string {
+	granted := map[string]bool{}
+	for _, s := range scopes {
+		if s.Enabled && s.Namespace != "" {
+			granted[s.Namespace] = true
+		}
+	}
+	for _, ns := range scopeNamespaces {
+		if granted[ns] {
+			return ns
+		}
+	}
+	if len(scopeNamespaces) > 0 {
+		return scopeNamespaces[0]
+	}
+	return ""
+}
+
 // probeResourceAccess is the testable inner of CheckResourcePermissions.
-// It does the actual probing with the supplied dynamic client and namespace,
+// It does the actual probing with the supplied dynamic client and namespaces,
 // with no caching and no global state. The returned bool is true when at
 // least one probe hit a non-auth (transient) error — caller uses this to
 // shorten the cache TTL so the next attempt re-probes.
 //
-// scopeNs and forceNamespace together describe the namespace's role:
-//   - forceNamespace=false: scopeNs is a kubeconfig fallback only. Probe
-//     cluster-wide first; on 403 retry namespace-scoped against scopeNs.
-//     This is the only path used by production code — the cache always boots
-//     cluster-wide and per-user view filtering happens at the HTTP layer
-//     (see internal/server/namespace_scope.go).
-//   - forceNamespace=true: probe namespaced kinds ONLY in scopeNs. Reserved
-//     for tests / a hypothetical future per-cache pin; not reachable from
-//     CheckResourcePermissions today. Cluster-only kinds (nodes, namespaces,
-//     PV, storageclasses, ingressclasses) are still probed cluster-wide
-//     since they have no namespace dimension to pin to.
-func probeResourceAccess(ctx context.Context, dyn dynamic.Interface, scopeNs string, forceNamespace bool) (*PermissionCheckResult, bool) {
+// scopeNamespaces are candidate fallback namespaces; see buildScopeCandidates
+// for how production callers populate it. Pass nil/empty to disable fallback.
+//
+// forceNamespace describes the role of scopeNamespaces:
+//   - false: probe cluster-wide first; on 403 walk candidates until one
+//     grants list. Per-user view filtering happens at the HTTP layer (see
+//     internal/server/namespace_scope.go), so the cache preferentially boots
+//     cluster-wide.
+//   - true: probe namespaced kinds ONLY in the first scopeNamespaces entry.
+//     Used by --namespace-scope to pin the informer cache. Cluster-only kinds
+//     (nodes, namespaces, PV, storageclasses, ingressclasses) are still probed
+//     cluster-wide since they have no namespace dimension to pin to.
+func probeResourceAccess(ctx context.Context, dyn dynamic.Interface, scopeNamespaces []string, forceNamespace bool) (*PermissionCheckResult, bool) {
 	perms := &ResourcePermissions{}
 	probes := resourceProbeTargets(perms)
 
 	type probeOutcome struct {
-		scope k8score.ResourceScope
+		scope      k8score.ResourceScope
+		namespaces []string
 	}
 	outcomes := make([]probeOutcome, len(probes))
 
-	logTiming("   [perms] Probing list access for %d typed resources (scopeNs=%q forced=%v)", len(probes), scopeNs, forceNamespace)
+	var forcedNs string
+	if forceNamespace && len(scopeNamespaces) > 0 {
+		forcedNs = scopeNamespaces[0]
+	}
+
+	logTiming("   [perms] Probing list access for %d typed resources (scopeNamespaces=%q forced=%v)", len(probes), scopeNamespaces, forceNamespace)
 	probeStart := time.Now()
 	var wg sync.WaitGroup
 	var hadErrors atomic.Bool
+	var truncatedMu sync.Mutex
+	var truncatedKinds []string
 	wg.Add(len(probes))
 
 	for i, p := range probes {
@@ -872,15 +1194,15 @@ func probeResourceAccess(ctx context.Context, dyn dynamic.Interface, scopeNs str
 					}
 					return
 				}
-				if scopeNs == "" {
+				if forcedNs == "" {
 					return
 				}
-				nsAllowed, _, nsTransient := probeKindAccess(ctx, dyn, p, scopeNs)
+				nsAllowed, _, nsTransient := probeKindAccess(ctx, dyn, p, forcedNs)
 				if nsTransient != nil {
 					hadErrors.Store(true)
 				}
 				if nsAllowed {
-					outcomes[i] = probeOutcome{scope: k8score.ResourceScope{Enabled: true, Namespace: scopeNs}}
+					outcomes[i] = probeOutcome{scope: k8score.ResourceScope{Enabled: true, Namespace: forcedNs}}
 				}
 				return
 			}
@@ -897,15 +1219,39 @@ func probeResourceAccess(ctx context.Context, dyn dynamic.Interface, scopeNs str
 			// Dynamic CRDs that were marked not-installed (all versions
 			// returned NotFound) also skip the fallback — the namespace
 			// probe would hit the same NotFound for every version.
-			if !forbidden || p.clusterOnly || scopeNs == "" {
+			if !forbidden || p.clusterOnly || len(scopeNamespaces) == 0 {
 				return
 			}
-			nsAllowed, _, nsTransient := probeKindAccess(ctx, dyn, p, scopeNs)
-			if nsTransient != nil {
-				hadErrors.Store(true)
+			// Try candidate namespaces in priority order. Every grant becomes
+			// part of the per-kind informer fanout; Namespace keeps the first
+			// grant as the stable primary for legacy diagnostics and dynamic
+			// fallback paths.
+			grantedNamespaces := make([]string, 0, len(scopeNamespaces))
+			for _, ns := range scopeNamespaces {
+				if ctx.Err() != nil {
+					// Probe budget exhausted mid-fanout. Keep the grants
+					// collected so far, but record the cut so the operator
+					// can see why later candidates came up missing instead
+					// of silently treating them as denied.
+					hadErrors.Store(true)
+					truncatedMu.Lock()
+					truncatedKinds = append(truncatedKinds, p.key)
+					truncatedMu.Unlock()
+					break
+				}
+				nsAllowed, _, nsTransient := probeKindAccess(ctx, dyn, p, ns)
+				if nsTransient != nil {
+					hadErrors.Store(true)
+				}
+				if nsAllowed {
+					grantedNamespaces = append(grantedNamespaces, ns)
+				}
 			}
-			if nsAllowed {
-				outcomes[i] = probeOutcome{scope: k8score.ResourceScope{Enabled: true, Namespace: scopeNs}}
+			if len(grantedNamespaces) > 0 {
+				outcomes[i] = probeOutcome{
+					scope:      k8score.ResourceScope{Enabled: true, Namespace: grantedNamespaces[0]},
+					namespaces: grantedNamespaces,
+				}
 			}
 		}(i, p)
 	}
@@ -914,12 +1260,22 @@ func probeResourceAccess(ctx context.Context, dyn dynamic.Interface, scopeNs str
 	logTiming("    Probe phase (%d resources): %v", len(probes), time.Since(probeStart))
 
 	if ctx.Err() != nil {
-		logTiming("   [perms] Bailing after probes: context canceled")
-		return &PermissionCheckResult{Perms: perms, Scopes: map[string]k8score.ResourceScope{}}, true
+		// Deadline expired mid-probe. Keep every outcome that completed —
+		// returning empty scopes here would silently start Radar with no
+		// typed informers at all. hadErrors forces the short error TTL, so
+		// a full re-probe happens soon regardless.
+		hadErrors.Store(true)
+		if len(truncatedKinds) > 0 {
+			sort.Strings(truncatedKinds)
+			log.Printf("RBAC: probe deadline expired before all candidate namespaces were tried for %d kind(s) (%s); untried namespaces are treated as denied until the next probe", len(truncatedKinds), strings.Join(truncatedKinds, ", "))
+		} else {
+			logTiming("   [perms] Probe deadline expired; keeping completed outcomes")
+		}
 	}
 
 	// Apply outcomes to perms (boolean projection) and build the scope map.
 	scopes := make(map[string]k8score.ResourceScope, len(probes))
+	scopeNamespacesByKind := make(map[string][]string)
 	namespaceScoped := false
 	var (
 		restricted   []string
@@ -933,30 +1289,47 @@ func probeResourceAccess(ctx context.Context, dyn dynamic.Interface, scopeNs str
 			if r.scope.Namespace != "" {
 				namespaceScoped = true
 				nsScopedKeys = append(nsScopedKeys, p.key)
+				if len(r.namespaces) > 1 {
+					scopeNamespacesByKind[p.key] = append([]string(nil), r.namespaces...)
+				}
 			}
 		} else {
 			restricted = append(restricted, p.key)
 		}
 	}
 
-	// scopeNs comes from operator-controlled config (kubeconfig context
-	// namespace or --namespace flag), but strip CR/LF defensively so log
-	// scrapers can't be tricked by a malicious kubeconfig. CodeQL's taint
-	// analysis doesn't model %q escaping, so be explicit.
-	logSafeNs := SanitizeForLog(scopeNs)
+	// Strip CR/LF defensively before logging — candidates come from
+	// operator-controlled config (kubeconfig context, --namespace flag,
+	// accessible-namespaces list); a malicious kubeconfig could otherwise
+	// inject lines. CodeQL doesn't model %q escaping, so be explicit.
+	scopedDetail := make([]string, 0, len(nsScopedKeys))
+	for _, k := range nsScopedKeys {
+		if namespaces := scopeNamespacesByKind[k]; len(namespaces) > 1 {
+			safeNamespaces := make([]string, 0, len(namespaces))
+			for _, ns := range namespaces {
+				safeNamespaces = append(safeNamespaces, SanitizeForLog(ns))
+			}
+			scopedDetail = append(scopedDetail, fmt.Sprintf("%s=%q", k, safeNamespaces))
+		} else {
+			scopedDetail = append(scopedDetail, fmt.Sprintf("%s=%s", k, SanitizeForLog(scopes[k].Namespace)))
+		}
+	}
+	sort.Strings(scopedDetail)
+	candidatesLog := make([]string, 0, len(scopeNamespaces))
+	for _, ns := range scopeNamespaces {
+		candidatesLog = append(candidatesLog, SanitizeForLog(ns))
+	}
 	if len(restricted) > 0 {
 		sort.Strings(restricted)
 		if namespaceScoped {
-			sort.Strings(nsScopedKeys)
-			log.Printf("RBAC: mixed scope (namespace=%q; ns-scoped: %s); denied: %s",
-				logSafeNs, strings.Join(nsScopedKeys, ", "), strings.Join(restricted, ", "))
+			log.Printf("RBAC: mixed scope (candidates=%q; ns-scoped: %s); denied: %s",
+				candidatesLog, strings.Join(scopedDetail, ", "), strings.Join(restricted, ", "))
 		} else {
 			log.Printf("RBAC: restricted resources (no list permission): %s", strings.Join(restricted, ", "))
 		}
 	} else if namespaceScoped {
-		sort.Strings(nsScopedKeys)
-		log.Printf("RBAC: mixed scope (namespace=%q; ns-scoped: %s); all kinds accessible",
-			logSafeNs, strings.Join(nsScopedKeys, ", "))
+		log.Printf("RBAC: mixed scope (candidates=%q; ns-scoped: %s); all kinds accessible",
+			candidatesLog, strings.Join(scopedDetail, ", "))
 	}
 
 	// In forced-namespace mode the user's intent is to be ns-scoped — even
@@ -964,15 +1337,26 @@ func probeResourceAccess(ctx context.Context, dyn dynamic.Interface, scopeNs str
 	// no access to). Force NamespaceScoped=true so the dynamic cache scopes
 	// CRD informers to the same namespace and doesn't silently fall through
 	// to cluster-wide watches.
-	if forceNamespace && scopeNs != "" {
+	if forceNamespace && forcedNs != "" {
 		namespaceScoped = true
 	}
 
+	// Namespace is the single-valued anchor consumed by the dynamic CRD
+	// cache (internal/k8s/dynamic_cache.go) as NamespaceFallback and by
+	// the diagnostics page (internal/server/diagnostics.go). It must be a
+	// namespace where the user actually has reads — otherwise CRD informers
+	// silently 403. Walk candidates in order and pick the first one that
+	// granted at least one typed kind. Fall back to scopeNamespaces[0]
+	// when nothing was granted (NamespaceScoped is false in that case, so
+	// the dynamic cache ignores this field anyway).
+	primaryNs := pickPrimaryNs(scopeNamespaces, scopes)
 	return &PermissionCheckResult{
 		Perms:           perms,
 		NamespaceScoped: namespaceScoped,
-		Namespace:       scopeNs,
+		Namespace:       primaryNs,
 		Scopes:          scopes,
+		ScopeNamespaces: scopeNamespacesByKind,
+		ScopeCandidates: append([]string(nil), scopeNamespaces...),
 	}, hadErrors.Load()
 }
 
@@ -991,11 +1375,18 @@ func GetCachedPermissionResult() *PermissionCheckResult {
 	for k, v := range cachedPermResult.Scopes {
 		scopesCopy[k] = v
 	}
+	scopeNamespacesCopy := make(map[string][]string, len(cachedPermResult.ScopeNamespaces))
+	for k, v := range cachedPermResult.ScopeNamespaces {
+		scopeNamespacesCopy[k] = append([]string(nil), v...)
+	}
 	return &PermissionCheckResult{
-		Perms:           &permsCopy,
-		NamespaceScoped: cachedPermResult.NamespaceScoped,
-		Namespace:       cachedPermResult.Namespace,
-		Scopes:          scopesCopy,
+		Perms:                    &permsCopy,
+		NamespaceScoped:          cachedPermResult.NamespaceScoped,
+		Namespace:                cachedPermResult.Namespace,
+		Scopes:                   scopesCopy,
+		ScopeNamespaces:          scopeNamespacesCopy,
+		ScopeCandidates:          append([]string(nil), cachedPermResult.ScopeCandidates...),
+		ScopeCandidatesTruncated: cachedPermResult.ScopeCandidatesTruncated,
 	}
 }
 

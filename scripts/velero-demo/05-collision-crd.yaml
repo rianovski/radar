@@ -1,0 +1,42 @@
+# The collision fixture, and the reason it uses a REAL third-party CRD.
+#
+# rancher/backup-restore-operator ships restores.resources.cattle.io — the
+# same plural Velero uses. Radar's renderers, status readers and column sets
+# must select on the API group, not the plural, or a Rancher Restore renders
+# through Velero's UI. A mock CRD would not prove much; this is the actual
+# schema, trimmed to the fields the fixture sets.
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: restores.resources.cattle.io
+spec:
+  conversion:
+    strategy: None
+  group: resources.cattle.io
+  names:
+    kind: Restore
+    listKind: RestoreList
+    plural: restores
+    singular: restore
+  scope: Namespaced
+  versions:
+  - name: v1
+    schema:
+      openAPIV3Schema:
+        properties:
+          spec:
+            properties:
+              backupFilename:
+                type: string
+            type: object
+          status:
+            properties:
+              phase:
+                type: string
+              restoreCompletionTs:
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true

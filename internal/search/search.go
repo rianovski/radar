@@ -22,7 +22,22 @@ import (
 
 	"github.com/skyhook-io/radar/internal/k8s"
 	aicontext "github.com/skyhook-io/radar/pkg/ai/context"
+	"github.com/skyhook-io/radar/pkg/resourcecontext"
 )
+
+// SummaryBuilderFunc, when supplied via Options.SummaryBuilder, is
+// invoked once per matched hit to produce the compact SummaryContext
+// attached to the hit's summaryContext field. Exactly one of obj/u will be
+// non-nil — typed kinds pass obj, dynamic CRDs pass u. Returning nil
+// is fine (the field is omitempty); callers use it to gate context
+// emission per request (context=none opts out by passing nil here).
+//
+// group is the candidate's API group (already known to the search
+// walker — typed kinds via typedKinds, CRDs via gvr.Group). Threading
+// it through lets the builder distinguish CRDs that share
+// kind+namespace+name across groups (e.g. Knative Service vs corev1
+// Service) in its per-resource issue index.
+type SummaryBuilderFunc func(obj runtime.Object, u *unstructured.Unstructured, group, kind, namespace, name string) *resourcecontext.ResourceSummaryContext
 
 // Provider abstracts the cache so tests can inject a fake.
 type Provider interface {
@@ -106,9 +121,27 @@ type Options struct {
 	// drop the candidate. Compile happens in the handler; this layer
 	// just runs the program.
 	Filter *CELFilter
+	// SummaryBuilder, when non-nil, is invoked per matched hit to
+	// attach the compact summaryContext (managedBy + health +
+	// issueCount). Handlers provide a closure that wraps the
+	// request-scoped topology + per-namespace issue index so the
+	// per-row cost stays flat. Pass nil to opt out (context=none) —
+	// the field is omitempty and consumers must tolerate its absence.
+	SummaryBuilder SummaryBuilderFunc
 }
 
 // Search runs the parsed query against the provider and returns ranked hits.
+// pendingHit pairs a Hit with the source object that produced it, so the
+// SummaryBuilder (topology lookups, issue-index reads) can be deferred
+// until AFTER the hits are sorted and truncated to opts.Limit. Lifecycle is
+// strictly internal to Search — never escapes the function.
+type pendingHit struct {
+	hit Hit
+	obj runtime.Object             // typed source (nil for CRD hits)
+	u   *unstructured.Unstructured // unstructured source (nil for typed hits)
+	c   candidate                  // for c.Group/Kind/Namespace/Name when invoking SummaryBuilder
+}
+
 func Search(ctx context.Context, p Provider, q Query, opts Options) (Result, error) {
 	if opts.Limit <= 0 {
 		opts.Limit = DefaultLimit
@@ -118,7 +151,11 @@ func Search(ctx context.Context, p Provider, q Query, opts Options) (Result, err
 	}
 
 	var res Result
-	var hits []Hit
+	// Buffer hits along with the source object so summaryBuilder (topology
+	// lookups, issue-index reads) can run AFTER sort + truncate — without
+	// this, broad queries pay topology lookups for thousands of matches
+	// only to ship at most opts.Limit of them.
+	var pending []pendingHit
 	// CEL filter eval errors are silently dropped per-row (the agent
 	// just gets fewer hits, no 500), but we log the first error so an
 	// operator can see when rows are dying to runtime issues — typical
@@ -176,7 +213,7 @@ func Search(ctx context.Context, p Provider, q Query, opts Options) (Result, err
 				continue
 			}
 			c.Group = tk.Group
-			score, matched, ok := match(q, c)
+			score, matched, snippets, ok := match(q, c)
 			if !ok {
 				continue
 			}
@@ -204,7 +241,11 @@ func Search(ctx context.Context, p Provider, q Query, opts Options) (Result, err
 					continue
 				}
 			}
-			hits = append(hits, buildHit(score, matched, c, opts.Include, obj, nil))
+			pending = append(pending, pendingHit{
+				hit: buildHit(score, matched, snippets, c, opts.Include, obj, nil),
+				obj: obj,
+				c:   c,
+			})
 		}
 	}
 
@@ -244,7 +285,7 @@ func Search(ctx context.Context, p Provider, q Query, opts Options) (Result, err
 		res.Searched += len(items)
 		for _, u := range items {
 			c := fromUnstructured(u, kind, gvr.Group)
-			score, matched, ok := match(q, c)
+			score, matched, snippets, ok := match(q, c)
 			if !ok {
 				continue
 			}
@@ -270,7 +311,11 @@ func Search(ctx context.Context, p Provider, q Query, opts Options) (Result, err
 					continue
 				}
 			}
-			hits = append(hits, buildHit(score, matched, c, opts.Include, nil, u))
+			pending = append(pending, pendingHit{
+				hit: buildHit(score, matched, snippets, c, opts.Include, nil, u),
+				u:   u,
+				c:   c,
+			})
 		}
 	}
 
@@ -282,21 +327,60 @@ func Search(ctx context.Context, p Provider, q Query, opts Options) (Result, err
 		}
 	}
 
-	sort.SliceStable(hits, func(i, j int) bool {
-		if hits[i].Score != hits[j].Score {
-			return hits[i].Score > hits[j].Score
+	// Dedup before sorting. A resource can land in the pending slice
+	// twice when it's reachable via both the typed loop (Deployment,
+	// Pod, …) and the dynamic loop (an integration registered
+	// Deployment/Pod as a watched GVR — e.g. a controller indexing
+	// built-in workloads as dynamic resources). Without dedup the table
+	// shows visible doubles. Keep the highest-scoring instance so the
+	// typed-path match (which usually has richer per-kind scoring) wins
+	// ties.
+	if len(pending) > 1 {
+		type hitKey struct{ kind, group, ns, name string }
+		seen := make(map[hitKey]int, len(pending))
+		out := pending[:0]
+		for _, p := range pending {
+			k := hitKey{p.hit.Kind, p.hit.Group, p.hit.Namespace, p.hit.Name}
+			if idx, ok := seen[k]; ok {
+				if p.hit.Score > out[idx].hit.Score {
+					out[idx] = p
+				}
+				continue
+			}
+			seen[k] = len(out)
+			out = append(out, p)
 		}
-		if hits[i].Kind != hits[j].Kind {
-			return hits[i].Kind < hits[j].Kind
+		pending = out
+	}
+
+	sort.SliceStable(pending, func(i, j int) bool {
+		if pending[i].hit.Score != pending[j].hit.Score {
+			return pending[i].hit.Score > pending[j].hit.Score
 		}
-		if hits[i].Namespace != hits[j].Namespace {
-			return hits[i].Namespace < hits[j].Namespace
+		if pending[i].hit.Kind != pending[j].hit.Kind {
+			return pending[i].hit.Kind < pending[j].hit.Kind
 		}
-		return hits[i].Name < hits[j].Name
+		if pending[i].hit.Namespace != pending[j].hit.Namespace {
+			return pending[i].hit.Namespace < pending[j].hit.Namespace
+		}
+		return pending[i].hit.Name < pending[j].hit.Name
 	})
-	res.TotalMatched = len(hits)
-	if len(hits) > opts.Limit {
-		hits = hits[:opts.Limit]
+	res.TotalMatched = len(pending)
+	if len(pending) > opts.Limit {
+		pending = pending[:opts.Limit]
+	}
+
+	// Summary attach happens HERE — after truncation — so the topology
+	// lookups + issue-index reads only run for the hits we'll actually
+	// ship. Skipped entirely when SummaryBuilder is nil (caller opted out
+	// via context=none).
+	hits := make([]Hit, len(pending))
+	for i := range pending {
+		hits[i] = pending[i].hit
+		if opts.SummaryBuilder != nil {
+			c := pending[i].c
+			hits[i].SummaryContext = opts.SummaryBuilder(pending[i].obj, pending[i].u, c.Group, c.Kind, c.Namespace, c.Name)
+		}
 	}
 	res.Hits = hits
 	res.Total = len(hits)
@@ -345,8 +429,11 @@ func isClusterScopedKind(kind string) bool {
 
 // buildHit assembles the response shape for a matched candidate. Exactly
 // one of obj/u will be non-nil. minify-on-demand keeps the cost of
-// IncludeNone (identity-only) flat.
-func buildHit(score int, matched []MatchedField, c candidate, mode IncludeMode, obj runtime.Object, u *unstructured.Unstructured) Hit {
+// IncludeNone (identity-only) flat. SummaryContext attachment is NOT
+// done here — it happens in Search's post-truncation loop so the
+// expensive topology lookups + issue-index reads only run for the hits
+// that survive sort + Limit truncation.
+func buildHit(score int, matched []MatchedField, snippets []MatchSnippet, c candidate, mode IncludeMode, obj runtime.Object, u *unstructured.Unstructured) Hit {
 	h := Hit{
 		Score:     score,
 		Kind:      c.Kind,
@@ -354,6 +441,7 @@ func buildHit(score int, matched []MatchedField, c candidate, mode IncludeMode, 
 		Namespace: c.Namespace,
 		Name:      c.Name,
 		Matched:   matched,
+		Snippets:  snippets,
 	}
 	switch mode {
 	case IncludeSummary:

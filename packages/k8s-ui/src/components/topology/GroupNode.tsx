@@ -6,6 +6,7 @@ import type { HealthStatus } from '../../types'
 import { Tooltip } from '../ui/Tooltip'
 import type { WorkloadCard, GroupDisplayLevel } from './layout'
 import { pluralize } from '../../utils/pluralize'
+import { getTopologyIcon } from '../../utils/resource-icons'
 
 interface GroupNodeData {
   type: 'namespace' | 'app' | 'label'
@@ -158,6 +159,10 @@ export const GroupNode = memo(function GroupNode({
     </div>
   )
 
+  // Chip and cardGrid roots must NOT counter-scale with zoom (group-header-scaled):
+  // the transform shrinks the visuals but the React Flow wrapper — the hitbox,
+  // drag target, and edge-attachment box — keeps the full ELK-computed size, so
+  // past zoom 0.7 the interactive area extends well outside the drawn box.
   // ── Level 1: Chip (compact collapsed card) ──
   if (displayLevel === 'chip') {
     // Size tier: 0-9 → 0, 10-99 → 1, 100-999 → 2, 1000+ → 3
@@ -177,7 +182,7 @@ export const GroupNode = memo(function GroupNode({
       <>
         {handles}
         <div
-          className="rounded-xl group-header-scaled overflow-hidden"
+          className="rounded-xl overflow-hidden"
           style={{ ...getBorderStyle(), ...getHeaderBgStyle(), padding: chipPadding, width: width || '100%', height: height || '100%' }}
         >
           {/* Header row: icon + name + count + status + controls */}
@@ -195,7 +200,10 @@ export const GroupNode = memo(function GroupNode({
             <div className="flex flex-wrap gap-1 mt-1.5">
               {kindPills.map(([kind, count]) => (
                 <div key={kind} className="flex items-center gap-1 bg-theme-surface/50 rounded px-1.5 py-0.5">
-                  <span className={`topology-icon topology-icon-${kind.toLowerCase()}`} style={{ width: 10, height: 10, fontSize: 6, borderRadius: 2 }} />
+                  {(() => {
+                    const KindIcon = getTopologyIcon(kind)
+                    return <KindIcon className="h-2.5 w-2.5 shrink-0 text-theme-text-tertiary" aria-hidden />
+                  })()}
                   <span className="text-[10px] text-theme-text-secondary">{pluralize(count, kind)}</span>
                 </div>
               ))}
@@ -216,7 +224,7 @@ export const GroupNode = memo(function GroupNode({
       <>
         {handles}
         <div
-          className="rounded-xl overflow-hidden group-header-scaled"
+          className="rounded-xl overflow-hidden"
           style={{ ...getBorderStyle(), width: width || '100%', height: height || '100%' }}
         >
           {/* Header bar with level controls */}
@@ -254,7 +262,10 @@ export const GroupNode = memo(function GroupNode({
                   onClick={(e) => { e.stopPropagation(); onCardClick?.(card.id) }}
                 >
                   <div className="grid-card-header">
-                    <span className={`topology-icon topology-icon-${card.kind.toLowerCase()}`} />
+                    {(() => {
+                      const KindIcon = getTopologyIcon(card.kind)
+                      return <KindIcon className="h-3.5 w-3.5 shrink-0 text-theme-text-tertiary" aria-hidden />
+                    })()}
                     <span className="grid-card-kind">{card.kind}</span>
                     <span className="grid-card-count">{card.resourceCount}</span>
                   </div>

@@ -1,6 +1,8 @@
 package k8score
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"maps"
@@ -12,9 +14,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apiruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/pager"
 )
 
 // ResourceCache provides fast, eventually-consistent access to K8s resources
@@ -24,6 +32,8 @@ type ResourceCache struct {
 	factory          informers.SharedInformerFactory            // cluster-wide factory (always present)
 	nsFactories      map[string]informers.SharedInformerFactory // per-namespace factories (for mixed-scope mode)
 	factoryByKind    map[string]informers.SharedInformerFactory // resolved factory per enabled kind — listers MUST go through this
+	indexerByKind    map[string]cache.Indexer                   // union indexer for kinds watched in multiple namespace factories
+	pagedInformers   map[string]cache.SharedIndexInformer       // per-kind paginating informers (ListPageSize>0); listers read these instead of the factory's
 	changes          chan ResourceChange
 	stopCh           chan struct{}
 	stopOnce         sync.Once
@@ -38,9 +48,21 @@ type ResourceCache struct {
 
 	// Per-informer sync tracking for diagnostics
 	informerStatuses []InformerSyncStatus
-	informerMu       sync.RWMutex
-	promotedKinds    []string // set when SyncTimeout fires; empty on normal sync
-	syncStartTime    time.Time
+	// informerHasSynced is the informer's own HasSynced, parallel to
+	// informerStatuses. The Synced flag beside it is written by a tracking
+	// goroutine and lags it, so a caller deciding whether it may trust an
+	// empty list must ask this rather than read the flag. Also backs
+	// KindReadiness and GetSyncSnapshot for the same reason.
+	informerHasSynced []func() bool
+	informerMu        sync.RWMutex
+	promotedKinds     []string // set when SyncTimeout fires; empty on normal sync
+	syncStartTime     time.Time
+
+	// backgroundKeys marks kinds that sync independently with no deadline
+	// (Events). They share deferredSynced tracking but must never classify
+	// as failed off the deferred-timeout flag — a late Events LIST on a big
+	// cluster is normal, not terminal.
+	backgroundKeys map[string]bool
 }
 
 // InformerSyncStatus tracks the sync state of a single informer.
@@ -87,6 +109,197 @@ type informerSetup struct {
 	setup           func(factory informers.SharedInformerFactory) cache.SharedIndexInformer
 	isEvent         bool
 	isClusterScoped bool // true for nodes, namespaces, PV, storageclasses, ingressclasses
+	// pagedSetup, when non-nil and CacheConfig.ListPageSize > 0, builds a
+	// paginating informer for this kind instead of the factory one. Set only
+	// for high-cardinality kinds whose single-shot initial LIST can fail on
+	// very large clusters.
+	pagedSetup func(client kubernetes.Interface, namespace string, pageSize int64) cache.SharedIndexInformer
+}
+
+// newPagedInformer builds a SharedIndexInformer whose initial LIST is fetched in
+// pages via a consistent (resourceVersion="") read rather than one unpaginated
+// response. The watch is unchanged. On clusters without WatchList streaming, a
+// single giant LIST of a high-cardinality kind can exceed the response-read
+// deadline or spike memory; paging bounds each request. When WatchList IS
+// available, client-go streams the initial state and never calls this ListFunc.
+func newPagedInformer(
+	example apiruntime.Object,
+	pageSize int64,
+	listFn pager.ListPageFunc,
+	watchFn func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error),
+) cache.SharedIndexInformer {
+	lw := &cache.ListWatch{
+		ListWithContextFunc: func(ctx context.Context, _ metav1.ListOptions) (apiruntime.Object, error) {
+			p := pager.New(listFn)
+			p.PageSize = pageSize
+			// resourceVersion="" forces a consistent read the apiserver will
+			// paginate — RV=0 (watch-cache) reads ignore limit. We deliberately
+			// override the reflector's default RV here.
+			obj, _, err := p.List(ctx, metav1.ListOptions{ResourceVersion: ""})
+			return obj, err
+		},
+		WatchFuncWithContext: watchFn,
+	}
+	inf := cache.NewSharedIndexInformer(lw, example, 0, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	return inf
+}
+
+func cloneScopeNamespaces(in map[string][]string) map[string][]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string][]string, len(in))
+	for k, v := range in {
+		if len(v) == 0 {
+			continue
+		}
+		out[k] = append([]string(nil), v...)
+	}
+	return out
+}
+
+func resourceScopeNamespaces(key string, scope ResourceScope, byKind map[string][]string) []string {
+	if !scope.Enabled || scope.Namespace == "" {
+		return nil
+	}
+	namespaces := byKind[key]
+	if len(namespaces) == 0 {
+		return []string{scope.Namespace}
+	}
+	seen := make(map[string]struct{}, len(namespaces)+1)
+	out := make([]string, 0, len(namespaces)+1)
+	add := func(ns string) {
+		if ns == "" {
+			return
+		}
+		if _, ok := seen[ns]; ok {
+			return
+		}
+		seen[ns] = struct{}{}
+		out = append(out, ns)
+	}
+	add(scope.Namespace)
+	for _, ns := range namespaces {
+		add(ns)
+	}
+	return out
+}
+
+// unionIndexer is a read-only cache.Indexer that fans reads out across the
+// per-namespace informer stores of one kind. Each underlying informer watches
+// a distinct namespace, so the union cannot duplicate an object. Reading the
+// informers' own stores — rather than mirroring events into a separate
+// indexer — keeps HasSynced meaningful (an informer's store is fully
+// populated before HasSynced flips, while a mirror fills in asynchronously
+// after) and avoids holding every object twice.
+type unionIndexer struct {
+	indexers []cache.Indexer
+}
+
+var errUnionIndexerReadOnly = errors.New("union indexer is read-only")
+
+func (u *unionIndexer) Add(any) error   { return errUnionIndexerReadOnly }
+func (u *unionIndexer) Bookmark(string) {}
+
+// LastStoreSyncResourceVersion is only meaningful on stores a reflector
+// writes into; nothing writes into the union, so report "unknown".
+func (u *unionIndexer) LastStoreSyncResourceVersion() string { return "" }
+func (u *unionIndexer) Update(any) error                     { return errUnionIndexerReadOnly }
+func (u *unionIndexer) Delete(any) error                     { return errUnionIndexerReadOnly }
+func (u *unionIndexer) Replace([]any, string) error          { return errUnionIndexerReadOnly }
+func (u *unionIndexer) Resync() error                        { return errUnionIndexerReadOnly }
+func (u *unionIndexer) AddIndexers(cache.Indexers) error     { return errUnionIndexerReadOnly }
+
+func (u *unionIndexer) List() []any {
+	var out []any
+	for _, idx := range u.indexers {
+		out = append(out, idx.List()...)
+	}
+	return out
+}
+
+func (u *unionIndexer) ListKeys() []string {
+	var out []string
+	for _, idx := range u.indexers {
+		out = append(out, idx.ListKeys()...)
+	}
+	return out
+}
+
+func (u *unionIndexer) Get(obj any) (any, bool, error) {
+	for _, idx := range u.indexers {
+		if item, exists, err := idx.Get(obj); err != nil || exists {
+			return item, exists, err
+		}
+	}
+	return nil, false, nil
+}
+
+func (u *unionIndexer) GetByKey(key string) (any, bool, error) {
+	for _, idx := range u.indexers {
+		if item, exists, err := idx.GetByKey(key); err != nil || exists {
+			return item, exists, err
+		}
+	}
+	return nil, false, nil
+}
+
+func (u *unionIndexer) Index(indexName string, obj any) ([]any, error) {
+	var out []any
+	for _, idx := range u.indexers {
+		items, err := idx.Index(indexName, obj)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, items...)
+	}
+	return out, nil
+}
+
+func (u *unionIndexer) IndexKeys(indexName, indexedValue string) ([]string, error) {
+	var out []string
+	for _, idx := range u.indexers {
+		keys, err := idx.IndexKeys(indexName, indexedValue)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, keys...)
+	}
+	return out, nil
+}
+
+func (u *unionIndexer) ListIndexFuncValues(indexName string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, idx := range u.indexers {
+		for _, v := range idx.ListIndexFuncValues(indexName) {
+			if _, ok := seen[v]; ok {
+				continue
+			}
+			seen[v] = struct{}{}
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func (u *unionIndexer) ByIndex(indexName, indexedValue string) ([]any, error) {
+	var out []any
+	for _, idx := range u.indexers {
+		items, err := idx.ByIndex(indexName, indexedValue)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, items...)
+	}
+	return out, nil
+}
+
+func (u *unionIndexer) GetIndexers() cache.Indexers {
+	if len(u.indexers) == 0 {
+		return cache.Indexers{}
+	}
+	return u.indexers[0].GetIndexers()
 }
 
 // NewResourceCache creates and starts a ResourceCache from the given config.
@@ -112,6 +325,21 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 			return nil, fmt.Errorf("CacheConfig.ResourceScopes contains entry with empty key")
 		}
 	}
+	for k, namespaces := range cfg.ResourceScopeNamespaces {
+		if k == "" {
+			return nil, fmt.Errorf("CacheConfig.ResourceScopeNamespaces contains entry with empty key")
+		}
+		if len(namespaces) == 0 {
+			continue
+		}
+		scope, ok := cfg.ResourceScopes[k]
+		if !ok || !scope.Enabled {
+			return nil, fmt.Errorf("CacheConfig.ResourceScopeNamespaces contains namespaces for disabled key %q", k)
+		}
+		if scope.Namespace == "" {
+			return nil, fmt.Errorf("CacheConfig.ResourceScopeNamespaces contains namespaces for cluster-wide key %q", k)
+		}
+	}
 
 	channelSize := cfg.ChannelSize
 	if channelSize <= 0 {
@@ -131,6 +359,7 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 	// Clone caller-owned maps to prevent mutation after construction.
 	cfg.ResourceTypes = maps.Clone(cfg.ResourceTypes)
 	cfg.ResourceScopes = maps.Clone(cfg.ResourceScopes)
+	cfg.ResourceScopeNamespaces = cloneScopeNamespaces(cfg.ResourceScopeNamespaces)
 	cfg.DeferredTypes = maps.Clone(cfg.DeferredTypes)
 	cfg.MinimalSet = maps.Clone(cfg.MinimalSet)
 
@@ -157,6 +386,20 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 			}
 		}
 	}
+	setups := buildInformerSetups()
+	for _, setup := range setups {
+		if !setup.isClusterScoped {
+			continue
+		}
+		scope, ok := scopes[setup.key]
+		if !ok {
+			continue
+		}
+		scope.Namespace = ""
+		scopes[setup.key] = scope
+		delete(cfg.ResourceScopeNamespaces, setup.key)
+	}
+	cfg.ResourceScopes = scopes
 
 	stopCh := make(chan struct{})
 	changes := make(chan ResourceChange, channelSize)
@@ -164,25 +407,34 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 	// Build one factory per unique scope. The cluster-wide factory is
 	// always created so cluster-scoped kinds (nodes, namespaces, PV…)
 	// have a home; namespace-scoped factories are created on demand.
+	transform := func(obj any) (any, error) {
+		if cfg.OnTransform != nil {
+			cfg.OnTransform(obj)
+		}
+		return DropManagedFields(obj)
+	}
 	clusterFactory := informers.NewSharedInformerFactoryWithOptions(
 		cfg.Client,
 		0, // no resync — updates come via watch
-		informers.WithTransform(DropManagedFields),
+		informers.WithTransform(transform),
 	)
 	nsFactories := make(map[string]informers.SharedInformerFactory)
-	for _, s := range scopes {
-		if s.Namespace == "" {
+	for key, s := range scopes {
+		namespaces := resourceScopeNamespaces(key, s, cfg.ResourceScopeNamespaces)
+		if len(namespaces) == 0 {
 			continue
 		}
-		if _, ok := nsFactories[s.Namespace]; ok {
-			continue
+		for _, namespace := range namespaces {
+			if _, ok := nsFactories[namespace]; ok {
+				continue
+			}
+			nsFactories[namespace] = informers.NewSharedInformerFactoryWithOptions(
+				cfg.Client,
+				0,
+				informers.WithTransform(transform),
+				informers.WithNamespace(namespace),
+			)
 		}
-		nsFactories[s.Namespace] = informers.NewSharedInformerFactoryWithOptions(
-			cfg.Client,
-			0,
-			informers.WithTransform(DropManagedFields),
-			informers.WithNamespace(s.Namespace),
-		)
 	}
 	if len(nsFactories) > 0 {
 		var nsList []string
@@ -205,9 +457,6 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 		}
 		return nsFactories[scope.Namespace]
 	}
-
-	// Table-driven informer setup — only create informers for enabled types
-	setups := buildInformerSetups()
 
 	// enabledMap is the boolean projection over `scopes` exposed via
 	// GetEnabledResources for callers that only need "is this kind on?"
@@ -232,6 +481,8 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 		factory:          clusterFactory,
 		nsFactories:      nsFactories,
 		factoryByKind:    map[string]informers.SharedInformerFactory{},
+		indexerByKind:    map[string]cache.Indexer{},
+		pagedInformers:   map[string]cache.SharedIndexInformer{},
 		changes:          changes,
 		stopCh:           stopCh,
 		enabledResources: enabled,
@@ -246,19 +497,22 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 		key      string
 		deferred bool
 		synced   cache.InformerSynced
-		informer cache.SharedIndexInformer
+		run      func(stopCh <-chan struct{})
 	}
 	var allEntries []informerEntry
 
-	for _, s := range setups {
-		if !enabled[s.key] {
-			continue
+	buildInformer := func(s informerSetup, factory informers.SharedInformerFactory, namespace string) cache.SharedIndexInformer {
+		if cfg.ListPageSize > 0 && s.pagedSetup != nil {
+			inf := s.pagedSetup(cfg.Client, namespace, cfg.ListPageSize)
+			// Paged informers are built outside the factories, so they need the
+			// same caller hook and managed-fields stripping transform here.
+			_ = inf.SetTransform(transform)
+			return inf
 		}
-		enabledCount++
-		factory := pickFactory(s)
-		rc.factoryByKind[s.key] = factory
-		inf := s.setup(factory)
+		return s.setup(factory)
+	}
 
+	wireInformer := func(inf cache.SharedIndexInformer, s informerSetup, idx int) error {
 		var err error
 		if s.isEvent {
 			err = rc.addEventHandlers(inf, changes)
@@ -266,8 +520,7 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 			err = rc.addChangeHandlers(inf, s.kind, changes)
 		}
 		if err != nil {
-			close(stopCh)
-			return nil, fmt.Errorf("failed to register %s event handler: %w", s.kind, err)
+			return fmt.Errorf("failed to register %s event handler: %w", s.kind, err)
 		}
 
 		// Wire a WatchErrorHandler so reflector-level failures (most
@@ -276,7 +529,6 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 		// mid-session) are visible in diagnostics. The reflector keeps
 		// retrying with exponential backoff regardless; this just makes
 		// the failure observable instead of silent.
-		idx := len(allEntries) // status index for this informer
 		key := s.key
 		kind := s.kind
 		if hErr := inf.SetWatchErrorHandler(func(_ *cache.Reflector, err error) {
@@ -286,30 +538,111 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 			// started, which can't happen here — log and continue.
 			stdlog.Printf("Warning: failed to set watch error handler for %s: %v", s.kind, hErr)
 		}
+		return nil
+	}
+
+	for _, s := range setups {
+		if !enabled[s.key] {
+			continue
+		}
+		enabledCount++
+		idx := len(allEntries) // status index for this logical kind
+		scopeNamespaces := resourceScopeNamespaces(s.key, scopes[s.key], cfg.ResourceScopeNamespaces)
+
+		var synced cache.InformerSynced
+		var run func(stopCh <-chan struct{})
+
+		if !s.isClusterScoped && len(scopeNamespaces) > 1 {
+			informersForKind := make([]cache.SharedIndexInformer, 0, len(scopeNamespaces))
+			stores := make([]cache.Indexer, 0, len(scopeNamespaces))
+			for _, namespace := range scopeNamespaces {
+				factory := nsFactories[namespace]
+				inf := buildInformer(s, factory, namespace)
+				if err := wireInformer(inf, s, idx); err != nil {
+					close(stopCh)
+					return nil, err
+				}
+				informersForKind = append(informersForKind, inf)
+				stores = append(stores, inf.GetIndexer())
+			}
+			rc.indexerByKind[s.key] = &unionIndexer{indexers: stores}
+			synced = func() bool {
+				for _, inf := range informersForKind {
+					if !inf.HasSynced() {
+						return false
+					}
+				}
+				return true
+			}
+			run = func(stopCh <-chan struct{}) {
+				for _, inf := range informersForKind {
+					go inf.Run(stopCh)
+				}
+			}
+		} else {
+			factory := pickFactory(s)
+			rc.factoryByKind[s.key] = factory
+			namespace := scopes[s.key].Namespace
+			if s.isClusterScoped {
+				namespace = ""
+			}
+			inf := buildInformer(s, factory, namespace)
+			if cfg.ListPageSize > 0 && s.pagedSetup != nil {
+				// Listers must read this informer's store, not the factory's
+				// (the factory's informer for this kind is never started).
+				rc.pagedInformers[s.key] = inf
+			}
+			if err := wireInformer(inf, s, idx); err != nil {
+				close(stopCh)
+				return nil, err
+			}
+			synced = inf.HasSynced
+			run = inf.Run
+		}
+
+		if delay := cfg.DebugSyncDelays[s.key]; delay > 0 {
+			inner := run
+			run = func(stopCh <-chan struct{}) {
+				stdlog.Printf("DEBUG: delaying %s informer start by %v (DebugSyncDelays)", s.key, delay)
+				select {
+				case <-time.After(delay):
+				case <-stopCh:
+					return
+				}
+				inner(stopCh)
+			}
+		}
 
 		isDeferred := deferredTypes[s.key]
-		entry := informerEntry{kind: s.kind, key: s.key, deferred: isDeferred, synced: inf.HasSynced, informer: inf}
+		entry := informerEntry{kind: s.kind, key: s.key, deferred: isDeferred, synced: synced, run: run}
 		allEntries = append(allEntries, entry)
 
 		if isDeferred && s.isEvent {
 			// Events sync independently — they can take 60s+ on large clusters
 			// and shouldn't block topology completion or warmup transition.
-			backgroundSyncFuncs = append(backgroundSyncFuncs, inf.HasSynced)
+			backgroundSyncFuncs = append(backgroundSyncFuncs, synced)
 			backgroundKeys = append(backgroundKeys, s.key)
+			if rc.backgroundKeys == nil {
+				rc.backgroundKeys = map[string]bool{}
+			}
+			rc.backgroundKeys[s.key] = true
 		} else if isDeferred {
-			deferredSyncFuncs = append(deferredSyncFuncs, inf.HasSynced)
+			deferredSyncFuncs = append(deferredSyncFuncs, synced)
 			deferredKeys = append(deferredKeys, s.key)
 		} else {
-			criticalSyncFuncs = append(criticalSyncFuncs, inf.HasSynced)
+			criticalSyncFuncs = append(criticalSyncFuncs, synced)
 		}
 	}
 
 	// Initialize per-informer tracking
 	statuses := make([]InformerSyncStatus, len(allEntries))
+	hasSynced := make([]func() bool, len(allEntries))
 	for i, e := range allEntries {
 		statuses[i] = InformerSyncStatus{Kind: e.kind, Key: e.key, Deferred: e.deferred}
+		hasSynced[i] = e.synced
 	}
 	rc.informerStatuses = statuses
+	rc.informerHasSynced = hasSynced
 
 	if enabledCount == 0 {
 		stdlog.Printf("Warning: No resource types are accessible (all RBAC checks failed)")
@@ -327,7 +660,7 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 	// bandwidth during the critical path.
 	for _, e := range allEntries {
 		if !e.deferred {
-			go e.informer.Run(stopCh)
+			go e.run(stopCh)
 		}
 	}
 
@@ -340,6 +673,15 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 	}
 	syncStart := time.Now()
 	rc.syncStartTime = syncStart
+
+	// Hand out the still-syncing handle for progressive per-kind reads.
+	// Deliberately after informer start + status registration + sync-start
+	// stamping and before the Phase-1 wait: the handle is structurally
+	// complete, only sync state is in flux, and KindReadinessFor answers
+	// that per kind.
+	if cfg.OnInformersStarted != nil {
+		cfg.OnInformersStarted(rc)
+	}
 
 	// Track per-informer sync completion in background goroutines.
 	// Each goroutine updates the InformerSyncStatus when its informer syncs.
@@ -557,16 +899,20 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 	case timedOut:
 		stdlog.Printf("WARNING: Critical sync timed out after %v — promoting %d informers to deferred: %s",
 			cfg.SyncTimeout, len(promoted), strings.Join(promoted, ", "))
-		stdlog.Printf("UI will render with partial data; promoted informers continue syncing in background")
+		stdlog.Printf("UI renders now; promoted kinds keep syncing in background and their views stay in a loading state until complete")
 		logf("    Phase 1 sync TIMED OUT (%d critical, %d promoted to deferred): %v",
 			len(criticalSyncFuncs), len(promoted), time.Since(syncStart))
+		rc.informerMu.Lock()
 		rc.promotedKinds = promoted
+		rc.informerMu.Unlock()
 	case patienceElapsed && len(promoted) > 0:
 		stdlog.Printf("First-paint ready after %v: minimal set synced; %d slower informers continue in background: %s",
 			time.Since(syncStart), len(promoted), strings.Join(promoted, ", "))
 		logf("    Phase 1 minimal-set sync (%d/%d critical, %d still loading): %v",
 			len(criticalSyncFuncs)-len(promoted), len(criticalSyncFuncs), len(promoted), time.Since(syncStart))
+		rc.informerMu.Lock()
 		rc.promotedKinds = promoted
+		rc.informerMu.Unlock()
 	default:
 		logf("    Phase 1 sync (%d critical informers): %v", len(criticalSyncFuncs), time.Since(syncStart))
 		stdlog.Printf("Critical resource caches synced in %v — UI can render", time.Since(syncStart))
@@ -610,21 +956,26 @@ func NewResourceCache(cfg CacheConfig) (*ResourceCache, error) {
 
 	rc.syncComplete.Store(true)
 
-	// Build deferred tracking state (includes both deferred and background keys)
+	// Build deferred tracking state (includes both deferred and background keys).
+	// The handle is already published to HTTP handlers (OnInformersStarted), so
+	// these fields must be installed under deferredMu — /api/connection polls
+	// GetSyncSnapshot sub-second during the connecting phase and reads them.
 	allDeferredKeys := append(append([]string{}, deferredKeys...), backgroundKeys...)
 	deferredSynced := make(map[string]bool, len(allDeferredKeys))
 	for _, k := range allDeferredKeys {
 		deferredSynced[k] = false
 	}
 	deferredDone := make(chan struct{})
+	rc.deferredMu.Lock()
 	rc.deferredSynced = deferredSynced
 	rc.deferredDone = deferredDone
+	rc.deferredMu.Unlock()
 
 	// Phase 2: Start deferred informers now that critical sync is done,
 	// then wait for them in background. This staggers the API server load.
 	for _, e := range allEntries {
 		if e.deferred {
-			go e.informer.Run(stopCh)
+			go e.run(stopCh)
 		}
 	}
 
@@ -777,12 +1128,26 @@ func buildInformerSetups() []informerSetup {
 	mk := func(key, kind string, isEvent, clusterScoped bool, fn func(f informers.SharedInformerFactory) cache.SharedIndexInformer) entry {
 		return entry{key: key, kind: kind, setup: fn, isEvent: isEvent, isClusterScoped: clusterScoped}
 	}
+	// withPaging marks a high-cardinality kind as paginatable: when
+	// CacheConfig.ListPageSize > 0, its initial LIST is fetched in pages.
+	withPaging := func(e entry, paged func(client kubernetes.Interface, namespace string, pageSize int64) cache.SharedIndexInformer) entry {
+		e.pagedSetup = paged
+		return e
+	}
 	return []informerSetup{
 		mk(Services, "Service", false, false, func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
 			return f.Core().V1().Services().Informer()
 		}),
-		mk(Pods, "Pod", false, false, func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+		withPaging(mk(Pods, "Pod", false, false, func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
 			return f.Core().V1().Pods().Informer()
+		}), func(client kubernetes.Interface, ns string, pageSize int64) cache.SharedIndexInformer {
+			return newPagedInformer(&corev1.Pod{}, pageSize,
+				func(ctx context.Context, o metav1.ListOptions) (apiruntime.Object, error) {
+					return client.CoreV1().Pods(ns).List(ctx, o)
+				},
+				func(ctx context.Context, o metav1.ListOptions) (watch.Interface, error) {
+					return client.CoreV1().Pods(ns).Watch(ctx, o)
+				})
 		}),
 		mk(Nodes, "Node", false, true, func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
 			return f.Core().V1().Nodes().Informer()
@@ -814,8 +1179,16 @@ func buildInformerSetups() []informerSetup {
 		mk(StatefulSets, "StatefulSet", false, false, func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
 			return f.Apps().V1().StatefulSets().Informer()
 		}),
-		mk(ReplicaSets, "ReplicaSet", false, false, func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+		withPaging(mk(ReplicaSets, "ReplicaSet", false, false, func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
 			return f.Apps().V1().ReplicaSets().Informer()
+		}), func(client kubernetes.Interface, ns string, pageSize int64) cache.SharedIndexInformer {
+			return newPagedInformer(&appsv1.ReplicaSet{}, pageSize,
+				func(ctx context.Context, o metav1.ListOptions) (apiruntime.Object, error) {
+					return client.AppsV1().ReplicaSets(ns).List(ctx, o)
+				},
+				func(ctx context.Context, o metav1.ListOptions) (watch.Interface, error) {
+					return client.AppsV1().ReplicaSets(ns).Watch(ctx, o)
+				})
 		}),
 		mk(Ingresses, "Ingress", false, false, func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
 			return f.Networking().V1().Ingresses().Informer()
@@ -858,6 +1231,9 @@ func buildInformerSetups() []informerSetup {
 		}),
 		mk(LimitRanges, "LimitRange", false, false, func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
 			return f.Core().V1().LimitRanges().Informer()
+		}),
+		mk(ResourceQuotas, "ResourceQuota", false, false, func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+			return f.Core().V1().ResourceQuotas().Informer()
 		}),
 	}
 }
@@ -951,6 +1327,10 @@ func (rc *ResourceCache) enqueueChange(ch chan<- ResourceChange, kind string, ob
 		UID:       uid,
 		Operation: op,
 		Diff:      diff,
+	}
+
+	if rc.config.OnObservedChange != nil {
+		rc.safeCallback("OnObservedChange", func() { rc.config.OnObservedChange(change, obj, oldObj) })
 	}
 
 	// Fire OnChange callback (before channel send, matching existing behavior)
@@ -1116,6 +1496,69 @@ func (rc *ResourceCache) Changes() <-chan ResourceChange {
 	return rc.changes
 }
 
+// IsKindClusterWide reports whether the informer for the given resource (plural
+// lowercase name, e.g. "services") is enabled and watches ALL namespaces. When
+// true, the lister's contents are authoritative cluster-wide; when false
+// (disabled or namespace-scoped fallback), reads only cover a subset of
+// namespaces, so callers must not infer cluster-wide absence from a miss.
+func (rc *ResourceCache) IsKindClusterWide(resource string) bool {
+	if rc == nil {
+		return false
+	}
+	s, ok := rc.config.ResourceScopes[resource]
+	return ok && s.Enabled && s.Namespace == "" && len(rc.config.ResourceScopeNamespaces[resource]) == 0
+}
+
+// KindCoversNamespace reports whether the informer for a resource (plural
+// lowercase, e.g. "pods") reliably covers the given namespace - cluster-wide, or
+// namespace-scoped to exactly that namespace. When it returns false, an EMPTY
+// list for that namespace is NOT authoritative: the informer may simply not watch
+// it (namespace-scoped RBAC), so callers must not infer "0 objects" from a miss.
+// A nil ResourceScopes is the legacy/cluster-wide default and covers everything.
+func (rc *ResourceCache) KindCoversNamespace(resource, ns string) bool {
+	if rc == nil {
+		return false
+	}
+	if rc.config.ResourceScopes == nil {
+		return true
+	}
+	s, ok := rc.config.ResourceScopes[resource]
+	if !ok || !s.Enabled {
+		return false
+	}
+	if s.Namespace == "" {
+		return true
+	}
+	for _, watched := range resourceScopeNamespaces(resource, s, rc.config.ResourceScopeNamespaces) {
+		if watched == ns {
+			return true
+		}
+	}
+	return false
+}
+
+// KindNamespaces returns the namespaces covered by a namespaced informer.
+// A nil result means the kind is cluster-wide or disabled.
+func (rc *ResourceCache) KindNamespaces(resource string) []string {
+	if rc == nil {
+		return nil
+	}
+	s, ok := rc.config.ResourceScopes[resource]
+	if !ok || !s.Enabled || s.Namespace == "" {
+		return nil
+	}
+	return append([]string(nil), resourceScopeNamespaces(resource, s, rc.config.ResourceScopeNamespaces)...)
+}
+
+func (rc *ResourceCache) IsKindReady(resource string) bool {
+	// Answer from the informer's own HasSynced, like every other readiness
+	// probe — the tracked Synced flag lags it, so capacity checks and
+	// missing-reference detectors would briefly disagree with what the
+	// resource handlers already serve.
+	synced, known := rc.InformerSynced(resource)
+	return known && synced
+}
+
 // ChangesRaw returns the bidirectional channel for internal use.
 func (rc *ResourceCache) ChangesRaw() chan ResourceChange {
 	if rc == nil {
@@ -1133,6 +1576,8 @@ func (rc *ResourceCache) PromotedKinds() []string {
 	if rc == nil {
 		return nil
 	}
+	rc.informerMu.RLock()
+	defer rc.informerMu.RUnlock()
 	return rc.promotedKinds
 }
 
@@ -1141,11 +1586,14 @@ func (rc *ResourceCache) PromotedKinds() []string {
 // background informers finish, so a UI bound to this method shows a
 // truthful "still loading" indicator.
 func (rc *ResourceCache) PendingPromotedKinds() []string {
-	if rc == nil || len(rc.promotedKinds) == 0 {
+	if rc == nil {
 		return nil
 	}
 	rc.informerMu.RLock()
 	defer rc.informerMu.RUnlock()
+	if len(rc.promotedKinds) == 0 {
+		return nil
+	}
 	syncedByKind := make(map[string]bool, len(rc.informerStatuses))
 	for _, s := range rc.informerStatuses {
 		if s.Synced {
@@ -1176,8 +1624,15 @@ func (rc *ResourceCache) IsDeferredSynced() bool {
 	if rc == nil {
 		return false
 	}
+	rc.deferredMu.RLock()
+	done := rc.deferredDone
+	rc.deferredMu.RUnlock()
+	if done == nil {
+		// Phase 1 still running: tracking state not installed yet.
+		return false
+	}
 	select {
-	case <-rc.deferredDone:
+	case <-done:
 		return !rc.deferredFailed.Load()
 	default:
 		return false
@@ -1190,7 +1645,35 @@ func (rc *ResourceCache) DeferredDone() <-chan struct{} {
 	if rc == nil {
 		return nil
 	}
+	rc.deferredMu.RLock()
+	defer rc.deferredMu.RUnlock()
 	return rc.deferredDone
+}
+
+// InformerSynced reports one informer's initial-sync state. `known` is false
+// when this cache never started that kind, so a caller can tell "not ready"
+// from "not watched at all" instead of failing closed on both. Callers that
+// need one kind must use this rather than IsDeferredSynced, which stays false
+// while any unrelated deferred informer is warming or has permanently failed.
+//
+// It answers from the informer's own HasSynced, not the Synced flag the
+// tracking goroutine writes ~10ms later: a caller gating a read on this would
+// otherwise refuse to serve a cache that is in fact ready.
+func (rc *ResourceCache) InformerSynced(key string) (synced, known bool) {
+	if rc == nil {
+		return false, false
+	}
+	rc.informerMu.RLock()
+	defer rc.informerMu.RUnlock()
+	for i, status := range rc.informerStatuses {
+		if status.Key == key {
+			if i < len(rc.informerHasSynced) && rc.informerHasSynced[i] != nil {
+				return rc.informerHasSynced[i](), true
+			}
+			return status.Synced, true
+		}
+	}
+	return false, false
 }
 
 // GetSyncStatus returns the current sync status of all informers for diagnostics.
@@ -1255,7 +1738,7 @@ func (rc *ResourceCache) GetSyncStatus() CacheSyncStatus {
 		Informers:       statuses,
 		PendingCritical: pendingCritical,
 		PendingDeferred: pendingDeferred,
-		PromotedKinds:   rc.promotedKinds,
+		PromotedKinds:   rc.PromotedKinds(),
 	}
 	if !rc.syncStartTime.IsZero() {
 		result.SyncStarted = rc.syncStartTime.Format(time.RFC3339)
@@ -1325,12 +1808,35 @@ var allKindListers = []kindLister{
 	{"RoleBinding", "rbac.authorization.k8s.io", func(rc *ResourceCache) any { return rc.RoleBindings() }},
 	{"ClusterRoleBinding", "rbac.authorization.k8s.io", func(rc *ResourceCache) any { return rc.ClusterRoleBindings() }},
 	{"LimitRange", "", func(rc *ResourceCache) any { return rc.LimitRanges() }},
+	{"ResourceQuota", "", func(rc *ResourceCache) any { return rc.ResourceQuotas() }},
 }
 
 // AllKindListers returns the table of all resource kinds with their group and lister.
 // Used by the resource-counts endpoint to enumerate typed resources.
 func AllKindListers() []kindLister {
 	return allKindListers
+}
+
+// KindReadinessForKindName is KindReadinessFor keyed by the Kind name
+// ("Pod") instead of the informer key ("pods") — for callers that enumerate
+// the kindLister table, which carries Kinds only.
+func (rc *ResourceCache) KindReadinessForKindName(kind string) KindReadiness {
+	if rc == nil {
+		return KindUnavailable
+	}
+	key := ""
+	rc.informerMu.RLock()
+	for _, status := range rc.informerStatuses {
+		if status.Kind == kind {
+			key = status.Key
+			break
+		}
+	}
+	rc.informerMu.RUnlock()
+	if key == "" {
+		return KindUnavailable
+	}
+	return rc.KindReadinessFor(key)
 }
 
 // Kind returns the resource kind name.
@@ -1387,8 +1893,139 @@ func (rc *ResourceCache) isReady(key string) bool {
 		return true
 	}
 	rc.deferredMu.RLock()
-	defer rc.deferredMu.RUnlock()
-	return rc.deferredSynced[key]
+	done := rc.deferredSynced[key]
+	rc.deferredMu.RUnlock()
+	if done {
+		return true
+	}
+	// The deferred tracker freezes its map when the deferred deadline fires;
+	// a kind whose LIST completes after that still has a fully-synced store.
+	// Ask the informer itself, so the lister and KindReadinessFor (which also
+	// reads live HasSynced) agree — otherwise a late-synced kind reports
+	// KindReady at the gate and then 403s off a nil lister forever.
+	synced, known := rc.InformerSynced(key)
+	return known && synced
+}
+
+// KindReadiness classifies a typed kind's serveability. It is meaningful at
+// any point in the cache lifecycle, including during the Phase-1 sync wait
+// (via the OnInformersStarted handle).
+type KindReadiness int
+
+const (
+	// KindUnavailable: no informer for this kind (RBAC-disabled, unknown key,
+	// or not part of the typed set). Callers fall through to their existing
+	// forbidden/not-found/dynamic semantics.
+	KindUnavailable KindReadiness = iota
+	// KindPending: the informer exists but its initial LIST hasn't completed.
+	// Serving now would render a partial store as truth — callers must
+	// respond "still loading", never an incomplete list.
+	KindPending
+	// KindReady: the informer's store is complete; serve normally.
+	KindReady
+	// KindFailed: the deferred-sync deadline fired with this kind still
+	// unsynced — terminal for this cache generation. Callers should return a
+	// terminal error, not "retry shortly".
+	KindFailed
+)
+
+// KindReadinessFor reports whether key can be served from this cache right
+// now. Keys are informer keys (lowercase plural, e.g. "pods") — the same
+// vocabulary as DeferredTypes and InformerSyncStatus.Key.
+func (rc *ResourceCache) KindReadinessFor(key string) KindReadiness {
+	if rc == nil || !rc.isEnabled(key) {
+		return KindUnavailable
+	}
+	synced, known := rc.InformerSynced(key)
+	if !known {
+		return KindUnavailable
+	}
+	if synced {
+		return KindReady
+	}
+	if rc.deferredFailed.Load() && !rc.backgroundKeys[key] {
+		// The give-up deadline only covers kinds in the deferred tracking set
+		// (statically deferred + promoted criticals). A kind mid-Phase-1 is
+		// still pending even if a previous generation's flag lingers — the
+		// tracking map tells them apart. Background kinds (Events) share the
+		// tracking map but have no deadline: they stay pending, not failed.
+		rc.deferredMu.RLock()
+		_, tracked := rc.deferredSynced[key]
+		rc.deferredMu.RUnlock()
+		if tracked {
+			return KindFailed
+		}
+	}
+	return KindPending
+}
+
+// KindSyncState is one kind's live sync state in a SyncSnapshot.
+type KindSyncState struct {
+	Kind     string `json:"kind"`
+	Key      string `json:"key"`
+	Synced   bool   `json:"synced"`
+	Deferred bool   `json:"deferred"`
+	// Failed marks a kind whose sync deadline fired without completing —
+	// terminal for this connection. The shell renders these as errors
+	// instead of promising they will finish loading.
+	Failed bool `json:"failed,omitempty"`
+}
+
+// SyncSnapshot is a lightweight progress report for connection-status
+// payloads: per-kind live sync state without the lister walks GetSyncStatus
+// does for item counts. Cheap enough for sub-second polling during sync.
+type SyncSnapshot struct {
+	Phase          SyncPhase       `json:"phase"`
+	CriticalTotal  int             `json:"criticalTotal"`
+	CriticalSynced int             `json:"criticalSynced"`
+	DeferredTotal  int             `json:"deferredTotal"`
+	DeferredSynced int             `json:"deferredSynced"`
+	Kinds          []KindSyncState `json:"kinds"`
+}
+
+// GetSyncSnapshot returns the live per-kind sync state. Unlike GetSyncStatus
+// it reads each informer's HasSynced directly (no status-goroutine lag) and
+// never touches listers.
+func (rc *ResourceCache) GetSyncSnapshot() SyncSnapshot {
+	if rc == nil {
+		return SyncSnapshot{Phase: SyncPhaseNotStarted}
+	}
+	rc.informerMu.RLock()
+	statuses := make([]InformerSyncStatus, len(rc.informerStatuses))
+	copy(statuses, rc.informerStatuses)
+	rc.informerMu.RUnlock()
+
+	snap := SyncSnapshot{Kinds: make([]KindSyncState, 0, len(statuses))}
+	for _, s := range statuses {
+		readiness := rc.KindReadinessFor(s.Key)
+		synced := readiness == KindReady
+		snap.Kinds = append(snap.Kinds, KindSyncState{
+			Kind: s.Kind, Key: s.Key, Synced: synced, Deferred: s.Deferred,
+			Failed: readiness == KindFailed,
+		})
+		if s.Deferred {
+			snap.DeferredTotal++
+			if synced {
+				snap.DeferredSynced++
+			}
+		} else {
+			snap.CriticalTotal++
+			if synced {
+				snap.CriticalSynced++
+			}
+		}
+	}
+	switch {
+	case rc.syncStartTime.IsZero():
+		snap.Phase = SyncPhaseNotStarted
+	case !rc.syncComplete.Load():
+		snap.Phase = SyncPhaseCritical
+	case !rc.IsDeferredSynced():
+		snap.Phase = SyncPhaseDeferred
+	default:
+		snap.Phase = SyncPhaseComplete
+	}
+	return snap
 }
 
 // IsDeferredPending returns true when the resource type passed RBAC checks
@@ -1410,6 +2047,14 @@ func (rc *ResourceCache) IsDeferredPending(key string) bool {
 		return false
 	}
 	rc.deferredMu.RLock()
-	defer rc.deferredMu.RUnlock()
-	return !rc.deferredSynced[key]
+	done := rc.deferredSynced[key]
+	rc.deferredMu.RUnlock()
+	if done {
+		return false
+	}
+	// Same live fallback as isReady: the tracking goroutine marks the map a
+	// beat after HasSynced flips, and the two answers must agree — otherwise
+	// a just-synced kind serves from its lister while this still says 503.
+	synced, known := rc.InformerSynced(key)
+	return !(known && synced)
 }

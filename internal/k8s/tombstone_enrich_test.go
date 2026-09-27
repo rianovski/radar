@@ -1,0 +1,274 @@
+package k8s
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/skyhook-io/radar/internal/timeline"
+	"github.com/skyhook-io/radar/pkg/k8score"
+)
+
+func tombstoneTestPod(name string, created time.Time) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "shop",
+			UID:               types.UID("pod-" + name),
+			CreationTimestamp: metav1.NewTime(created),
+			Labels:            map[string]string{"app": "web", "app.kubernetes.io/name": "web"},
+			OwnerReferences: []metav1.OwnerReference{{
+				Kind:       "ReplicaSet",
+				Name:       "web-rs",
+				Controller: boolPtr(true),
+			}},
+		},
+	}
+}
+
+func initMemoryTimeline(t *testing.T) {
+	t.Helper()
+	timeline.ResetStore()
+	if err := timeline.InitStore(timeline.StoreConfig{Type: timeline.StoreTypeMemory, MaxSize: 100}); err != nil {
+		t.Fatalf("InitStore: %v", err)
+	}
+	// Clean tombstone cache (resourceCache is nil in tests, so this is safe).
+	ResetResourceCache()
+	t.Cleanup(timeline.ResetStore)
+}
+
+func k8sEventPod(name, reason string) *corev1.Event {
+	return &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name + ".evt",
+			Namespace: "shop",
+			UID:       types.UID("evt-" + name),
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:       "Pod",
+			APIVersion: "v1",
+			Namespace:  "shop",
+			Name:       name,
+			// Real K8s Events carry the involved object's UID; the tombstone
+			// key is UID-first, so the fixture must too.
+			UID: types.UID("pod-" + name),
+		},
+		Reason:         reason,
+		Message:        "Stopping container web",
+		Type:           "Normal",
+		LastTimestamp:  metav1.NewTime(time.Now()),
+		FirstTimestamp: metav1.NewTime(time.Now()),
+		Count:          1,
+	}
+}
+
+func k8sEventFromStore(t *testing.T) timeline.TimelineEvent {
+	t.Helper()
+	events, err := timeline.GetStore().Query(context.Background(), timeline.QueryOptions{
+		Kinds:            []string{"Pod"},
+		IncludeManaged:   true,
+		IncludeK8sEvents: true,
+	})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	for _, e := range events {
+		if e.Source == timeline.SourceK8sEvent {
+			return e
+		}
+	}
+	t.Fatal("no k8s_event recorded")
+	return timeline.TimelineEvent{}
+}
+
+// A "Killing"-class K8s Event arrives after its involved Pod has left the
+// informer cache. Because the delete fed the tombstone with the final object's
+// enrichment, the event still ships owner + labels + createdAt as fact.
+func TestK8sEvent_TombstoneEnrichesAfterDelete(t *testing.T) {
+	initMemoryTimeline(t)
+
+	created := time.Now().Add(-45 * time.Minute)
+	pod := tombstoneTestPod("web-abc", created)
+
+	// Informer delete: production passes the deleted object as newObj, oldObj=nil.
+	recordToTimelineStore(ActiveClusterContext(), "Pod", "shop", "web-abc", string(pod.UID), "delete", nil, pod, nil, false)
+
+	// Late K8s event; live cache is empty (GetResourceCache()==nil), so
+	// enrichment must come from the tombstone.
+	recordK8sEventToTimeline(ActiveClusterContext(), k8sEventPod("web-abc", "Killing"))
+
+	got := k8sEventFromStore(t)
+	if got.Owner == nil || got.Owner.Kind != "ReplicaSet" || got.Owner.Name != "web-rs" {
+		t.Fatalf("owner not enriched from tombstone: %+v", got.Owner)
+	}
+	if got.Labels == nil || got.Labels["app.kubernetes.io/name"] != "web" {
+		t.Fatalf("labels not enriched from tombstone: %+v", got.Labels)
+	}
+	if got.CreatedAt == nil || !got.CreatedAt.Equal(created) {
+		t.Fatalf("createdAt not stamped from tombstone: %v", got.CreatedAt)
+	}
+}
+
+// Without a tombstone (or live cache) the event ships anonymous — the silent
+// null-enrichment fallback, unchanged from before the cache existed.
+func TestK8sEvent_MissStaysSilentNull(t *testing.T) {
+	initMemoryTimeline(t)
+
+	recordK8sEventToTimeline(ActiveClusterContext(), k8sEventPod("ghost", "Killing"))
+
+	got := k8sEventFromStore(t)
+	if got.Owner != nil {
+		t.Fatalf("expected nil owner on miss, got %+v", got.Owner)
+	}
+	if got.Labels != nil {
+		t.Fatalf("expected nil labels on miss, got %+v", got.Labels)
+	}
+	if got.CreatedAt != nil {
+		t.Fatalf("expected nil createdAt on miss, got %v", got.CreatedAt)
+	}
+}
+
+// An informer add feeds the tombstone too, so a later event for a still-recent
+// (or just-evicted) object is enriched even without a delete.
+func TestK8sEvent_TombstoneFedOnAdd(t *testing.T) {
+	initMemoryTimeline(t)
+	initialSyncComplete.Store(true)
+	t.Cleanup(func() { initialSyncComplete.Store(false) })
+
+	created := time.Now() // fresh add (age <= 30s so it is recorded, not treated as sync)
+	pod := tombstoneTestPod("web-new", created)
+	recordToTimelineStore(ActiveClusterContext(), "Pod", "shop", "web-new", string(pod.UID), "add", nil, pod, nil, false)
+
+	recordK8sEventToTimeline(ActiveClusterContext(), k8sEventPod("web-new", "Started"))
+
+	got := k8sEventFromStore(t)
+	if got.Owner == nil || got.Owner.Name != "web-rs" {
+		t.Fatalf("owner not enriched from add-fed tombstone: %+v", got.Owner)
+	}
+	if got.CreatedAt == nil || !got.CreatedAt.Equal(created) {
+		t.Fatalf("createdAt not stamped: %v", got.CreatedAt)
+	}
+}
+
+// A callback whose object can't be unwrapped (extract failure) must not feed
+// the tombstone — an empty entry would clobber the enrichment a prior good
+// entry was preserving.
+func TestK8sEvent_FailedExtractDoesNotClobberTombstone(t *testing.T) {
+	initMemoryTimeline(t)
+
+	created := time.Now().Add(-45 * time.Minute)
+	pod := tombstoneTestPod("web-abc", created)
+	recordToTimelineStore(ActiveClusterContext(), "Pod", "shop", "web-abc", string(pod.UID), "delete", nil, pod, nil, false)
+
+	// Same resource identity, but a payload ExtractTombstoneEntry can't
+	// unwrap (not a metav1.Object, not a DeletedFinalStateUnknown).
+	recordToTimelineStore(ActiveClusterContext(), "Pod", "shop", "web-abc", string(pod.UID), "delete", nil, "not-an-object", nil, false)
+
+	recordK8sEventToTimeline(ActiveClusterContext(), k8sEventPod("web-abc", "Killing"))
+
+	got := k8sEventFromStore(t)
+	if got.Owner == nil || got.Owner.Kind != "ReplicaSet" || got.Owner.Name != "web-rs" {
+		t.Fatalf("prior good tombstone entry was clobbered: owner = %+v", got.Owner)
+	}
+	if got.Labels == nil || got.Labels["app.kubernetes.io/name"] != "web" {
+		t.Fatalf("prior good tombstone entry was clobbered: labels = %+v", got.Labels)
+	}
+	if got.CreatedAt == nil || !got.CreatedAt.Equal(created) {
+		t.Fatalf("prior good tombstone entry was clobbered: createdAt = %v", got.CreatedAt)
+	}
+}
+
+// The typed ReplicaSet lister is keyed by namespace/name alone, so an event must
+// prove it names that exact object — the built-in group and the object's UID —
+// before the live object's owner is attached to it.
+func TestK8sEvent_LiveEnrichmentRequiresExactSubject(t *testing.T) {
+	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "shop", Name: "web-rs", UID: types.UID("rs-live"),
+		OwnerReferences: []metav1.OwnerReference{controllerRef("Deployment", "web")},
+	}}
+	cache := newOwnershipCache(t, map[string]bool{k8score.Pods: true, k8score.ReplicaSets: true}, rs)
+	previous := resourceCache.Swap(cache)
+	t.Cleanup(func() { resourceCache.Store(previous) })
+
+	event := func(apiVersion, uid string) *corev1.Event {
+		return &corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "shop", Name: "web-rs.evt"},
+			InvolvedObject: corev1.ObjectReference{
+				Kind: "ReplicaSet", APIVersion: apiVersion, Namespace: "shop", Name: "web-rs", UID: types.UID(uid),
+			},
+		}
+	}
+	for _, tc := range []struct {
+		name         string
+		event        *corev1.Event
+		wantEnriched bool
+		wantEvidence timeline.OwnerEvidence
+	}{
+		{"the exact object", event("apps/v1", "rs-live"), true, timeline.OwnerEnriched},
+		{"no UID cannot identify the subject", event("apps/v1", ""), false, timeline.OwnerUnidentified},
+		{"an earlier incarnation", event("apps/v1", "rs-deleted"), false, timeline.OwnerMissed},
+		{"a same-named ReplicaSet of another group", event("example.com/v1", "rs-live"), false, timeline.OwnerMissed},
+		{"no apiVersion cannot prove the group", event("", "rs-live"), false, timeline.OwnerMissed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			owner, _, _, evidence := enrichInvolvedObject(tc.event)
+			if tc.wantEnriched != (owner != nil && owner.Kind == "Deployment" && owner.Name == "web") {
+				t.Fatalf("owner = %+v, want enriched=%v", owner, tc.wantEnriched)
+			}
+			if evidence != tc.wantEvidence {
+				t.Fatalf("evidence = %q, want %q", evidence, tc.wantEvidence)
+			}
+			if tc.wantEnriched && owner.APIVersion != "apps/v1" {
+				t.Fatalf("owner reference incomplete: %+v", owner)
+			}
+		})
+	}
+}
+
+// An informer row records its owner as observed on the object at that moment;
+// the historical rows extracted alongside it carry the same owner as
+// reconstructed — the object's current owner applied to earlier timestamps —
+// and the object's own UID.
+func TestInformerAdd_RecordsOwnerEvidence(t *testing.T) {
+	initMemoryTimeline(t)
+	initialSyncComplete.Store(true)
+	t.Cleanup(func() { initialSyncComplete.Store(false) })
+
+	pod := tombstoneTestPod("web-ev", time.Now())
+	pod.OwnerReferences[0].APIVersion = "apps/v1"
+	pod.OwnerReferences[0].UID = types.UID("rs-uid")
+	recordToTimelineStore(ActiveClusterContext(), "Pod", "shop", "web-ev", string(pod.UID), "add", nil, pod, nil, false)
+
+	events, err := timeline.GetStore().Query(context.Background(), timeline.QueryOptions{
+		Kinds: []string{"Pod"}, IncludeManaged: true,
+	})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	want := timeline.OwnerInfo{Kind: "ReplicaSet", Name: "web-rs", APIVersion: "apps/v1", UID: "rs-uid"}
+	seen := map[timeline.EventSource]bool{}
+	for _, e := range events {
+		seen[e.Source] = true
+		if e.Owner == nil || *e.Owner != want {
+			t.Fatalf("%s row owner = %+v, want %+v", e.Source, e.Owner, want)
+		}
+		switch e.Source {
+		case timeline.SourceInformer:
+			if e.OwnerEvidence != timeline.OwnerObserved {
+				t.Fatalf("informer row evidence = %q", e.OwnerEvidence)
+			}
+		case timeline.SourceHistorical:
+			if e.OwnerEvidence != timeline.OwnerReconstructed || e.UID != string(pod.UID) {
+				t.Fatalf("historical row evidence = %q uid = %q", e.OwnerEvidence, e.UID)
+			}
+		}
+	}
+	if !seen[timeline.SourceInformer] || !seen[timeline.SourceHistorical] {
+		t.Fatalf("expected informer and historical rows, got %v", seen)
+	}
+}

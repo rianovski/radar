@@ -27,8 +27,10 @@ type Memoizer struct {
 }
 
 type memoEntry struct {
-	topo    *Topology
-	builtAt time.Time
+	topo      *Topology
+	builtAt   time.Time
+	indexOnce sync.Once           // guards lazy build of index
+	index     *RelationshipsIndex // populated by Memoizer.GetIndex on first call
 }
 
 // NewMemoizer returns a Memoizer with the given TTL. A zero or negative TTL
@@ -75,6 +77,35 @@ func (m *Memoizer) lookup(key string) (*Topology, bool) {
 		return e.topo, true
 	}
 	return nil, false
+}
+
+// GetIndex returns the RelationshipsIndex for the topology produced by build
+// under opts. The index is computed lazily on first call and cached alongside
+// the topology entry, so subsequent GetIndex calls for the same entry are O(1)
+// map lookups. Falls through to an inline build when the underlying entry has
+// been evicted between the topology fetch and the index fetch, or when the
+// Memoizer is disabled (ttl ≤ 0).
+func (m *Memoizer) GetIndex(opts BuildOptions, build func() (*Topology, error)) (*RelationshipsIndex, error) {
+	topo, err := m.Get(opts, build)
+	if err != nil {
+		return nil, err
+	}
+	if m == nil || m.ttl <= 0 {
+		return IndexByResource(topo), nil
+	}
+	key := memoKey(opts)
+	m.mu.Lock()
+	entry := m.entries[key]
+	m.mu.Unlock()
+	// Entry evicted between Get() and GetIndex() — build inline and return.
+	// Costs one extra walk but keeps the API correct under aggressive eviction.
+	if entry == nil || entry.topo != topo {
+		return IndexByResource(topo), nil
+	}
+	entry.indexOnce.Do(func() {
+		entry.index = IndexByResource(entry.topo)
+	})
+	return entry.index, nil
 }
 
 func (m *Memoizer) store(key string, topo *Topology) {

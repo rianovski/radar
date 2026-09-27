@@ -1,24 +1,44 @@
 import { Component, ReactNode } from 'react'
 import { AlertTriangle, RefreshCw } from 'lucide-react'
+import { recordUsageEvent } from '../../api/usage-data'
 
 interface Props {
   children: ReactNode
+  /**
+   * Clears a caught error whenever this value changes - pass whatever selects
+   * the children, typically the route. A boundary latches: nothing resets
+   * hasError on its own, so without this a view that throws keeps the fallback
+   * on screen and navigating away cannot escape it. Preferred over remounting
+   * via `key`, which would also discard the children's state on every change
+   * while nothing is wrong.
+   */
+  resetKey: string | number
+  /** Fixed name of the screen inside, counted in usage stats when it crashes. */
+  usageLabel?: string
 }
 
 interface State {
   hasError: boolean
   error: Error | null
+  resetKey: string | number
 }
 
 export class ErrorBoundary extends Component<Props, State> {
-  state: State = { hasError: false, error: null }
+  state: State = { hasError: false, error: null, resetKey: this.props.resetKey }
 
-  static getDerivedStateFromError(error: Error): State {
+  static getDerivedStateFromError(error: Error): Pick<State, 'hasError' | 'error'> {
     return { hasError: true, error }
+  }
+
+  static getDerivedStateFromProps(props: Props, state: State): State | null {
+    if (Object.is(props.resetKey, state.resetKey)) return null
+    return { hasError: false, error: null, resetKey: props.resetKey }
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
     console.error('[ErrorBoundary]', error, info.componentStack)
+    // Only which screen crashed is counted, never the message.
+    if (this.props.usageLabel) recordUsageEvent({ type: 'ui', name: `ui_error:${this.props.usageLabel}` })
   }
 
   handleReset = () => this.setState({ hasError: false, error: null })

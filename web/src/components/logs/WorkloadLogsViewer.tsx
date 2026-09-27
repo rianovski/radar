@@ -9,23 +9,28 @@ interface WorkloadLogsViewerProps {
   kind: string
   namespace: string
   name: string
+  /** Start streaming on mount. Default true — workload logs are aggregated from live pods. */
+  snapshotOnly?: boolean
+  role?: string
+  autoStream?: boolean
 }
 
-export function WorkloadLogsViewer({ kind, namespace, name }: WorkloadLogsViewerProps) {
+export function WorkloadLogsViewer({ kind, namespace, name, autoStream = true, snapshotOnly = false, role }: WorkloadLogsViewerProps) {
   const desktopDownload = useDesktopDownload()
   const { theme } = useTheme()
 
   const fetchAll = useCallback(async (params: WorkloadLogsFetchParams): Promise<WorkloadLogsResult> => {
     const query = new URLSearchParams()
     if (params.container) query.set('container', params.container)
+    if (role) query.set('role', role)
     if (params.tailLines) query.set('tailLines', String(params.tailLines))
     if (params.sinceSeconds) query.set('sinceSeconds', String(params.sinceSeconds))
     const qs = query.toString()
     const data = await fetchJSON<WorkloadLogsResult>(
-      `/workloads/${kind}/${namespace}/${name}/logs${qs ? `?${qs}` : ''}`
+      `${snapshotOnly ? `/jobsets/${namespace}/${name}` : `/workloads/${kind}/${namespace}/${name}`}/logs${qs ? `?${qs}` : ''}`, { signal: params.signal }
     )
     return data
-  }, [kind, namespace, name])
+  }, [kind, namespace, name, snapshotOnly, role])
 
   const makeStream = useCallback((params: WorkloadLogsFetchParams) => {
     return createWorkloadLogStream(kind, namespace, name, params)
@@ -35,9 +40,10 @@ export function WorkloadLogsViewer({ kind, namespace, name }: WorkloadLogsViewer
     <SharedWorkloadLogsViewer
       name={name}
       fetchAll={fetchAll}
-      createStream={makeStream}
+      createStream={snapshotOnly ? undefined : makeStream}
       overrideDownload={desktopDownload}
       forceDark={theme === 'dark' ? true : undefined}
+      autoStream={autoStream}
     />
   )
 }

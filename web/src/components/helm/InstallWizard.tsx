@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { X, Package, ChevronRight, ChevronLeft, Play, Loader2, AlertTriangle, CheckCircle, User, BookOpen, Link as LinkIcon, Star, BadgeCheck, Shield, Globe, Building2, Plus, Minus, Terminal } from 'lucide-react'
-import { PaneLoader } from '@skyhook-io/k8s-ui'
+import { PaneLoader, Input } from '@skyhook-io/k8s-ui'
 import { clsx } from 'clsx'
 import yaml from 'yaml'
 import { createPatch } from 'diff'
@@ -9,6 +9,7 @@ import { useChartDetail, useNamespaces, useArtifactHubChart, installChartWithPro
 import { useCanHelmAct } from '../../api/client'
 import type { ChartSource, ChartDetail, ArtifactHubChartDetail } from '../../types'
 import { YamlEditor } from '../ui/YamlEditor'
+import { Collapse, CollapseChevron, useDisclosure } from '@skyhook-io/k8s-ui/components/ui/Collapse'
 import { Tooltip } from '../ui/Tooltip'
 import { Markdown } from '../ui/Markdown'
 import { SEVERITY_BADGE, SEVERITY_TEXT } from '../../utils/badge-colors'
@@ -28,7 +29,6 @@ function deepMerge(base: Record<string, unknown>, overrides: Record<string, unkn
   }
   return result
 }
-
 interface InstallWizardProps {
   repo: string
   chartName: string
@@ -106,11 +106,11 @@ export function InstallWizard({ repo, chartName, version, source, repoUrl, defau
       }
     }
     if (baseValues && defaultValues) {
-      setValuesYaml(yaml.stringify(deepMerge(baseValues, defaultValues)))
+      setValuesYaml(yaml.stringify(deepMerge(baseValues, defaultValues), { lineWidth: 0 }))
     } else if (defaultValues && !baseValues) {
-      setValuesYaml(yaml.stringify(defaultValues))
+      setValuesYaml(yaml.stringify(defaultValues, { lineWidth: 0 }))
     } else if (baseValues) {
-      setValuesYaml(yaml.stringify(baseValues))
+      setValuesYaml(yaml.stringify(baseValues, { lineWidth: 0 }))
     }
   }, [localChartDetail?.values, artifactHubDetail?.values, isLocal, defaultValues])
 
@@ -191,7 +191,7 @@ export function InstallWizard({ repo, chartName, version, source, repoUrl, defau
     } finally {
       setIsInstalling(false)
     }
-  }, [releaseName, namespace, chartName, version, repo, valuesYaml, createNamespace, onSuccess, isLocal, artifactHubDetail, queryClient])
+  }, [releaseName, namespace, chartName, version, repo, repoUrl, valuesYaml, createNamespace, onSuccess, isLocal, artifactHubDetail, queryClient])
 
   // Validate release name + namespace before letting the user
   // advance. Without this, a name like "Invalid Name With Spaces!"
@@ -349,7 +349,7 @@ export function InstallWizard({ repo, chartName, version, source, repoUrl, defau
                   valuesYaml={valuesYaml}
                   defaultValuesYaml={
                     isLocal
-                      ? (localChartDetail?.values ? yaml.stringify(localChartDetail.values) : '')
+                      ? (localChartDetail?.values ? yaml.stringify(localChartDetail.values, { lineWidth: 0 }) : '')
                       : (artifactHubDetail?.values || '')
                   }
                 />
@@ -411,11 +411,11 @@ export function InstallWizard({ repo, chartName, version, source, repoUrl, defau
                   Cancel
                 </button>
                 {step === 'review' ? (
+                  <Tooltip content={!canHelmWrite ? helmActReason : ''}>
                   <button
                     onClick={handleInstall}
                     disabled={!canInstall || isInstalling || !canHelmWrite}
-                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium btn-brand rounded-lg disabled:cursor-not-allowed"
-                    title={!canHelmWrite ? helmActReason : undefined}
+                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium btn-brand rounded-lg disabled:cursor-not-allowed disabled:pointer-events-none"
                   >
                     {isInstalling ? (
                       <Loader2 className="w-4 h-4 animate-spin" />
@@ -424,6 +424,7 @@ export function InstallWizard({ repo, chartName, version, source, repoUrl, defau
                     )}
                     Install
                   </button>
+                  </Tooltip>
                 ) : (
                   <button
                     onClick={() => setStep(step === 'info' ? 'values' : 'review')}
@@ -560,8 +561,7 @@ function InfoStep({
         <label className="block text-sm font-medium text-theme-text-secondary mb-2">
           Release Name
         </label>
-        <input
-          type="text"
+        <Input
           value={releaseName}
           onChange={(e) => setReleaseName(e.target.value)}
           placeholder="my-release"
@@ -590,8 +590,7 @@ function InfoStep({
         <label className="block text-sm font-medium text-theme-text-secondary mb-2">
           Namespace
         </label>
-        <input
-          type="text"
+        <Input
           list="namespace-suggestions"
           value={namespace}
           onChange={(e) => setNamespace(e.target.value)}
@@ -658,13 +657,14 @@ interface ValuesStepProps {
 
 function ValuesStep({ valuesYaml, setValuesYaml, yamlError, setYamlError, chartDetail, source }: ValuesStepProps) {
   const [showEditor, setShowEditor] = useState(false)
+  const editorDisclosure = useDisclosure(showEditor)
 
   const isLocal = source === 'local'
   const localDetail = chartDetail as ChartDetail | undefined
   const ahDetail = chartDetail as ArtifactHubChartDetail | undefined
 
   const defaultValues = isLocal
-    ? (localDetail?.values ? yaml.stringify(localDetail.values) : '')
+    ? (localDetail?.values ? yaml.stringify(localDetail.values, { lineWidth: 0 }) : '')
     : (ahDetail?.values || '')
 
   const hasDefaults = Boolean(defaultValues)
@@ -702,11 +702,12 @@ function ValuesStep({ valuesYaml, setValuesYaml, yamlError, setYamlError, chartD
       {/* Collapsible editor section */}
       <div className="border border-theme-border rounded-lg overflow-hidden">
         <button
+          {...editorDisclosure.buttonProps}
           onClick={() => setShowEditor(!showEditor)}
           className="w-full flex items-center justify-between px-4 py-3 bg-theme-elevated/50 hover:bg-theme-elevated transition-colors"
         >
           <div className="flex items-center gap-2">
-            <ChevronRight className={clsx('w-4 h-4 text-theme-text-tertiary transition-transform', showEditor && 'rotate-90')} />
+            <CollapseChevron open={showEditor} className="w-4 h-4" />
             <span className="text-sm font-medium text-theme-text-primary">
               {hasValues ? (showEditor ? 'Hide' : 'Show') : 'Add'} configuration values
             </span>
@@ -717,7 +718,9 @@ function ValuesStep({ valuesYaml, setValuesYaml, yamlError, setYamlError, chartD
           </div>
         </button>
 
-        {showEditor && (
+        {/* unmountOnExit: the Monaco editor is heavy and its instance should
+            not outlive a closed section; values live in `valuesYaml` above. */}
+        <Collapse open={showEditor} unmountOnExit id={editorDisclosure.panelId}>
           <div className="p-4 border-t border-theme-border">
             {/* Action buttons */}
             <div className="flex items-center gap-3 mb-4">
@@ -758,6 +761,7 @@ function ValuesStep({ valuesYaml, setValuesYaml, yamlError, setYamlError, chartD
               <YamlEditor
                 value={valuesYaml}
                 onChange={setValuesYaml}
+                showProblems={false}
                 height="300px"
                 onValidate={(isValid, errors) => {
                   setYamlError(isValid ? null : errors[0] || 'Invalid YAML')
@@ -778,7 +782,7 @@ function ValuesStep({ valuesYaml, setValuesYaml, yamlError, setYamlError, chartD
               </div>
             )}
           </div>
-        )}
+        </Collapse>
       </div>
     </div>
   )
@@ -893,7 +897,7 @@ function ReviewStep({
           <div>
             <p className="text-sm font-medium text-amber-400">Installing from ArtifactHub</p>
             <p className="text-xs text-theme-text-secondary mt-1">
-              This chart will be installed from: <code className="bg-theme-elevated px-1 rounded">{artifactHubRepoUrl || repo}</code>
+              This chart will be installed from: <code className="inline-code">{artifactHubRepoUrl || repo}</code>
             </p>
           </div>
         </div>

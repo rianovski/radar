@@ -14,7 +14,10 @@ type DeprecationEntry struct {
 	Replacement string
 }
 
-// DeprecationTable contains known deprecated K8s APIs from 1.16 through 1.32.
+// DeprecationCatalogReviewedThrough is the latest Kubernetes release reviewed for deprecated and removed API entries.
+const DeprecationCatalogReviewedThrough = "1.37"
+
+// DeprecationTable contains known deprecated K8s APIs from 1.16 through 1.37.
 // Sources: https://kubernetes.io/docs/reference/using-api/deprecation-guide/
 var DeprecationTable = []DeprecationEntry{
 	// ── Removed in 1.22 ───────────────────────────────────────────────
@@ -47,6 +50,10 @@ var DeprecationTable = []DeprecationEntry{
 
 	// ── Removed in 1.32 ───────────────────────────────────────────────
 	{GroupVersion: "flowcontrol.apiserver.k8s.io/v1beta3", Kind: "", DeprecatedIn: "1.29", RemovedIn: "1.32", Replacement: "flowcontrol.apiserver.k8s.io/v1"},
+
+	// ── Removed in 1.37 ───────────────────────────────────────────────
+	{GroupVersion: "scheduling.k8s.io/v1alpha2", Kind: "Workload", DeprecatedIn: "1.36", RemovedIn: "1.37", Replacement: "scheduling.k8s.io/v1beta1"},
+	{GroupVersion: "scheduling.k8s.io/v1alpha2", Kind: "PodGroup", DeprecatedIn: "1.36", RemovedIn: "1.37", Replacement: "scheduling.k8s.io/v1beta1"},
 }
 
 // DeprecationsByGroupVersion indexes the deprecation table by group/version for fast lookup.

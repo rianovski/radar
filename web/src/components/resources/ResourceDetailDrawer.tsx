@@ -14,25 +14,35 @@ interface ResourceDetailDrawerProps {
   expanded?: boolean
   /** Called when user clicks collapse in expanded mode */
   onCollapse?: () => void
-  /** Called when user clicks expand button */
-  onExpand?: (resource: SelectedResource) => void
+  /** Called when user clicks expand button (opts.yaml = expanding from YAML view) */
+  onExpand?: (resource: SelectedResource, opts?: { yaml?: boolean }) => void
+  /** Hide the collapse-to-drawer control (mobile: no drawer to collapse to). Default true. */
+  canCollapseToDrawer?: boolean
   /** Navigate to another resource within expanded WorkloadView */
   onNavigateToResource?: (resource: SelectedResource) => void
+  /** Top offset for the drawer (px). Defaults to Radar's 49px header height;
+   *  pass 0 in chromeless embeds where there's no Radar header above it. */
+  headerHeight?: number
+  /** Right inset in px so the drawer sits beside a docked side panel (AI), not under it. */
+  rightInset?: number
 }
 
 export function ResourceDetailDrawer(props: ResourceDetailDrawerProps) {
   return (
     <BaseResourceDetailDrawer {...props}>
-      {({ resource, expanded, initialTab, onClose, onExpand, onBack, onNavigateToResource, onCollapseToDrawer }) => (
+      {({ resource, expanded, active, initialTab, onClose, onExpand, onExpandIntent, onCancelExpandIntent, onBack, onNavigateToResource, onCollapseToDrawer }) => (
         <WorkloadView
           kind={resource.kind}
           namespace={resource.namespace}
           name={resource.name}
           group={resource.group}
           expanded={expanded}
+          active={active}
           initialTab={initialTab}
           onClose={onClose}
           onExpand={onExpand}
+          onExpandIntent={onExpandIntent}
+          onCancelExpandIntent={onCancelExpandIntent}
           onBack={onBack ?? (() => {})}
           onNavigateToResource={onNavigateToResource}
           onCollapseToDrawer={onCollapseToDrawer}

@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -23,7 +22,9 @@ import (
 	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/internal/timeline"
 	"github.com/skyhook-io/radar/internal/traffic"
+	"github.com/skyhook-io/radar/pkg/health"
 	topology "github.com/skyhook-io/radar/pkg/topology"
+	"github.com/skyhook-io/radar/pkg/upgradereadiness"
 )
 
 // DashboardResponse is the aggregated response for the home dashboard
@@ -32,9 +33,7 @@ type DashboardResponse struct {
 	Health                 DashboardHealth                 `json:"health"`
 	Problems               []DashboardProblem              `json:"problems"`
 	ResourceCounts         DashboardResourceCounts         `json:"resourceCounts"`
-	RecentEvents           []DashboardEvent                `json:"recentEvents"`
 	RecentChanges          []DashboardChange               `json:"recentChanges"`
-	TopologySummary        DashboardTopologySummary        `json:"topologySummary"`
 	TrafficSummary         *DashboardTrafficSummary        `json:"trafficSummary"`
 	Metrics                *DashboardMetrics               `json:"metrics"`
 	MetricsServerAvailable bool                            `json:"metricsServerAvailable"`
@@ -42,14 +41,15 @@ type DashboardResponse struct {
 	NetworkPolicyCoverage  *DashboardNetworkPolicyCoverage `json:"networkPolicyCoverage,omitempty"`
 	NodeVersionSkew        *k8s.VersionSkew                `json:"nodeVersionSkew,omitempty"`
 	Audit                  *DashboardAudit                 `json:"audit,omitempty"`
+	Visibility             *k8s.VisibilitySummary          `json:"visibility,omitempty"`
 	// GitOpsControllers summarizes Argo CD / Flux controller pod health.
 	// Omitted when no controllers are detected — the Home dashboard
 	// hides the card entirely on non-GitOps clusters rather than
 	// rendering an empty state.
-	GitOpsControllers      *DashboardGitOpsControllers     `json:"gitopsControllers,omitempty"`
-	DeferredLoading        bool                            `json:"deferredLoading,omitempty"`  // True while deferred informers (secrets, events, etc.) are still syncing
-	PartialData            []string                        `json:"partialData,omitempty"`      // Resource kinds that timed out during critical sync (e.g. ["Pod", "Deployment"])
-	AccessRestricted       bool                            `json:"accessRestricted,omitempty"` // True when user has no namespace access (RBAC)
+	GitOpsControllers *DashboardGitOpsControllers `json:"gitopsControllers,omitempty"`
+	DeferredLoading   bool                        `json:"deferredLoading,omitempty"`  // True while deferred informers (secrets, events, etc.) are still syncing
+	PartialData       []string                    `json:"partialData,omitempty"`      // Resource kinds that timed out during critical sync (e.g. ["Pod", "Deployment"])
+	AccessRestricted  bool                        `json:"accessRestricted,omitempty"` // True when user has no namespace access (RBAC)
 }
 
 // DashboardCRDsResponse is the response for CRD counts (loaded lazily)
@@ -62,6 +62,10 @@ type DashboardCluster struct {
 	Platform  string `json:"platform"`
 	Version   string `json:"version"`
 	Connected bool   `json:"connected"`
+	// UpgradeReviewedThrough is the newest Kubernetes minor the upgrade-impact
+	// catalog covers. A static catalog fact, so Home can hint that the cluster
+	// is behind without triggering the (expensive) upgrade-readiness scan.
+	UpgradeReviewedThrough string `json:"upgradeReviewedThrough,omitempty"`
 }
 
 type DashboardHealth struct {
@@ -80,9 +84,10 @@ type DashboardProblem struct {
 	Reason          string `json:"reason"`
 	Message         string `json:"message"`
 	Age             string `json:"age"`
-	AgeSeconds      int64  `json:"ageSeconds"`         // For sorting: lower = more recent
-	Duration        string `json:"duration"`           // How long the problem has persisted
-	DurationSeconds int64  `json:"durationSeconds"`    // For sorting by problem age
+	AgeSeconds      int64  `json:"ageSeconds"`      // For sorting: lower = more recent
+	Duration        string `json:"duration"`        // How long the problem has persisted
+	DurationSeconds int64  `json:"durationSeconds"` // For sorting by problem age
+	OnsetUnknown    bool   `json:"onsetUnknown,omitempty"`
 	PodCount        int    `json:"podCount,omitempty"` // For workload rollups: number of affected pods
 }
 
@@ -167,6 +172,10 @@ type WorkloadCount struct {
 type DashboardMetrics struct {
 	CPU    *MetricSummary `json:"cpu,omitempty"`
 	Memory *MetricSummary `json:"memory,omitempty"`
+	// UsageAvailable reports whether live usage (UsageMillis/UsagePercent) came
+	// from metrics-server. When false, only RequestsMillis/CapacityMillis are
+	// meaningful — usage fields are zero.
+	UsageAvailable bool `json:"usageAvailable"`
 }
 
 type MetricSummary struct {
@@ -221,16 +230,6 @@ type DashboardCRDCount struct {
 	Count int    `json:"count"`
 }
 
-type DashboardEvent struct {
-	Type           string `json:"type"`
-	Reason         string `json:"reason"`
-	Message        string `json:"message"`
-	InvolvedObject string `json:"involvedObject"`
-	Namespace      string `json:"namespace"`
-	Timestamp      string `json:"timestamp"`
-	Count          int32  `json:"count,omitempty"`
-}
-
 type DashboardChange struct {
 	Kind       string `json:"kind"`
 	Namespace  string `json:"namespace"`
@@ -238,11 +237,6 @@ type DashboardChange struct {
 	ChangeType string `json:"changeType"`
 	Summary    string `json:"summary"`
 	Timestamp  string `json:"timestamp"`
-}
-
-type DashboardTopologySummary struct {
-	NodeCount int `json:"nodeCount"`
-	EdgeCount int `json:"edgeCount"`
 }
 
 type DashboardTrafficSummary struct {
@@ -282,21 +276,6 @@ type DashboardHelmRelease struct {
 	ResourceHealth string `json:"resourceHealth,omitempty"`
 }
 
-// mergeHelmSummary appends src into dst. The first non-empty Error / ErrorCode
-// wins so the UI surfaces a real failure rather than swallowing it under a
-// later success. Restricted is OR-merged: restricted in any namespace ⇒ flag.
-func mergeHelmSummary(dst *DashboardHelmSummary, src DashboardHelmSummary) {
-	dst.Total += src.Total
-	dst.Releases = append(dst.Releases, src.Releases...)
-	if src.Restricted {
-		dst.Restricted = true
-	}
-	if dst.Error == "" {
-		dst.Error = src.Error
-		dst.ErrorCode = src.ErrorCode
-	}
-}
-
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
@@ -331,6 +310,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	discovery := s.discoveryFor(r)
 
 	resp := DashboardResponse{}
+	if result := k8s.GetCachedPermissionResult(); result != nil {
+		resp.Visibility = k8s.BuildVisibilitySummary(result, k8s.VisibilityNamespace(namespaces))
+	}
 	canReadNodes := s.canRead(r, "", "nodes", "", "list")
 	canReadNamespaces := s.canRead(r, "", "namespaces", "", "list")
 
@@ -407,7 +389,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	t = time.Now()
 	for _, ns := range iterateNamespaces {
-		resp.RecentEvents = append(resp.RecentEvents, s.getDashboardRecentEvents(cache, ns)...)
 		resp.Health.WarningEvents += s.countWarningEvents(cache, ns)
 	}
 	k8s.LogTiming("  [dashboard] events: %v", time.Since(t))
@@ -416,13 +397,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	resp.RecentChanges = s.getDashboardRecentChanges(ctx, namespaces)
 	k8s.LogTiming("  [dashboard] changes: %v", time.Since(t))
 
-	t = time.Now()
-	resp.TopologySummary = s.getDashboardTopologySummary(namespaces, cache, dynCache, discovery)
-	k8s.LogTiming("  [dashboard] topology: %v", time.Since(t))
-
-	resp.CertificateHealth = s.getDashboardCertificateHealth(cache, namespaces)
-	resp.NetworkPolicyCoverage = s.getDashboardNetworkPolicyCoverage(cache, dynCache, discovery, namespaces)
-	resp.Audit = getDashboardAudit(cache, namespaces)
+	// Cert health is derived from TLS Secrets — gate by per-user secrets RBAC.
+	resp.CertificateHealth = s.getDashboardCertificateHealth(cache, s.secretReadableNamespaces(r, namespaces))
+	resp.NetworkPolicyCoverage = s.getDashboardNetworkPolicyCoverage(r, cache, namespaces)
+	resp.Audit = s.getDashboardAudit(r, cache, namespaces)
 	resp.GitOpsControllers = s.getDashboardGitOpsControllers(cache, namespaces)
 
 	if canReadNodes {
@@ -430,7 +408,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			nodeList, _ := nodeLister.List(labels.Everything())
 			resp.ResourceCounts.Nodes.Total = len(nodeList)
 			for _, n := range nodeList {
-				h := k8s.ClassifyNodeHealth(n)
+				h := health.Node(n)
 				if h.Ready {
 					if h.Unschedulable {
 						resp.ResourceCounts.Nodes.Cordoned++
@@ -448,6 +426,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			nss, _ := nsLister.List(labels.Everything())
 			resp.ResourceCounts.Namespaces = len(nss)
 		}
+	} else if len(namespaces) > 0 {
+		// Restricted user — surface their accessible count instead of "0".
+		resp.ResourceCounts.Namespaces = len(namespaces)
 	}
 
 	if canReadNodes && cache.Nodes() != nil {
@@ -460,7 +441,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	resp.Cluster = cluster
 	resp.Metrics = metrics
-	resp.MetricsServerAvailable = metrics != nil
+	// "Available" means live usage is present — not merely that capacity/request
+	// data exists. metrics is now non-nil whenever nodes are cached, so gate the
+	// flag on actual usage so the frontend's "usage unavailable" hint still fires.
+	resp.MetricsServerAvailable = metrics != nil && metrics.UsageAvailable
 	resp.TrafficSummary = trafficSummary
 
 	k8s.LogTiming(" [dashboard] total: %v", time.Since(dashStart))
@@ -472,22 +456,13 @@ func (s *Server) handleDashboardHelm(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
 	}
-	namespaces := s.parseNamespacesForUser(r)
-	if noNamespaceAccess(namespaces) {
+	namespaces, ok := s.resolveHelmNamespaces(r)
+	if !ok {
 		s.writeJSON(w, DashboardHelmSummary{})
 		return
 	}
 
-	// Iterate per allowed namespace and aggregate. Cluster-admin / no-auth
-	// (namespaces == nil) collapses to a single "" call (cluster-wide).
-	var summary DashboardHelmSummary
-	if namespaces == nil {
-		summary = s.getDashboardHelmSummary(r, "")
-	} else {
-		for _, ns := range namespaces {
-			mergeHelmSummary(&summary, s.getDashboardHelmSummary(r, ns))
-		}
-	}
+	summary := s.getDashboardHelmSummary(r, namespaces)
 	s.writeJSON(w, summary)
 }
 
@@ -519,15 +494,16 @@ func (s *Server) getDashboardCluster(ctx context.Context, entry *k8s.PoolEntry) 
 		return DashboardCluster{Connected: false}
 	}
 	return DashboardCluster{
-		Name:      info.Cluster,
-		Platform:  info.Platform,
-		Version:   info.KubernetesVersion,
-		Connected: true,
+		Name:                   info.Cluster,
+		Platform:               info.Platform,
+		Version:                info.KubernetesVersion,
+		Connected:              true,
+		UpgradeReviewedThrough: upgradereadiness.ReviewedThrough,
 	}
 }
 
 func (s *Server) getDashboardHealth(cache *k8s.ResourceCache, dynCache *k8s.DynamicResourceCache, discovery *k8s.ResourceDiscovery, namespace string) (DashboardHealth, []DashboardProblem) {
-	health := DashboardHealth{}
+	dh := DashboardHealth{}
 	problems := make([]DashboardProblem, 0)
 
 	now := time.Now()
@@ -542,22 +518,45 @@ func (s *Server) getDashboardHealth(cache *k8s.ResourceCache, dynCache *k8s.Dyna
 			pods, err = podLister.List(labels.Everything())
 		}
 	}
+	// Pods the post-bind layer owns (stuck ContainerCreating on CNI/volume).
+	// Computed up front so the warning rollup below can skip them the same way
+	// it skips unschedulable pods — otherwise a long-Pending stuck pod gets
+	// both a bare "Pending" rollup row and the richer post-bind row. Keyed
+	// "namespace/name"; the slice is reused in the scheduling block below.
+	postBind := k8s.DetectPostBindProblems(cache, namespace)
+	postBindPods := make(map[string]bool, len(postBind))
+	for _, p := range postBind {
+		postBindPods[p.Namespace+"/"+p.Name] = true
+	}
+
 	// Group unhealthy pods by owner workload for rollup
 	ownerGroups := make(map[ownerKey]*ownerGroup)
 	var orphanProblems []DashboardProblem
 
 	if err == nil {
 		for _, pod := range pods {
-			status := classifyPodHealth(pod, now)
-			switch status {
-			case "healthy":
-				health.Healthy++
-			case "warning":
-				health.Warning++
-				collectPodForRollup(pod, "medium", now, ownerGroups, &orphanProblems)
-			case "error":
-				health.Error++
+			switch health.Pod(pod, now).Level {
+			case health.LevelUnhealthy:
+				dh.Error++
 				collectPodForRollup(pod, "critical", now, ownerGroups, &orphanProblems)
+			case health.LevelDegraded:
+				dh.Warning++
+				// Unschedulable pods (bind-time) and stuck-creating pods
+				// (post-bind) are owned by the scheduling rows appended below,
+				// which name the actual constraint; don't also roll them up
+				// here as a bare "Pending".
+				if !health.IsPodUnschedulable(pod) && !postBindPods[pod.Namespace+"/"+pod.Name] {
+					collectPodForRollup(pod, "medium", now, ownerGroups, &orphanProblems)
+				}
+			case health.LevelUnknown:
+				// node-lost / unobservable: count as warning so it isn't hidden in
+				// the healthy bucket, but don't add a per-pod rollup row — the Node
+				// NotReady row is the actionable signal (and the problem detector
+				// likewise defers to it), so a per-pod row would just be noise with
+				// no real reason to show.
+				dh.Warning++
+			default: // healthy, neutral
+				dh.Healthy++
 			}
 		}
 	}
@@ -597,55 +596,99 @@ func (s *Server) getDashboardHealth(cache *k8s.ResourceCache, dynCache *k8s.Dyna
 	// Add orphan pod problems (no owner workload)
 	problems = append(problems, orphanProblems...)
 
-	// Workload/HPA/CronJob/Node problems (excluding pods, handled above)
-	for _, p := range k8s.DetectProblems(cache, namespace) {
-		problems = append(problems, DashboardProblem{
-			Kind:            p.Kind,
-			Namespace:       p.Namespace,
-			Name:            p.Name,
-			Severity:        p.Severity,
-			Reason:          p.Reason,
-			Message:         p.Message,
-			Age:             p.Age,
-			AgeSeconds:      p.AgeSeconds,
-			Duration:        p.Duration,
-			DurationSeconds: p.DurationSeconds,
-		})
+	// Workload/HPA/CronJob/Node problems (excluding pods, handled above) +
+	// direct dangling-ref errors (missing CM/Secret/PVC/SA refs, missing
+	// HPA target, missing Ingress backend / TLS / port, missing roleRef,
+	// missing StorageClass on a PVC, missing headless Service on a
+	// StatefulSet) + webhook-config refs (missing Service on
+	// Validating/MutatingWebhookConfiguration). Skip Pod-kind rows from
+	// DetectProblems — REST's pod rollup + orphan handling above is the
+	// canonical pod surface; including DetectProblems Pod rows would
+	// duplicate them. (Missing-ref Pod rows are intentionally kept: those
+	// catch pods stuck Pending on missing refs, which the pod-error loop
+	// above doesn't surface.)
+	detected := append(k8s.DetectProblems(cache, namespace), k8s.DetectMissingRefs(cache, namespace)...)
+	detected = append(detected, k8s.DetectMissingWebhookRefs(cache, dynCache, discovery, namespace)...)
+	// DetectProblems Pod rows duplicate REST's pod rollup above; skip them.
+	// DetectMissingRefs Pod rows are kept (different failure category — won't-
+	// schedule etc.). We can't tell the source from the Problem struct, so
+	// distinguish by whether Reason starts with "Missing " (only emitted by
+	// DetectMissingRefs at present). Dedupe keys by (ns, name, reason) so a
+	// Pod with multiple distinct missing-ref reasons (e.g. PVC + ConfigMap)
+	// keeps a row per blocker — agents triaging a Pending pod need ALL of
+	// the missing refs, not just whichever fired first.
+	seenPodReason := map[string]bool{}
+	for _, p := range detected {
+		if p.Kind == "Pod" {
+			if !strings.HasPrefix(p.Reason, "Missing ") {
+				continue
+			}
+			key := p.Namespace + "/" + p.Name + "/" + p.Reason
+			if seenPodReason[key] {
+				continue
+			}
+			seenPodReason[key] = true
+		}
+		problems = append(problems, detectionToDashboardProblem(p))
+	}
+
+	// Scheduling problems: unschedulable pods (with the offending node
+	// constraint named), admission rejections (quota/PodSecurity/webhook — no
+	// Pod exists, so the pod rollup above can't see them), and post-bind
+	// CNI/volume stalls. Appended directly (not through the Missing-ref Pod
+	// filter above) — an Unschedulable row IS the pod's scheduling reason; the
+	// pod rollup above skips unschedulable + post-bind pods so they don't
+	// double-surface. postBind was computed above for that skip; reuse it.
+	sched := k8s.DetectSchedulingProblems(cache, namespace)
+	sched = append(sched, k8s.DetectAdmissionProblems(cache, namespace)...)
+	sched = append(sched, postBind...)
+	for _, p := range sched {
+		problems = append(problems, detectionToDashboardProblem(p))
 	}
 
 	// CAPI problems (Cluster API resources)
 	for _, p := range k8s.DetectCAPIProblems(dynCache, discovery, namespace) {
-		problems = append(problems, DashboardProblem{
-			Kind:            p.Kind,
-			Namespace:       p.Namespace,
-			Name:            p.Name,
-			Group:           p.Group,
-			Severity:        p.Severity,
-			Reason:          p.Reason,
-			Message:         p.Message,
-			Age:             p.Age,
-			AgeSeconds:      p.AgeSeconds,
-			Duration:        p.Duration,
-			DurationSeconds: p.DurationSeconds,
-		})
+		problems = append(problems, detectionToDashboardProblem(p))
 	}
 
 	// Sort: critical first, then high, then medium; within each group sort by age (most recent first)
-	severityOrder := map[string]int{"critical": 0, "high": 1, "medium": 2}
+	// "warning" is below medium — degraded states that aren't immediate
+	// failures. Info is inert/posture and ranks last. Unknown severities also
+	// rank last instead of falling through to Go's zero value beside critical.
+	severityOrder := map[string]int{"critical": 0, "high": 1, "medium": 2, "warning": 3, "info": 4}
 	sort.SliceStable(problems, func(i, j int) bool {
-		si, sj := severityOrder[problems[i].Severity], severityOrder[problems[j].Severity]
+		si, ok := severityOrder[problems[i].Severity]
+		if !ok {
+			si = len(severityOrder)
+		}
+		sj, ok := severityOrder[problems[j].Severity]
+		if !ok {
+			sj = len(severityOrder)
+		}
 		if si != sj {
 			return si < sj
 		}
 		return problems[i].AgeSeconds < problems[j].AgeSeconds
 	})
 
-	return health, problems
+	return dh, problems
 }
 
-// classifyPodHealth delegates to the shared implementation in k8s.ClassifyPodHealth.
-func classifyPodHealth(pod *corev1.Pod, now time.Time) string {
-	return k8s.ClassifyPodHealth(pod, now)
+func detectionToDashboardProblem(p k8s.Detection) DashboardProblem {
+	return DashboardProblem{
+		Kind:            p.Kind,
+		Namespace:       p.Namespace,
+		Name:            p.Name,
+		Group:           p.Group,
+		Severity:        p.Severity,
+		Reason:          p.Reason,
+		Message:         p.Message,
+		Age:             p.Age,
+		AgeSeconds:      p.AgeSeconds,
+		Duration:        p.Duration,
+		DurationSeconds: p.DurationSeconds,
+		OnsetUnknown:    p.OnsetUnknown,
+	}
 }
 
 func podToProblem(pod *corev1.Pod, severity string, now time.Time) DashboardProblem {
@@ -779,12 +822,12 @@ func collectPodForRollup(pod *corev1.Pod, severity string, now time.Time, groups
 
 	g.podCount++
 	// Keep worst severity: critical > high > medium
-	order := map[string]int{"critical": 0, "high": 1, "medium": 2}
+	order := map[string]int{"critical": 0, "high": 1, "medium": 2, "warning": 3}
 	if g.severity == "" || order[severity] < order[g.severity] {
 		g.severity = severity
 	}
 
-	reason := k8s.PodProblemReason(pod)
+	reason := health.PodProblemReason(pod, now)
 	if reason != "" {
 		g.reasons[reason]++
 	}
@@ -1080,70 +1123,6 @@ func (s *Server) getDashboardResourceCounts(cache *k8s.ResourceCache, dynCache *
 	return counts
 }
 
-func (s *Server) getDashboardRecentEvents(cache *k8s.ResourceCache, namespace string) []DashboardEvent {
-	eventLister := cache.Events()
-	if eventLister == nil {
-		return []DashboardEvent{}
-	}
-	var events []*corev1.Event
-	var err error
-	if namespace != "" {
-		events, err = eventLister.Events(namespace).List(labels.Everything())
-	} else {
-		events, err = eventLister.List(labels.Everything())
-	}
-	if err != nil || len(events) == 0 {
-		return []DashboardEvent{}
-	}
-
-	// Filter to Warning events only and sort by last timestamp desc
-	var warnings []*corev1.Event
-	for _, e := range events {
-		if e.Type == "Warning" {
-			warnings = append(warnings, e)
-		}
-	}
-
-	sort.Slice(warnings, func(i, j int) bool {
-		ci := max(warnings[i].Count, 1)
-		cj := max(warnings[j].Count, 1)
-		if ci != cj {
-			return ci > cj
-		}
-		ti := warnings[i].LastTimestamp.Time
-		tj := warnings[j].LastTimestamp.Time
-		if ti.IsZero() {
-			ti = warnings[i].CreationTimestamp.Time
-		}
-		if tj.IsZero() {
-			tj = warnings[j].CreationTimestamp.Time
-		}
-		return ti.After(tj)
-	})
-
-	// Take top 5
-	limit := min(len(warnings), 5)
-
-	result := make([]DashboardEvent, 0, limit)
-	for _, e := range warnings[:limit] {
-		ts := e.LastTimestamp.Time
-		if ts.IsZero() {
-			ts = e.CreationTimestamp.Time
-		}
-		result = append(result, DashboardEvent{
-			Type:           e.Type,
-			Reason:         e.Reason,
-			Message:        k8s.Truncate(e.Message, 200),
-			InvolvedObject: fmt.Sprintf("%s/%s", e.InvolvedObject.Kind, e.InvolvedObject.Name),
-			Namespace:      e.Namespace,
-			Timestamp:      ts.Format(time.RFC3339),
-			Count:          max(e.Count, 1),
-		})
-	}
-
-	return result
-}
-
 func (s *Server) getDashboardRecentChanges(ctx context.Context, namespaces []string) []DashboardChange {
 	store := timeline.GetStore()
 	if store == nil {
@@ -1151,16 +1130,20 @@ func (s *Server) getDashboardRecentChanges(ctx context.Context, namespaces []str
 	}
 
 	opts := timeline.QueryOptions{
-		Namespaces:   namespaces,
-		Since:        time.Now().Add(-1 * time.Hour),
-		Limit:        5,
-		FilterPreset: "workloads",
+		Namespaces:     namespaces,
+		Since:          time.Now().Add(-1 * time.Hour),
+		Limit:          5,
+		FilterPreset:   "workloads",
+		ClusterContext: k8s.ActiveClusterContext(),
 	}
 
 	events, err := store.Query(ctx, opts)
 	if err != nil || len(events) == 0 {
 		return []DashboardChange{}
 	}
+	// Per-kind RBAC: the store namespace-filters, but a workload change the user
+	// can see the namespace of but not read the kind of would still surface here.
+	events = s.filterTimelineEventsByRBAC(ctx, events)
 
 	result := make([]DashboardChange, 0, len(events))
 	for _, e := range events {
@@ -1182,34 +1165,6 @@ func (s *Server) getDashboardRecentChanges(ctx context.Context, namespaces []str
 	}
 
 	return result
-}
-
-func (s *Server) getDashboardTopologySummary(namespaces []string, cache *k8s.ResourceCache, dynCache *k8s.DynamicResourceCache, discovery *k8s.ResourceDiscovery) DashboardTopologySummary {
-	// Use cached topology only when no namespace filter is active,
-	// since the cached topology's namespace scope may not match the request.
-	if namespaces == nil {
-		if cachedTopo := s.broadcaster.GetCachedTopology(); cachedTopo != nil {
-			return DashboardTopologySummary{
-				NodeCount: len(cachedTopo.Nodes),
-				EdgeCount: len(cachedTopo.Edges),
-			}
-		}
-	}
-
-	// Build topology with the requested namespace filter
-	opts := topology.DefaultBuildOptions()
-	opts.Namespaces = namespaces
-	builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(cache)).WithDynamic(k8s.NewTopologyDynamicProvider(dynCache, discovery))
-	topo, err := builder.Build(opts)
-	if err != nil {
-		log.Printf("[dashboard] Failed to build topology summary: %v", err)
-		return DashboardTopologySummary{}
-	}
-
-	return DashboardTopologySummary{
-		NodeCount: len(topo.Nodes),
-		EdgeCount: len(topo.Edges),
-	}
 }
 
 func (s *Server) getDashboardTrafficSummary(ctx context.Context, namespaces []string) *DashboardTrafficSummary {
@@ -1238,8 +1193,21 @@ func (s *Server) getDashboardTrafficSummary(ctx context.Context, namespaces []st
 		}
 	}
 
+	// The source only filters by a single namespace; restrict multi-namespace
+	// users here so the summary doesn't count flows outside their allowed set.
+	flows := response.Flows
+	if allowed := namespaceLookup(namespaces); allowed != nil {
+		kept := make([]traffic.Flow, 0, len(flows))
+		for _, f := range flows {
+			if flowVisibleForNamespaces(f, allowed) {
+				kept = append(kept, f)
+			}
+		}
+		flows = kept
+	}
+
 	// Aggregate flows
-	aggregated := traffic.AggregateFlows(response.Flows)
+	aggregated := traffic.AggregateFlows(flows)
 
 	// Sort by connection count
 	sort.Slice(aggregated, func(i, j int) bool {
@@ -1271,7 +1239,7 @@ func (s *Server) getDashboardTrafficSummary(ctx context.Context, namespaces []st
 	}
 }
 
-func (s *Server) getDashboardHelmSummary(r *http.Request, namespace string) DashboardHelmSummary {
+func (s *Server) getDashboardHelmSummary(r *http.Request, namespaces []string) DashboardHelmSummary {
 	helmClient := helm.GetClient()
 	if helmClient == nil {
 		return DashboardHelmSummary{
@@ -1287,7 +1255,7 @@ func (s *Server) getDashboardHelmSummary(r *http.Request, namespace string) Dash
 		username = user.Username
 		groups = user.Groups
 	}
-	releases, err := s.listHelmReleasesForUser(r, helmClient, namespace, username, groups)
+	releases, err := s.helmClientFor(r, helmClient).ListReleasesAcrossNamespaces(namespaces, username, groups)
 	if err != nil {
 		if helm.IsForbiddenError(err) {
 			return DashboardHelmSummary{Releases: []DashboardHelmRelease{}, Restricted: true}
@@ -1300,29 +1268,32 @@ func (s *Server) getDashboardHelmSummary(r *http.Request, namespace string) Dash
 		}
 	}
 
+	return dashboardHelmSummaryFromReleases(releases)
+}
+
+func dashboardHelmSummaryFromReleases(releases []helm.HelmRelease) DashboardHelmSummary {
 	result := DashboardHelmSummary{
 		Total: len(releases),
 	}
 
-	// Sort: failed/unhealthy releases first to surface problems
+	// Sort: failed/pending first, then operation-signaled Helm rollbacks,
+	// then unhealthy/degraded owned resources.
 	sort.SliceStable(releases, func(i, j int) bool {
-		pi := helm.StatusPriority(releases[i].Status, releases[i].ResourceHealth)
-		pj := helm.StatusPriority(releases[j].Status, releases[j].ResourceHealth)
-		return pi < pj
+		return helm.ReleasePriority(releases[i]) < helm.ReleasePriority(releases[j])
 	})
 
 	// Take top 6 releases
 	limit := min(len(releases), 6)
 
 	result.Releases = make([]DashboardHelmRelease, 0, limit)
-	for _, r := range releases[:limit] {
+	for _, rel := range releases[:limit] {
 		result.Releases = append(result.Releases, DashboardHelmRelease{
-			Name:           r.Name,
-			Namespace:      r.Namespace,
-			Chart:          r.Chart,
-			ChartVersion:   r.ChartVersion,
-			Status:         r.Status,
-			ResourceHealth: r.ResourceHealth,
+			Name:           rel.Name,
+			Namespace:      rel.Namespace,
+			Chart:          rel.Chart,
+			ChartVersion:   rel.ChartVersion,
+			Status:         rel.Status,
+			ResourceHealth: rel.ResourceHealth,
 		})
 	}
 
@@ -1350,44 +1321,10 @@ func (s *Server) countWarningEvents(cache *k8s.ResourceCache, namespace string) 
 }
 
 func (s *Server) getDashboardMetrics(ctx context.Context, allowedNamespaces []string, cache *k8s.ResourceCache) *DashboardMetrics {
-	client := k8s.ClientFromContext(ctx)
-	if client == nil {
-		return nil
-	}
-
-	// Query metrics-server via raw REST to avoid adding k8s.io/metrics dependency.
-	// GET /apis/metrics.k8s.io/v1beta1/nodes. Metrics-server forwards the
-	// impersonation headers, so a user without metrics.k8s.io/nodes access
-	// gets a 403 here and dashboard metrics are silently omitted.
-	data, err := client.CoreV1().RESTClient().Get().
-		AbsPath("/apis/metrics.k8s.io/v1beta1/nodes").
-		DoRaw(ctx)
-	if err != nil {
-		// metrics-server not installed or not accessible — that's fine
-		return nil
-	}
-
-	var nodeMetricsList struct {
-		Items []struct {
-			Metadata struct {
-				Name string `json:"name"`
-			} `json:"metadata"`
-			Usage struct {
-				CPU    string `json:"cpu"`
-				Memory string `json:"memory"`
-			} `json:"usage"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(data, &nodeMetricsList); err != nil {
-		log.Printf("Failed to parse node metrics: %v", err)
-		return nil
-	}
-
-	if len(nodeMetricsList.Items) == 0 {
-		return nil
-	}
-
-	// Get node capacity from the cache
+	// Node capacity and pod requests come from the cache — they don't need
+	// metrics-server. Live usage does. Compute the cached values first and
+	// treat usage as best-effort so a missing/slow metrics-server still leaves
+	// requests vs. capacity on the dashboard.
 	if cache == nil {
 		return nil
 	}
@@ -1400,57 +1337,23 @@ func (s *Server) getDashboardMetrics(ctx context.Context, allowedNamespaces []st
 		return nil
 	}
 
-	// Sum capacity across all nodes
-	var cpuCapacityMillis int64
-	var memCapacityBytes int64
-	for _, n := range nodes {
-		cpuCapacityMillis += n.Status.Capacity.Cpu().MilliValue()
-		memCapacityBytes += n.Status.Capacity.Memory().Value()
-	}
+	// Capacity + scheduled-pod requests via the shared informer-derived
+	// computation (node_metrics.go). Namespace scoping keeps restricted users
+	// from seeing aggregate totals of namespaces they can't read.
+	cr := computeCapacityRequests(nodes, listPodsScoped(cache.Pods(), allowedNamespaces))
+	cpuCapacityMillis := cr.cpuCapMillis
+	memCapacityBytes := cr.memCapBytes
+	cpuRequestsMillis := cr.cpuReqMillis
+	memRequestsBytes := cr.memReqBytes
 
-	// Sum usage across all nodes
-	var cpuUsageMillis int64
-	var memUsageBytes int64
-	for _, item := range nodeMetricsList.Items {
-		cpuUsageMillis += parseCPUToMillis(item.Usage.CPU)
-		memUsageBytes += parseMemoryToBytes(item.Usage.Memory)
-	}
+	// Live usage from metrics-server — best-effort. Query via raw REST to avoid
+	// adding k8s.io/metrics dependency; metrics-server forwards impersonation
+	// headers, so a user without metrics.k8s.io/nodes access gets a 403. A
+	// missing, forbidden, or slow metrics-server leaves usageAvailable false
+	// rather than discarding the capacity/request data computed above.
+	cpuUsageMillis, memUsageBytes, usageAvailable := s.fetchNodeUsage(ctx)
 
-	// Sum requests across pods the user can see. For namespace-restricted
-	// users this scopes to allowedNamespaces — without it, the dashboard
-	// would expose aggregate pod-resource totals from namespaces they have
-	// no read access to.
-	var cpuRequestsMillis int64
-	var memRequestsBytes int64
-	var metricPods []*corev1.Pod
-	if podLister := cache.Pods(); podLister != nil {
-		if allowedNamespaces == nil {
-			metricPods, _ = podLister.List(labels.Everything())
-		} else {
-			for _, ns := range allowedNamespaces {
-				items, _ := podLister.Pods(ns).List(labels.Everything())
-				metricPods = append(metricPods, items...)
-			}
-		}
-	}
-	for _, pod := range metricPods {
-		// Skip completed/failed pods
-		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-			continue
-		}
-		for _, container := range pod.Spec.Containers {
-			if container.Resources.Requests != nil {
-				if cpu, ok := container.Resources.Requests[corev1.ResourceCPU]; ok {
-					cpuRequestsMillis += cpu.MilliValue()
-				}
-				if mem, ok := container.Resources.Requests[corev1.ResourceMemory]; ok {
-					memRequestsBytes += mem.Value()
-				}
-			}
-		}
-	}
-
-	metrics := &DashboardMetrics{}
+	metrics := &DashboardMetrics{UsageAvailable: usageAvailable}
 	if cpuCapacityMillis > 0 {
 		metrics.CPU = &MetricSummary{
 			UsageMillis:    cpuUsageMillis,
@@ -1476,12 +1379,6 @@ func (s *Server) getDashboardMetrics(ctx context.Context, allowedNamespaces []st
 
 	return metrics
 }
-
-// parseCPUToMillis delegates to k8s.ParseCPUToMillis.
-func parseCPUToMillis(s string) int64 { return k8s.ParseCPUToMillis(s) }
-
-// parseMemoryToBytes delegates to k8s.ParseMemoryToBytes.
-func parseMemoryToBytes(s string) int64 { return k8s.ParseMemoryToBytes(s) }
 
 // Helper functions
 
@@ -1627,70 +1524,162 @@ func mergeCRDCounts(a, b []DashboardCRDCount) []DashboardCRDCount {
 
 // DashboardNetworkPolicyCoverage reports how many workloads are covered by at least one NetworkPolicy.
 type DashboardNetworkPolicyCoverage struct {
-	TotalPolicies    int `json:"totalPolicies"`
-	CoveredWorkloads int `json:"coveredWorkloads"`
-	TotalWorkloads   int `json:"totalWorkloads"`
+	TotalPolicies            int `json:"totalPolicies"`
+	StagedPolicies           int `json:"stagedPolicies,omitempty"`
+	CoveredWorkloads         int `json:"coveredWorkloads"`
+	CoveredWorkloadsIfStaged int `json:"coveredWorkloadsIfStaged"`
+	TotalWorkloads           int `json:"totalWorkloads"`
 }
 
 type npSelector struct {
 	namespace string
+	name      string
 	selector  labels.Selector
+	// cilium marks a CiliumNetworkPolicy sharing this list with the core
+	// networking.k8s.io policies. A staged Calico deletion names a policy in one
+	// family or the other, never both.
+	cilium bool
 }
 
-func (s *Server) getDashboardNetworkPolicyCoverage(cache *k8s.ResourceCache, dynCache *k8s.DynamicResourceCache, discovery *k8s.ResourceDiscovery, namespaces []string) *DashboardNetworkPolicyCoverage {
-	npLister := cache.NetworkPolicies()
-	if npLister == nil {
-		return nil
+type dashboardCalicoPolicy struct {
+	policy     *unstructured.Unstructured
+	matcher    *topology.CalicoPolicyMatcher
+	definition topology.CalicoPolicyKind
+	// previewsProtection is false for the staged actions that describe removing
+	// or ignoring a policy rather than adding one.
+	previewsProtection bool
+	// stagesRemoval is true only for a staged deletion. An ignored staged policy
+	// previews nothing, but it does not take the enforced policy away either.
+	stagesRemoval bool
+}
+
+// stagedPolicyTarget identifies the enforced policy a staged one refers to.
+// A StagedKubernetesNetworkPolicy stages a change to a policy in
+// networking.k8s.io, so the family has to be part of the identity.
+type stagedPolicyTarget struct {
+	kubernetesFamily bool
+	kind             string
+	namespace        string
+	name             string
+}
+
+type dashboardPolicyWorkload struct {
+	key            string
+	namespace      string
+	labels         map[string]string
+	serviceAccount string
+}
+
+func (s *Server) dashboardPolicyReadScope(r *http.Request, namespaces []string, group, resource string) (clusterWide bool, readable []string) {
+	allNamespaces := namespaces == nil || (len(namespaces) == 0 && auth.UserFromContext(r.Context()) == nil)
+	if allNamespaces {
+		return s.canRead(r, group, resource, "", "list"), nil
 	}
+	if len(namespaces) == 0 {
+		return false, nil
+	}
+	for _, namespace := range namespaces {
+		if s.canRead(r, group, resource, namespace, "list") {
+			readable = append(readable, namespace)
+		}
+	}
+	return false, readable
+}
+
+// calicoSelectorLabels returns the namespace and service-account labels Calico
+// selectors are evaluated against, including the labels Calico adds itself.
+func calicoSelectorLabels(cache *k8s.ResourceCache) (namespaceLabels, serviceAccountLabels map[string]map[string]string) {
+	namespaceLabels = make(map[string]map[string]string)
+	serviceAccountLabels = make(map[string]map[string]string)
+	if namespaceLister := cache.Namespaces(); namespaceLister != nil {
+		if items, err := namespaceLister.List(labels.Everything()); err == nil {
+			for _, namespace := range items {
+				itemLabels := make(map[string]string, len(namespace.Labels)+2)
+				for key, value := range namespace.Labels {
+					itemLabels[key] = value
+				}
+				itemLabels["kubernetes.io/metadata.name"] = namespace.Name
+				itemLabels["projectcalico.org/name"] = namespace.Name
+				namespaceLabels[namespace.Name] = itemLabels
+			}
+		}
+	}
+	if serviceAccountLister := cache.ServiceAccounts(); serviceAccountLister != nil {
+		if items, err := serviceAccountLister.List(labels.Everything()); err == nil {
+			for _, account := range items {
+				itemLabels := make(map[string]string, len(account.Labels)+2)
+				for key, value := range account.Labels {
+					itemLabels[key] = value
+				}
+				itemLabels["projectcalico.org/name"] = account.Name
+				itemLabels["kubernetes.io/service-account.name"] = account.Name
+				serviceAccountLabels[account.Namespace+"/"+account.Name] = itemLabels
+			}
+		}
+	}
+	return namespaceLabels, serviceAccountLabels
+}
+
+func (s *Server) getDashboardNetworkPolicyCoverage(r *http.Request, cache *k8s.ResourceCache, namespaces []string) *DashboardNetworkPolicyCoverage {
+	npLister := cache.NetworkPolicies()
+	allNamespaces := namespaces == nil || (len(namespaces) == 0 && auth.UserFromContext(r.Context()) == nil)
 
 	var allNPs []npSelector
-	if len(namespaces) == 0 {
-		nps, err := npLister.List(labels.Everything())
-		if err != nil {
-			log.Printf("[dashboard] Failed to list NetworkPolicies: %v", err)
-			return nil
-		}
-		for _, np := range nps {
-			sel, err := metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)
+	if npLister != nil {
+		clusterWide, readableNamespaces := s.dashboardPolicyReadScope(r, namespaces, "", "networkpolicies")
+		if clusterWide {
+			nps, err := npLister.List(labels.Everything())
 			if err != nil {
-				continue
-			}
-			allNPs = append(allNPs, npSelector{np.Namespace, sel})
-		}
-	} else {
-		for _, ns := range namespaces {
-			nps, err := npLister.NetworkPolicies(ns).List(labels.Everything())
-			if err != nil {
-				log.Printf("[dashboard] Failed to list NetworkPolicies in namespace %s: %v", ns, err)
-				continue
+				log.Printf("[dashboard] Failed to list NetworkPolicies: %v", err)
+				return nil
 			}
 			for _, np := range nps {
 				sel, err := metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)
 				if err != nil {
 					continue
 				}
-				allNPs = append(allNPs, npSelector{np.Namespace, sel})
+				allNPs = append(allNPs, npSelector{namespace: np.Namespace, name: np.Name, selector: sel})
+			}
+		} else {
+			for _, ns := range readableNamespaces {
+				nps, err := npLister.NetworkPolicies(ns).List(labels.Everything())
+				if err != nil {
+					log.Printf("[dashboard] Failed to list NetworkPolicies in namespace %s: %v", ns, err)
+					continue
+				}
+				for _, np := range nps {
+					sel, err := metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)
+					if err != nil {
+						continue
+					}
+					allNPs = append(allNPs, npSelector{namespace: np.Namespace, name: np.Name, selector: sel})
+				}
 			}
 		}
 	}
 
-	if dynamicCache := dynCache; dynamicCache != nil {
-		if disc := discovery; disc != nil {
-			if cnpGVR, ok := disc.GetGVR("CiliumNetworkPolicy"); ok {
-				nsFilter := ""
-				if len(namespaces) == 1 {
-					nsFilter = namespaces[0]
+	var calicoPolicies []dashboardCalicoPolicy
+	seenCalicoPolicies := make(map[string]struct{})
+	if dynamicCache := s.dynCacheFor(r); dynamicCache != nil {
+		if discovery := s.discoveryFor(r); discovery != nil {
+			if cnpGVR, ok := discovery.GetGVRWithGroup("CiliumNetworkPolicy", "cilium.io"); ok {
+				clusterWide, readableNamespaces := s.dashboardPolicyReadScope(r, namespaces, cnpGVR.Group, cnpGVR.Resource)
+				var cnps []*unstructured.Unstructured
+				var err error
+				if clusterWide {
+					cnps, err = dynamicCache.List(cnpGVR, "")
+				} else if len(readableNamespaces) > 0 {
+					cnps, err = dynamicCache.ListNamespaces(cnpGVR, readableNamespaces)
 				}
-				cnps, err := dynamicCache.List(cnpGVR, nsFilter)
 				if err == nil {
 					for _, cnp := range cnps {
 						ns := cnp.GetNamespace()
-						if len(namespaces) > 1 && !slices.Contains(namespaces, ns) {
+						if !clusterWide && !slices.Contains(readableNamespaces, ns) {
 							continue
 						}
 						selectorMap, _, _ := unstructured.NestedMap(cnp.Object, "spec", "endpointSelector", "matchLabels")
 						if len(selectorMap) == 0 {
-							allNPs = append(allNPs, npSelector{ns, labels.Everything()})
+							allNPs = append(allNPs, npSelector{namespace: ns, name: cnp.GetName(), selector: labels.Everything(), cilium: true})
 						} else {
 							selectorLabels := make(map[string]string)
 							for k, v := range selectorMap {
@@ -1699,93 +1688,213 @@ func (s *Server) getDashboardNetworkPolicyCoverage(cache *k8s.ResourceCache, dyn
 								}
 							}
 							if sel, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: selectorLabels}); err == nil {
-								allNPs = append(allNPs, npSelector{ns, sel})
+								allNPs = append(allNPs, npSelector{namespace: ns, name: cnp.GetName(), selector: sel, cilium: true})
 							}
 						}
+					}
+				}
+			}
+
+			calicoDefinitions := topology.CalicoPolicyKinds()
+			for _, group := range topology.CalicoAPIGroups() {
+				for _, definition := range calicoDefinitions {
+					gvr, ok := discovery.GetGVRWithGroup(definition.Kind, group)
+					if !ok {
+						continue
+					}
+					var policies []*unstructured.Unstructured
+					var err error
+					if definition.Namespaced {
+						clusterWide, readableNamespaces := s.dashboardPolicyReadScope(r, namespaces, group, gvr.Resource)
+						if clusterWide {
+							policies, err = dynamicCache.List(gvr, "")
+						} else if len(readableNamespaces) > 0 {
+							policies, err = dynamicCache.ListNamespaces(gvr, readableNamespaces)
+						}
+					} else {
+						if s.canRead(r, group, gvr.Resource, "", "list") {
+							policies, err = dynamicCache.List(gvr, "")
+						}
+					}
+					if err != nil {
+						continue
+					}
+					for _, policy := range policies {
+						identity := definition.Kind + "\x00" + policy.GetNamespace() + "\x00" + policy.GetName()
+						if _, seen := seenCalicoPolicies[identity]; seen {
+							continue
+						}
+						seenCalicoPolicies[identity] = struct{}{}
+						calicoPolicies = append(calicoPolicies, dashboardCalicoPolicy{
+							policy:             policy,
+							matcher:            topology.CompileCalicoPolicyMatcher(policy),
+							definition:         definition,
+							previewsProtection: !definition.Staged || topology.CalicoStagedActionPreviewsProtection(policy),
+							stagesRemoval:      definition.Staged && topology.CalicoStagedActionStagesRemoval(policy),
+						})
 					}
 				}
 			}
 		}
 	}
 
-	covered := make(map[string]bool)
-	totalWorkloads := 0
-
-	checkCoverage := func(kind, ns, name string, templateLabels map[string]string) {
-		key := kind + "/" + ns + "/" + name
-		totalWorkloads++
-		for _, np := range allNPs {
-			if np.namespace != ns {
-				continue
-			}
-			if np.selector.Matches(labels.Set(templateLabels)) {
-				covered[key] = true
-				break
-			}
+	workloads := make([]dashboardPolicyWorkload, 0)
+	addWorkload := func(kind, ns, name string, templateLabels map[string]string, serviceAccount string) {
+		if serviceAccount == "" {
+			serviceAccount = "default"
 		}
+		workloads = append(workloads, dashboardPolicyWorkload{
+			key:            kind + "/" + ns + "/" + name,
+			namespace:      ns,
+			labels:         templateLabels,
+			serviceAccount: serviceAccount,
+		})
 	}
 
 	if depLister := cache.Deployments(); depLister != nil {
-		if len(namespaces) == 0 {
+		if allNamespaces {
 			deps, _ := depLister.List(labels.Everything())
 			for _, d := range deps {
-				checkCoverage("Deployment", d.Namespace, d.Name, d.Spec.Template.Labels)
+				addWorkload("Deployment", d.Namespace, d.Name, d.Spec.Template.Labels, d.Spec.Template.Spec.ServiceAccountName)
 			}
 		} else {
 			for _, ns := range namespaces {
 				deps, _ := depLister.Deployments(ns).List(labels.Everything())
 				for _, d := range deps {
-					checkCoverage("Deployment", d.Namespace, d.Name, d.Spec.Template.Labels)
+					addWorkload("Deployment", d.Namespace, d.Name, d.Spec.Template.Labels, d.Spec.Template.Spec.ServiceAccountName)
 				}
 			}
 		}
 	}
 
 	if stsLister := cache.StatefulSets(); stsLister != nil {
-		if len(namespaces) == 0 {
+		if allNamespaces {
 			stss, _ := stsLister.List(labels.Everything())
 			for _, s := range stss {
-				checkCoverage("StatefulSet", s.Namespace, s.Name, s.Spec.Template.Labels)
+				addWorkload("StatefulSet", s.Namespace, s.Name, s.Spec.Template.Labels, s.Spec.Template.Spec.ServiceAccountName)
 			}
 		} else {
 			for _, ns := range namespaces {
 				stss, _ := stsLister.StatefulSets(ns).List(labels.Everything())
 				for _, s := range stss {
-					checkCoverage("StatefulSet", s.Namespace, s.Name, s.Spec.Template.Labels)
+					addWorkload("StatefulSet", s.Namespace, s.Name, s.Spec.Template.Labels, s.Spec.Template.Spec.ServiceAccountName)
 				}
 			}
 		}
 	}
 
 	if dsLister := cache.DaemonSets(); dsLister != nil {
-		if len(namespaces) == 0 {
+		if allNamespaces {
 			dss, _ := dsLister.List(labels.Everything())
 			for _, d := range dss {
-				checkCoverage("DaemonSet", d.Namespace, d.Name, d.Spec.Template.Labels)
+				addWorkload("DaemonSet", d.Namespace, d.Name, d.Spec.Template.Labels, d.Spec.Template.Spec.ServiceAccountName)
 			}
 		} else {
 			for _, ns := range namespaces {
 				dss, _ := dsLister.DaemonSets(ns).List(labels.Everything())
 				for _, d := range dss {
-					checkCoverage("DaemonSet", d.Namespace, d.Name, d.Spec.Template.Labels)
+					addWorkload("DaemonSet", d.Namespace, d.Name, d.Spec.Template.Labels, d.Spec.Template.Spec.ServiceAccountName)
 				}
 			}
 		}
 	}
 
+	covered := make(map[string]bool)
+	coveredIfStaged := make(map[string]bool)
+	// Both label maps exist only to evaluate Calico's namespace and
+	// service-account selectors. On a cluster without Calico policies, building
+	// them walks every namespace and every ServiceAccount for nothing, on a
+	// request the dashboard makes constantly.
+	namespaceLabels := make(map[string]map[string]string)
+	serviceAccountLabels := make(map[string]map[string]string)
+	if len(calicoPolicies) > 0 {
+		namespaceLabels, serviceAccountLabels = calicoSelectorLabels(cache)
+	}
+
+	// A staged deletion is a preview of protection going away, so the enforced
+	// policy it names must not count towards the projected coverage.
+	stagedForDeletion := make(map[stagedPolicyTarget]bool)
+	for _, policy := range calicoPolicies {
+		if !policy.stagesRemoval || policy.definition.Stages == "" {
+			continue
+		}
+		stagedForDeletion[stagedPolicyTarget{
+			kubernetesFamily: policy.definition.Kubernetes,
+			kind:             policy.definition.Stages,
+			namespace:        policy.policy.GetNamespace(),
+			name:             policy.policy.GetName(),
+		}] = true
+	}
+
+	for _, workload := range workloads {
+		for _, np := range allNPs {
+			// Both answers are settled once a policy that survives the staged set
+			// matches; the rest of the list cannot change either of them.
+			if covered[workload.key] && coveredIfStaged[workload.key] {
+				break
+			}
+			if np.namespace != workload.namespace || !np.selector.Matches(labels.Set(workload.labels)) {
+				continue
+			}
+			covered[workload.key] = true
+			if np.cilium || !stagedForDeletion[stagedPolicyTarget{kubernetesFamily: true, kind: "NetworkPolicy", namespace: np.namespace, name: np.name}] {
+				coveredIfStaged[workload.key] = true
+			}
+		}
+		calicoEndpointLabels := topology.CalicoEndpointLabels(workload.namespace, workload.labels)
+		for _, policy := range calicoPolicies {
+			if policy.definition.Namespaced && policy.policy.GetNamespace() != workload.namespace {
+				continue
+			}
+			policyLabels := calicoEndpointLabels
+			if policy.definition.Kubernetes {
+				policyLabels = workload.labels
+			}
+			matched, valid := policy.matcher.Matches(
+				policyLabels,
+				namespaceLabels[workload.namespace],
+				workload.serviceAccount,
+				serviceAccountLabels[workload.namespace+"/"+workload.serviceAccount],
+			)
+			if !valid || !matched {
+				continue
+			}
+			if policy.definition.Staged {
+				if policy.previewsProtection {
+					coveredIfStaged[workload.key] = true
+				}
+				continue
+			}
+			covered[workload.key] = true
+			if !stagedForDeletion[stagedPolicyTarget{kind: policy.definition.Kind, namespace: policy.policy.GetNamespace(), name: policy.policy.GetName()}] {
+				coveredIfStaged[workload.key] = true
+			}
+		}
+	}
+
+	stagedPolicies := 0
+	for _, policy := range calicoPolicies {
+		if policy.definition.Staged {
+			stagedPolicies++
+		}
+	}
+
 	return &DashboardNetworkPolicyCoverage{
-		TotalPolicies:    len(allNPs),
-		CoveredWorkloads: len(covered),
-		TotalWorkloads:   totalWorkloads,
+		TotalPolicies:            len(allNPs) + len(calicoPolicies),
+		StagedPolicies:           stagedPolicies,
+		CoveredWorkloads:         len(covered),
+		CoveredWorkloadsIfStaged: len(coveredIfStaged),
+		TotalWorkloads:           len(workloads),
 	}
 }
 
 // DashboardAudit is the audit summary in the dashboard response.
 type DashboardAudit struct {
-	Passing    int                                 `json:"passing"`
-	Warning    int                                 `json:"warning"`
-	Danger     int                                 `json:"danger"`
-	Categories map[string]DashboardCategorySummary `json:"categories"`
+	MissingInputs []string                            `json:"missingInputs,omitempty"`
+	Passing       int                                 `json:"passing"`
+	Warning       int                                 `json:"warning"`
+	Danger        int                                 `json:"danger"`
+	Categories    map[string]DashboardCategorySummary `json:"categories"`
 }
 
 // DashboardCategorySummary provides per-category counts for the dashboard.
@@ -1795,8 +1904,8 @@ type DashboardCategorySummary struct {
 	Danger  int `json:"danger"`
 }
 
-func getDashboardAudit(cache *k8s.ResourceCache, namespaces []string) *DashboardAudit {
-	results := applyAuditSettings(getCachedResults(cache, namespaces), getAuditConfig())
+func (s *Server) getDashboardAudit(r *http.Request, cache *k8s.ResourceCache, namespaces []string) *DashboardAudit {
+	results := applyAuditSettings(getCachedResults(cache, namespaces, s.auditOptions(r)), getAuditConfig())
 	if results == nil {
 		return nil
 	}
@@ -1809,9 +1918,10 @@ func getDashboardAudit(cache *k8s.ResourceCache, namespaces []string) *Dashboard
 		}
 	}
 	return &DashboardAudit{
-		Passing:    results.Summary.Passing,
-		Warning:    results.Summary.Warning,
-		Danger:     results.Summary.Danger,
-		Categories: cats,
+		MissingInputs: results.MissingInputs,
+		Passing:       results.Summary.Passing,
+		Warning:       results.Summary.Warning,
+		Danger:        results.Summary.Danger,
+		Categories:    cats,
 	}
 }

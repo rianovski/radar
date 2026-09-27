@@ -1,0 +1,62 @@
+# CNPG Backup objects. Their `status.phase` is patched by the script after the
+# operator is frozen — a Backup created against a running operator would be
+# picked up and driven to `failed` against the unreachable store, which is a
+# different (and slower, and less controllable) state than the three below.
+#
+# Three phases on purpose:
+#   completed              — the healthy row
+#   walArchivingFailing    — Radar's own curated label, not a CNPG phase string
+#   an unmapped phase      — proves an unrecognised phase passes through
+#                            VERBATIM rather than being asserted healthy
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: pg-backup-ok
+  namespace: pg
+spec:
+  method: barmanObjectStore
+  cluster:
+    name: pg-healthy
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: pg-backup-wal-broken
+  namespace: pg
+spec:
+  method: barmanObjectStore
+  cluster:
+    name: pg-wal-failing
+---
+# The phase patched onto this one is not in Radar's map and never will be. It
+# stands in for a future CNPG minor: the badge must show CNPG's own string
+# rather than inventing a state, and the Status filter must offer that same
+# string rather than a prettified guess.
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: pg-backup-unknown-phase
+  namespace: pg
+spec:
+  method: barmanObjectStore
+  cluster:
+    name: pg-healthy
+---
+# The plugin-method Backup. Every other Backup here uses the in-tree
+# barmanObjectStore method, so without this the plugin fields on the Backup
+# renderer have nothing in the cluster that can exercise them — the gap that
+# let them ship unlooked-at.
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: pg-backup-plugin
+  namespace: pg
+spec:
+  cluster:
+    name: pg-healthy
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+    parameters:
+      barmanObjectName: pg-store

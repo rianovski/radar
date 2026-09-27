@@ -1,0 +1,17 @@
+# The Rancher Restore itself — a foreign CR sharing Velero's plural.
+#
+# It must render through GenericRenderer with its own fields (Backup
+# Filename, Restore Completion Ts), leak no Velero strings, and NOT render
+# blank. Blank is the specific trap: the kind is in KNOWN_KINDS, so a
+# group-gated renderer that does not match suppresses GenericRenderer too
+# unless the fall-through is wired.
+---
+apiVersion: resources.cattle.io/v1
+kind: Restore
+metadata:
+  name: rancher-restore
+spec:
+  backupFilename: "rancher-backup-2026.tar.gz"
+status:
+  phase: "Completed"
+  restoreCompletionTs: "2026-08-08T01:00:00Z"

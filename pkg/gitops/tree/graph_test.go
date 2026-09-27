@@ -3,6 +3,7 @@ package tree
 import (
 	"testing"
 
+	"github.com/skyhook-io/radar/pkg/topology"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -52,5 +53,65 @@ func TestClassifyGitOpsKind(t *testing.T) {
 				t.Fatalf("got (%q, %q), want (%q, %q)", tool, kind, tt.wantTool, tt.wantKind)
 			}
 		})
+	}
+}
+
+func TestRolloutTopologyInfoAndPriority(t *testing.T) {
+	info := infoFromTopology(topology.Node{
+		Kind: topology.KindRollout,
+		Data: map[string]any{
+			"readyReplicas": int64(2),
+			"totalReplicas": int64(3),
+		},
+	})
+	if len(info) != 1 || info[0].Name != "Ready" || info[0].Value != "2/3" {
+		t.Fatalf("rollout info = %#v, want Ready 2/3", info)
+	}
+
+	if got, want := kindPriority("Rollout"), kindPriority("Deployment"); got != want {
+		t.Fatalf("rollout priority = %d, want deployment priority %d", got, want)
+	}
+}
+
+func TestServiceTopologyInfoShowsAllPorts(t *testing.T) {
+	info := infoFromTopology(topology.Node{
+		Kind: topology.KindService,
+		Data: map[string]any{
+			"type": "ClusterIP",
+			"ports": []map[string]any{
+				{"name": "http", "port": int32(80), "protocol": "TCP"},
+				{"name": "https", "port": int32(443), "protocol": "TCP"},
+			},
+		},
+	})
+	if len(info) != 1 || info[0].Name != "Service" || info[0].Value != "ClusterIP :80 +1 more" {
+		t.Fatalf("service info = %#v, want Service \"ClusterIP :80 +1 more\"", info)
+	}
+
+	singlePort := infoFromTopology(topology.Node{
+		Kind: topology.KindService,
+		Data: map[string]any{
+			"type":  "ClusterIP",
+			"ports": []map[string]any{{"port": int32(80), "protocol": "TCP"}},
+		},
+	})
+	if len(singlePort) != 1 || singlePort[0].Value != "ClusterIP :80" {
+		t.Fatalf("single-port service info = %#v, want Service \"ClusterIP :80\"", singlePort)
+	}
+}
+
+func TestSummarize_ExcludesRootAndGroupFromDegraded(t *testing.T) {
+	nodes := []Node{
+		{Role: RoleRoot, Ref: ResourceRef{Kind: "Application", Name: "app"}, Health: "Degraded", Sync: "OutOfSync"}, // the app itself — must NOT count
+		{Role: RoleDeclared, Ref: ResourceRef{Kind: "HTTPRoute", Name: "r"}, Health: "Degraded"},
+		{Role: RoleDeclared, Ref: ResourceRef{Kind: "Deployment", Name: "d"}, Health: "Healthy", Sync: "OutOfSync"},
+		{Role: RoleGroup, Ref: ResourceRef{Kind: "ConfigMap", Name: "3 ConfigMaps"}, Health: "Degraded", Count: 3}, // synthetic bucket — must NOT count
+	}
+	s := Summarize(nodes)
+	if s.Degraded != 1 {
+		t.Errorf("Degraded = %d, want 1 (only the managed HTTPRoute; not the app or the group)", s.Degraded)
+	}
+	if s.OutOfSync != 1 {
+		t.Errorf("OutOfSync = %d, want 1 (only the managed Deployment; not the app root)", s.OutOfSync)
 	}
 }

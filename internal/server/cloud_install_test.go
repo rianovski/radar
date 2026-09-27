@@ -1,0 +1,1115 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/skyhook-io/radar/internal/cloud"
+	"github.com/skyhook-io/radar/internal/cloudinstall"
+	"github.com/skyhook-io/radar/internal/helm"
+	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/pkg/subject"
+)
+
+const testToken = "rhc_SUPERSECRET_TEST_TOKEN"
+
+type fakePrepared struct {
+	mode      cloudinstall.ProvisionMode
+	namespace string
+	release   string
+}
+
+func (f *fakePrepared) Mode() cloudinstall.ProvisionMode { return f.mode }
+func (f *fakePrepared) Namespace() string                { return f.namespace }
+func (f *fakePrepared) ReleaseName() string              { return f.release }
+func (f *fakePrepared) ChartVersion() string             { return "1.9.0" }
+func (f *fakePrepared) AppVersion() string               { return "1.9.0" }
+func (f *fakePrepared) CurrentChartVersion() string      { return "1.8.0" }
+func (f *fakePrepared) CurrentRevision() int             { return 3 }
+func (f *fakePrepared) CurrentValues() helm.CloudUpgradeValuesSummary {
+	return helm.CloudUpgradeValuesSummary{}
+}
+func (f *fakePrepared) CurrentManifest() string { return "" }
+func (f *fakePrepared) TargetManifest() string  { return "kind: Deployment" }
+func (f *fakePrepared) Deployment() helm.DeploymentRef {
+	return helm.DeploymentRef{Namespace: f.namespace, Name: f.release}
+}
+
+type fakeConnectClient struct {
+	cr              *cloud.CreateResponse
+	createErr       error
+	pollErr         error
+	approve         chan *cloud.PollResponse
+	approveOnCancel *cloud.PollResponse
+	consume         chan error
+	// beforeApprovalReturn runs just before an approval is handed back, so a
+	// test can widen the window between "approved" and the provisioning claim.
+	beforeApprovalReturn func()
+	// beforeCreateReturn runs while the Hub connect request is still in flight.
+	beforeCreateReturn func()
+}
+
+func (f *fakeConnectClient) Create(_ context.Context, _ cloud.ConnectMetadata) (*cloud.CreateResponse, error) {
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	if f.beforeCreateReturn != nil {
+		f.beforeCreateReturn()
+	}
+	return f.cr, nil
+}
+
+func (f *fakeConnectClient) PollUntilApproved(ctx context.Context, _ *cloud.CreateResponse) (*cloud.PollResponse, error) {
+	if f.pollErr != nil {
+		return nil, f.pollErr
+	}
+	select {
+	case pr := <-f.approve:
+		if f.beforeApprovalReturn != nil {
+			f.beforeApprovalReturn()
+		}
+		return pr, nil
+	case <-ctx.Done():
+		if f.approveOnCancel != nil {
+			// Models finalPollAfterCancellation catching a racing approval.
+			return f.approveOnCancel, nil
+		}
+		// The real client wraps cancellation with an explicit "approval may
+		// have created a cluster" warning rather than returning it bare.
+		return nil, fmt.Errorf("%w: browser approval may have created a cluster in the Hub", ctx.Err())
+	}
+}
+
+func (f *fakeConnectClient) WaitUntilConsumed(ctx context.Context, _ *cloud.CreateResponse, _ time.Duration) error {
+	select {
+	case err := <-f.consume:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func testCreateResponse() *cloud.CreateResponse {
+	return &cloud.CreateResponse{
+		RequestID:            "req_1",
+		DeviceSecret:         "devsecret",
+		ConnectURL:           "https://app.test.example/connect/req_1",
+		ExpiresIn:            900,
+		TokenPickupExpiresIn: 1800,
+		PollInterval:         2,
+	}
+}
+
+type managerFixture struct {
+	m         *cloudInstallManager
+	connect   *fakeConnectClient
+	provision struct {
+		gotToken   string
+		gotCluster string
+		err        error
+		block      chan struct{}
+	}
+}
+
+func newManagerFixture(mode cloudinstall.ProvisionMode, planMode cloudinstall.InstallPlanMode, scanErr error) *managerFixture {
+	return newManagerFixtureOn(mode, planMode, scanErr, false)
+}
+
+func newManagerFixtureOn(mode cloudinstall.ProvisionMode, planMode cloudinstall.InstallPlanMode, scanErr error, shared bool) *managerFixture {
+	fx := &managerFixture{
+		connect: &fakeConnectClient{
+			cr:      testCreateResponse(),
+			approve: make(chan *cloud.PollResponse, 1),
+			consume: make(chan error, 1),
+		},
+	}
+	prepared := &fakePrepared{mode: mode, namespace: "radar", release: "radar"}
+	fx.m = &cloudInstallManager{
+		cfg:            CloudConnectConfig{HubAPIURL: "https://api.test.example", HubAppURL: "https://app.test.example"},
+		sharedListener: func() bool { return shared },
+		backend: cloudInstallBackend{
+			captureClients: func() (cloudInstallClients, string, error) {
+				return cloudInstallClients{}, "kind-test", nil
+			},
+			inspectPlan: func(context.Context, cloudInstallClients, string, string) (cloudinstall.InstallPlan, error) {
+				return cloudinstall.InstallPlan{Mode: planMode, Namespace: "radar", Release: "radar", ClusterWideScanError: scanErr}, nil
+			},
+			prepare: func(context.Context, cloudInstallClients, cloudinstall.PrepareConfig) (preparedInstall, error) {
+				return prepared, nil
+			},
+			preflight: func(context.Context, cloudInstallClients, preparedInstall) (cloudinstall.PreflightResult, error) {
+				return cloudinstall.PreflightResult{}, nil
+			},
+			provision: func(_ context.Context, _ cloudInstallClients, _ preparedInstall, cfg cloudinstall.ProvisionConfig) error {
+				fx.provision.gotToken = cfg.Token
+				fx.provision.gotCluster = cfg.ClusterID
+				if fx.provision.block != nil {
+					<-fx.provision.block
+				}
+				return fx.provision.err
+			},
+			newConnectClient: func() cloudConnectClient { return fx.connect },
+			connectMetadata: func(_ context.Context, _ cloudInstallClients, name string) cloud.ConnectMetadata {
+				return cloud.ConnectMetadata{DeploymentMode: "in-cluster", ClusterName: name}
+			},
+		},
+	}
+	return fx
+}
+
+func waitForState(t *testing.T, m *cloudInstallManager, want string) cloudInstallStatus {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		st := m.status()
+		if st.State == want {
+			return st
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("state = %q, want %q (status %+v)", st.State, want, st)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// assertNoTokenInStatus is the load-bearing security check: the cluster token
+// must never serialize through the status API in any state.
+func assertNoTokenInStatus(t *testing.T, m *cloudInstallManager) {
+	t.Helper()
+	raw, err := json.Marshal(m.status())
+	if err != nil {
+		t.Fatalf("marshal status: %v", err)
+	}
+	if strings.Contains(string(raw), testToken) || strings.Contains(string(raw), "SUPERSECRET") {
+		t.Fatalf("status JSON leaks the cluster token: %s", raw)
+	}
+}
+
+func TestCloudInstallCommandTargetUsesContextSource(t *testing.T) {
+	m := &cloudInstallManager{
+		cfg: CloudConnectConfig{Kubeconfig: "/primary/config"},
+		backend: cloudInstallBackend{
+			contextSource: func(name string) (string, string, bool) {
+				if name != "prod (paris)" {
+					t.Fatalf("context source lookup = %q", name)
+				}
+				return "/clusters/paris.yaml", "prod", true
+			},
+		},
+	}
+
+	got := m.commandTarget("prod (paris)")
+	if got.Kubeconfig != "/clusters/paris.yaml" || got.Context != "prod" {
+		t.Fatalf("command target = %+v", got)
+	}
+}
+
+func TestCloudInstallCommandTargetFallsBackOutsideRegistry(t *testing.T) {
+	m := &cloudInstallManager{cfg: CloudConnectConfig{Kubeconfig: "/primary/config"}}
+	got := m.commandTarget("prod")
+	if got.Kubeconfig != "/primary/config" || got.Context != "prod" {
+		t.Fatalf("command target = %+v", got)
+	}
+}
+
+func TestCloudInstallHappyPathFreshNeverLeaksToken(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil)
+
+	flow, blocked, err := fx.m.prepare(context.Background())
+	if err != nil || blocked != nil {
+		t.Fatalf("prepare: flow=%v blocked=%+v err=%v", flow, blocked, err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+	if st.Plan == nil || st.Plan.Mode != "fresh" || st.Plan.ContextName != "kind-test" || st.Plan.DefaultClusterName == "" {
+		t.Fatalf("plan summary = %+v", st.Plan)
+	}
+	assertNoTokenInStatus(t, fx.m)
+
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID, ClusterName: "prod"}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	st = waitForState(t, fx.m, cloudFlowAwaitingApproval)
+	if st.ConnectURL == "" {
+		t.Fatalf("awaiting_approval status = %+v", st)
+	}
+	assertNoTokenInStatus(t, fx.m)
+
+	fx.connect.approve <- &cloud.PollResponse{Status: "approved", ClusterID: "cl_1", Token: testToken, WSSURL: "wss://api.test.example/agent"}
+	waitForState(t, fx.m, cloudFlowWaitingTunnel)
+	assertNoTokenInStatus(t, fx.m)
+
+	fx.connect.consume <- nil
+	st = waitForState(t, fx.m, cloudFlowConnected)
+	if st.Connected == nil || st.Connected.ClusterID != "cl_1" ||
+		st.Connected.ClusterURL != "https://app.test.example/c/cl_1" {
+		t.Fatalf("connected = %+v", st.Connected)
+	}
+	if fx.provision.gotToken != testToken || fx.provision.gotCluster != "cl_1" {
+		t.Fatalf("provision received token=%q cluster=%q", fx.provision.gotToken, fx.provision.gotCluster)
+	}
+	assertNoTokenInStatus(t, fx.m)
+
+	if err := fx.m.dismiss(st.FlowID); err != nil {
+		t.Fatalf("dismiss: %v", err)
+	}
+	if got := fx.m.status(); got.State != "idle" {
+		t.Fatalf("post-dismiss state = %q", got.State)
+	}
+}
+
+func TestCloudInstallGitOpsIsBlockedBeforeAnyHubContact(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeGitOps, nil)
+	_, blocked, err := fx.m.prepare(context.Background())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if blocked == nil || blocked.Reason != "gitops" || !strings.Contains(blocked.Message, "radar cloud install") {
+		t.Fatalf("blocked = %+v", blocked)
+	}
+	if st := fx.m.status(); st.State != "idle" {
+		t.Fatalf("blocked prepare retained a flow: %+v", st)
+	}
+}
+
+func TestCloudInstallPreflightBlockingIsSurfaced(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil)
+	fx.m.backend.preflight = func(context.Context, cloudInstallClients, preparedInstall) (cloudinstall.PreflightResult, error) {
+		return cloudinstall.PreflightResult{Blocking: []string{"create ClusterRoleBinding radar-cloud-owner"}}, nil
+	}
+	_, blocked, err := fx.m.prepare(context.Background())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if blocked == nil || blocked.Reason != "preflight" || len(blocked.Blocking) != 1 {
+		t.Fatalf("blocked = %+v", blocked)
+	}
+}
+
+func TestCloudInstallMultipleInstallsBlockedWithCLIHint(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil)
+	fx.m.backend.inspectPlan = func(context.Context, cloudInstallClients, string, string) (cloudinstall.InstallPlan, error) {
+		return cloudinstall.InstallPlan{}, &cloudinstall.MultipleTargetsError{Targets: []cloudinstall.RadarTarget{{Namespace: "a"}, {Namespace: "b"}}}
+	}
+	_, blocked, err := fx.m.prepare(context.Background())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if blocked == nil || !strings.Contains(blocked.Message, "radar cloud install --namespace") {
+		t.Fatalf("blocked = %+v", blocked)
+	}
+}
+
+func TestCloudInstallAdoptionRequiresConsent(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionAdopt, cloudinstall.InstallModeAdopt, nil)
+	_, _, err := fx.m.prepare(context.Background())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+	if st.Plan.CurrentRevision != 3 || st.Plan.CurrentChartVersion != "1.8.0" {
+		t.Fatalf("adoption summary = %+v", st.Plan)
+	}
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID}); err == nil || !strings.Contains(err.Error(), "consent") {
+		t.Fatalf("start without consent: %v", err)
+	}
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID, AcceptAdoption: true}); err != nil {
+		t.Fatalf("start with consent: %v", err)
+	}
+}
+
+func TestCloudInstallUncertaintyRequiresAcknowledgement(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, errors.New("namespaces forbidden"))
+	_, _, err := fx.m.prepare(context.Background())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+	if st.Plan.Uncertainty == "" {
+		t.Fatalf("uncertainty missing from summary: %+v", st.Plan)
+	}
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID}); err == nil || !strings.Contains(err.Error(), "acknowledgement") {
+		t.Fatalf("start without ack: %v", err)
+	}
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID, AcknowledgeIncompleteDiscovery: true}); err != nil {
+		t.Fatalf("start with ack: %v", err)
+	}
+}
+
+func TestCloudInstallApprovalTerminalOutcomes(t *testing.T) {
+	cases := []struct {
+		name      string
+		pollErr   error
+		wantKind  string
+		retrySafe bool
+	}{
+		{"expired", cloud.ErrConnectExpired, cloudFailExpired, true},
+		{"rejected", cloud.ErrConnectRejected, cloudFailRejected, true},
+		{"pickup expired", cloud.ErrConnectPickupExpired, cloudFailPickupExpired, false},
+		{"recovery timeout is ambiguous", cloud.ErrConnectRecoveryTimeout, cloudFailApprovalUnknown, false},
+		{"transport", errors.New("hub returned 502"), cloudFailApprovalPoll, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil)
+			fx.connect.pollErr = tc.pollErr
+			_, _, err := fx.m.prepare(context.Background())
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			st := waitForState(t, fx.m, cloudFlowReady)
+			if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID}); err != nil {
+				t.Fatalf("start: %v", err)
+			}
+			st = waitForState(t, fx.m, cloudFlowFailed)
+			if st.Failure.Kind != tc.wantKind || st.Failure.RetrySafe != tc.retrySafe {
+				t.Fatalf("failure = %+v, want kind %q retrySafe %v", st.Failure, tc.wantKind, tc.retrySafe)
+			}
+		})
+	}
+}
+
+// A cancel is never provably harmless: the Hub's approval page stays valid
+// until it expires, so an approval can commit after Radar stops polling.
+func TestCloudInstallCancelBeforeApprovalIsAmbiguous(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil)
+	_, _, err := fx.m.prepare(context.Background())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitForState(t, fx.m, cloudFlowAwaitingApproval)
+	if err := fx.m.cancelFlow(st.FlowID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	st = waitForState(t, fx.m, cloudFlowFailed)
+	if st.Failure.Kind != cloudFailApprovalUnknown || st.Failure.RetrySafe {
+		t.Fatalf("failure = %+v", st.Failure)
+	}
+	if st.Failure.Guidance == nil || !strings.HasSuffix(st.Failure.Guidance.ClusterURL, "/clusters") {
+		t.Fatalf("guidance = %+v", st.Failure.Guidance)
+	}
+}
+
+func TestCloudInstallCancelRacingApprovalReportsClusterExists(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil)
+	fx.connect.approveOnCancel = &cloud.PollResponse{Status: "approved", ClusterID: "cl_race", Token: testToken, WSSURL: "wss://api.test.example/agent"}
+	_, _, err := fx.m.prepare(context.Background())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitForState(t, fx.m, cloudFlowAwaitingApproval)
+	if err := fx.m.cancelFlow(st.FlowID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	st = waitForState(t, fx.m, cloudFlowFailed)
+	if st.Failure.Kind != cloudFailCanceledApproved || st.Failure.RetrySafe {
+		t.Fatalf("failure = %+v", st.Failure)
+	}
+	if st.Failure.Guidance == nil || !strings.Contains(st.Failure.Guidance.ClusterURL, "cl_race") {
+		t.Fatalf("guidance = %+v", st.Failure.Guidance)
+	}
+	assertNoTokenInStatus(t, fx.m)
+}
+
+func TestCloudInstallCancelDuringProvisioningRefused(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil)
+	fx.provision.block = make(chan struct{})
+	_, _, err := fx.m.prepare(context.Background())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	fx.connect.approve <- &cloud.PollResponse{Status: "approved", ClusterID: "cl_1", Token: testToken, WSSURL: "wss://api.test.example/agent"}
+	waitForState(t, fx.m, cloudFlowProvisioning)
+	if err := fx.m.cancelFlow(st.FlowID); err == nil || !strings.Contains(err.Error(), "cannot be canceled") {
+		t.Fatalf("cancel during provisioning: %v", err)
+	}
+	close(fx.provision.block)
+	fx.connect.consume <- nil
+	waitForState(t, fx.m, cloudFlowConnected)
+}
+
+func TestCloudInstallProvisionFailureCarriesRecoveryGuidance(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionAdopt, cloudinstall.InstallModeAdopt, nil)
+	fx.provision.err = &cloudinstall.AdoptionUpgradeError{Err: errors.New("upgrade failed"), RollbackVerified: true}
+	_, _, err := fx.m.prepare(context.Background())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID, AcceptAdoption: true}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	fx.connect.approve <- &cloud.PollResponse{Status: "approved", ClusterID: "cl_1", Token: testToken, WSSURL: "wss://api.test.example/agent"}
+	st = waitForState(t, fx.m, cloudFlowFailed)
+	if st.Failure.Kind != cloudFailProvision || st.Failure.Guidance == nil {
+		t.Fatalf("failure = %+v", st.Failure)
+	}
+	g := st.Failure.Guidance
+	if !strings.Contains(strings.Join(g.Lines, "\n"), "atomic rollback restored") {
+		t.Fatalf("guidance lines = %v", g.Lines)
+	}
+	if len(g.Inspect) == 0 || !strings.Contains(g.Inspect[0], "helm") {
+		t.Fatalf("guidance inspect = %v", g.Inspect)
+	}
+	assertNoTokenInStatus(t, fx.m)
+}
+
+func TestCloudInstallTunnelTimeoutCarriesGuidance(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil)
+	_, _, err := fx.m.prepare(context.Background())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	fx.connect.approve <- &cloud.PollResponse{Status: "approved", ClusterID: "cl_1", Token: testToken, WSSURL: "wss://api.test.example/agent"}
+	waitForState(t, fx.m, cloudFlowWaitingTunnel)
+	fx.connect.consume <- cloud.ErrConnectConsumptionTimeout
+	st = waitForState(t, fx.m, cloudFlowFailed)
+	if st.Failure.Kind != cloudFailTunnelUnconfirmed || st.Failure.Guidance == nil {
+		t.Fatalf("failure = %+v", st.Failure)
+	}
+	if !strings.Contains(st.Failure.Guidance.Summary, "five-minute confirmation window") {
+		t.Fatalf("guidance summary = %q", st.Failure.Guidance.Summary)
+	}
+}
+
+func TestCloudInstallSingleFlightAndStaleFlowIDs(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil)
+	_, _, err := fx.m.prepare(context.Background())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+
+	if _, _, err := fx.m.prepare(context.Background()); !errors.Is(err, errFlowActive) {
+		t.Fatalf("concurrent prepare: %v", err)
+	}
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: "stale"}); !errors.Is(err, errFlowStale) {
+		t.Fatalf("stale start: %v", err)
+	}
+	if err := fx.m.cancelFlow("stale"); !errors.Is(err, errFlowStale) {
+		t.Fatalf("stale cancel: %v", err)
+	}
+	if err := fx.m.dismiss(st.FlowID); err == nil {
+		t.Fatal("dismiss of non-terminal flow succeeded")
+	}
+	if err := fx.m.cancelFlow(st.FlowID); err != nil {
+		t.Fatalf("cancel ready flow (discard): %v", err)
+	}
+	if got := fx.m.status(); got.State != "idle" {
+		t.Fatalf("post-discard state = %q", got.State)
+	}
+}
+
+func TestCloudInstallEndpointGating(t *testing.T) {
+	oldMode := cloudConnectDeploymentMode
+	cloudConnectDeploymentMode = func() k8s.DeploymentMode { return k8s.DeploymentModeLocal }
+	t.Cleanup(func() { cloudConnectDeploymentMode = oldMode })
+
+	newSrv := func(listen string) *Server {
+		return &Server{
+			listenAddress:   listen,
+			cloudConnectCfg: CloudConnectConfig{HubAPIURL: "https://api.test.example", HubAppURL: "https://app.test.example"},
+			cloudInstall:    newCloudInstallManager(CloudConnectConfig{HubAPIURL: "https://api.test.example", HubAppURL: "https://app.test.example"}),
+		}
+	}
+
+	// A shared listener does NOT disable the lane: /api/resources/apply and
+	// pods/exec are ungated there too, so this would hold the weaker capability
+	// to a higher bar. The exposure is surfaced on the plan card instead.
+	t.Run("non-loopback listener still serves, flagged as shared", func(t *testing.T) {
+		srv := newSrv("0.0.0.0")
+		w := httptest.NewRecorder()
+		srv.handleCloudInstallStatus(w, httptest.NewRequest(http.MethodGet, "/api/cloud/install/status", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+		}
+		if !srv.sharedListener() {
+			t.Fatal("0.0.0.0 not reported as a shared listener")
+		}
+		if loopback := newSrv("127.0.0.1"); loopback.sharedListener() {
+			t.Fatal("127.0.0.1 reported as a shared listener")
+		}
+	})
+
+	t.Run("auth enabled disables the lane", func(t *testing.T) {
+		srv := newSrv("127.0.0.1")
+		srv.authConfig.Mode = "proxy"
+		if srv.cloudConnectDriverEnabled() {
+			t.Fatal("driver lane enabled with auth on")
+		}
+	})
+
+	t.Run("loopback listener serves idle status with no-store", func(t *testing.T) {
+		srv := newSrv("127.0.0.1")
+		w := httptest.NewRecorder()
+		srv.handleCloudInstallStatus(w, httptest.NewRequest(http.MethodGet, "/api/cloud/install/status", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+		}
+		if cc := w.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Fatalf("Cache-Control = %q", cc)
+		}
+		var st cloudInstallStatus
+		if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil || st.State != "idle" {
+			t.Fatalf("body = %s err = %v", w.Body.String(), err)
+		}
+	})
+
+	t.Run("cross-origin mutations are refused", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			path    string
+			handler func(*Server, http.ResponseWriter, *http.Request)
+		}{
+			{"prepare", "/api/cloud/install/prepare", (*Server).handleCloudInstallPrepare},
+			{"start", "/api/cloud/install/start", (*Server).handleCloudInstallStart},
+			{"cancel", "/api/cloud/install/cancel", (*Server).handleCloudInstallCancel},
+			{"dismiss", "/api/cloud/install/dismiss", (*Server).handleCloudInstallDismiss},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				srv := newSrv("127.0.0.1")
+				req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader("{}"))
+				req.Header.Set("Origin", "https://evil.example")
+				w := httptest.NewRecorder()
+				tt.handler(srv, w, req)
+				if w.Code != http.StatusForbidden {
+					t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+				}
+				if body := w.Body.String(); !strings.Contains(body, "cross-origin requests are not allowed") {
+					t.Fatalf("body = %q, want the cross-origin rejection", body)
+				}
+			})
+		}
+	})
+
+	t.Run("tunnel-configured deployment gets no capability at all", func(t *testing.T) {
+		srv := newSrv("127.0.0.1")
+		srv.cloudConnectCfg.CloudTunnelConfigured = true
+		if cap := srv.cloudConnectCapability(); cap != nil {
+			t.Fatalf("capability = %+v, want nil — an already-connected cluster must not be pitched", cap)
+		}
+	})
+
+	t.Run("wizard lane capability when driver disabled", func(t *testing.T) {
+		t.Setenv("RADAR_CLOUD_FUNNEL", "on")
+		srv := newSrv("127.0.0.1")
+		srv.authConfig.Mode = "proxy"
+		cap := srv.cloudConnectCapability()
+		if cap == nil || cap.Lane != "wizard" || cap.AppURL != "https://app.test.example" {
+			t.Fatalf("capability = %+v", cap)
+		}
+	})
+
+	// apiUrl is what enables the dialog's live-copy fetch, so its presence is a
+	// server-side decision the frontend never second-guesses.
+	t.Run("capability carries the Hub API origin for the live-copy fetch", func(t *testing.T) {
+		t.Setenv("RADAR_CLOUD_FUNNEL", "on")
+		srv := newSrv("127.0.0.1")
+		cap := srv.cloudConnectCapability()
+		if cap == nil || cap.APIURL != "https://api.test.example" {
+			t.Fatalf("capability = %+v, want apiUrl https://api.test.example", cap)
+		}
+	})
+
+	t.Run("production constructor wires the shared-listener probe", func(t *testing.T) {
+		srv := New(Config{DevMode: true, ListenAddress: "0.0.0.0"})
+		if srv.cloudInstall.sharedListener == nil || !srv.cloudInstall.sharedListener() {
+			t.Fatal("New did not wire the shared-listener acknowledgement probe")
+		}
+		if loopback := New(Config{DevMode: true, ListenAddress: "127.0.0.1"}); loopback.cloudInstall.sharedListener() {
+			t.Fatal("loopback listener reported as shared")
+		}
+	})
+
+	t.Run("driver lane capability on loopback", func(t *testing.T) {
+		t.Setenv("RADAR_CLOUD_FUNNEL", "on")
+		srv := newSrv("127.0.0.1")
+		cap := srv.cloudConnectCapability()
+		if cap.Lane != "driver" {
+			t.Fatalf("capability = %+v", cap)
+		}
+	})
+
+	t.Run("out-of-cohort rollout hides the capability", func(t *testing.T) {
+		t.Setenv("RADAR_CLOUD_FUNNEL", "off")
+		srv := newSrv("127.0.0.1")
+		if cap := srv.cloudConnectCapability(); cap != nil {
+			t.Fatalf("capability = %+v, want nil during staged rollout opt-out", cap)
+		}
+	})
+
+	t.Run("existing cloud tunnel disables the driver lane", func(t *testing.T) {
+		srv := newSrv("127.0.0.1")
+		srv.cloudConnectCfg.CloudTunnelConfigured = true
+		if srv.cloudConnectDriverEnabled() {
+			t.Fatal("driver lane enabled despite --cloud-url")
+		}
+	})
+}
+
+func TestCloudInstallStatusJSONNeverContainsTokenField(t *testing.T) {
+	// Compile-time-ish guard: the wire structs must not even declare a token
+	// field, so a future refactor can't quietly add one.
+	for _, typ := range []any{cloudInstallStatus{}, cloudInstallConnected{}, cloudInstallFailure{}, cloudInstallPlanSummary{}} {
+		raw, err := json.Marshal(typ)
+		if err != nil {
+			t.Fatalf("marshal %T: %v", typ, err)
+		}
+		if strings.Contains(strings.ToLower(string(raw)), "token") {
+			t.Fatalf("%T serializes a token-named field: %s", typ, raw)
+		}
+	}
+	if strings.Contains(strings.ToLower(fmt.Sprintf("%+v", cloudInstallStatus{})), "token") {
+		t.Fatal("cloudInstallStatus carries a token-named field")
+	}
+}
+
+// A cancel accepted while the approval poll is returning must not be followed
+// by a Helm apply: the user got a success response for the cancel.
+func TestCloudInstallCancelAcceptedBeforeProvisionBlocksTheApply(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil)
+	fx.m.backend.provision = func(context.Context, cloudInstallClients, preparedInstall, cloudinstall.ProvisionConfig) error {
+		t.Error("provision ran after the cancel was accepted")
+		return nil
+	}
+
+	if _, _, err := fx.m.prepare(context.Background()); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitForState(t, fx.m, cloudFlowAwaitingApproval)
+
+	// Cancel from inside the approval hook: the poll has already committed to
+	// returning an approval, so this deterministically exercises the window
+	// between "approved" and the provisioning claim rather than racing the
+	// poll's own select.
+	fx.connect.beforeApprovalReturn = func() {
+		if err := fx.m.cancelFlow(st.FlowID); err != nil {
+			t.Errorf("cancel during approval: %v", err)
+		}
+	}
+	fx.connect.approve <- &cloud.PollResponse{Status: "approved", ClusterID: "cl_race", Token: testToken, WSSURL: "wss://api.test.example/agent"}
+
+	st = waitForState(t, fx.m, cloudFlowFailed)
+	if st.Failure.Kind != cloudFailCanceledApproved || st.Failure.RetrySafe {
+		t.Fatalf("failure = %+v", st.Failure)
+	}
+	if st.Failure.Guidance == nil || !strings.Contains(st.Failure.Guidance.ClusterURL, "cl_race") {
+		t.Fatalf("guidance = %+v", st.Failure.Guidance)
+	}
+	assertNoTokenInStatus(t, fx.m)
+}
+
+// Cancel during `starting` has no context to cancel yet (the Hub request is in
+// flight), so it must be honored before the run goroutine is launched.
+func TestCloudInstallCancelDuringStartingDoesNotLaunchTheFlow(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil)
+	fx.m.backend.provision = func(context.Context, cloudInstallClients, preparedInstall, cloudinstall.ProvisionConfig) error {
+		t.Error("provision ran for a canceled start")
+		return nil
+	}
+	if _, _, err := fx.m.prepare(context.Background()); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+
+	// Cancel lands while Create is still running.
+	fx.connect.beforeCreateReturn = func() {
+		if err := fx.m.cancelFlow(st.FlowID); err != nil {
+			t.Errorf("cancel during starting: %v", err)
+		}
+	}
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	got := fx.m.status()
+	if got.State != cloudFlowFailed || got.Failure.Kind != cloudFailCanceled || !got.Failure.RetrySafe {
+		t.Fatalf("status = %+v", got)
+	}
+	// Approval must never have been polled.
+	select {
+	case fx.connect.approve <- &cloud.PollResponse{Status: "approved", ClusterID: "cl_x", Token: testToken}:
+	default:
+		t.Fatal("approval channel was consumed by a flow that should not have launched")
+	}
+}
+
+// The plan card must be able to warn that anyone reachable on this listener
+// could approve the connection into their own org.
+func TestCloudInstallPlanFlagsSharedListener(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		fx := newManagerFixtureOn(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil, shared)
+		if _, _, err := fx.m.prepare(context.Background()); err != nil {
+			t.Fatalf("prepare: %v", err)
+		}
+		st := waitForState(t, fx.m, cloudFlowReady)
+		if st.Plan.SharedListener != shared {
+			t.Fatalf("sharedListener = %v, want %v", st.Plan.SharedListener, shared)
+		}
+	}
+}
+
+// A shared listener means the approver may not be the operator, and the
+// binding outlives the request — so it must be an explicit decision.
+func TestCloudInstallSharedListenerRequiresAcknowledgement(t *testing.T) {
+	fx := newManagerFixtureOn(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil, true)
+	if _, _, err := fx.m.prepare(context.Background()); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+	if !st.Plan.SharedListener {
+		t.Fatal("plan did not flag the shared listener")
+	}
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID}); err == nil || !strings.Contains(err.Error(), "acknowledgement") {
+		t.Fatalf("start without acknowledgement: %v", err)
+	}
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID, AcknowledgeSharedListener: true}); err != nil {
+		t.Fatalf("start with acknowledgement: %v", err)
+	}
+}
+
+// Loopback must not demand the extra click.
+func TestCloudInstallLoopbackNeedsNoSharedAcknowledgement(t *testing.T) {
+	fx := newManagerFixtureOn(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil, false)
+	if _, _, err := fx.m.prepare(context.Background()); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID}); err != nil {
+		t.Fatalf("start on loopback: %v", err)
+	}
+}
+
+// The shared-listener lane must work for the browser it exists for: a page
+// served from the same non-loopback authority is same-origin and must pass,
+// while a genuinely foreign origin must not.
+func TestSameOriginOKAcceptsTheServingAuthority(t *testing.T) {
+	cases := []struct {
+		name, host, origin string
+		devMode            bool
+		fetchSite          string
+		want               bool
+	}{
+		{name: "no origin (non-browser)", host: "10.0.0.5:9280", want: true},
+		{name: "same non-loopback authority", host: "10.0.0.5:9280", origin: "http://10.0.0.5:9280", want: true},
+		{name: "hostname case is ignored", host: "Radar.Example.com:9280", origin: "http://radar.example.com:9280", want: true},
+		{name: "same loopback authority", host: "127.0.0.1:9280", origin: "http://127.0.0.1:9280", want: true},
+		{name: "vite dev proxy, loopback to loopback", host: "localhost:9280", origin: "http://localhost:9273", devMode: true, want: true},
+		{name: "vite port outside dev mode", host: "localhost:9280", origin: "http://localhost:9273", want: false},
+		{name: "unrelated port in dev mode", host: "localhost:9280", origin: "http://localhost:9274", devMode: true, want: false},
+		{name: "bracketed IPv6 Vite proxy", host: "[::1]", origin: "http://[::1]:9273", devMode: true, want: true},
+		{name: "foreign origin", host: "10.0.0.5:9280", origin: "http://evil.example", want: false},
+		{name: "lookalike hostname", host: "10.0.0.5:9280", origin: "http://localhost.evil.com", want: false},
+		{name: "different port on the same non-loopback host", host: "10.0.0.5:9280", origin: "http://10.0.0.5:9999", want: false},
+		{name: "loopback origin against a non-loopback host", host: "10.0.0.5:9280", origin: "http://127.0.0.1:9280", want: false},
+		{name: "cross-site metadata without origin", host: "10.0.0.5:9280", fetchSite: "cross-site", want: false},
+		{name: "same-origin metadata survives rewritten host", host: "internal:9280", origin: "https://radar.example.com", fetchSite: "same-origin", want: true},
+		{name: "unparseable origin", host: "10.0.0.5:9280", origin: "://nope", want: false},
+		{name: "opaque (null) origin", host: "10.0.0.5:9280", origin: "null", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/api/cloud/install/prepare", nil)
+			r.Host = tc.host
+			if tc.origin != "" {
+				r.Header.Set("Origin", tc.origin)
+			}
+			if tc.fetchSite != "" {
+				r.Header.Set("Sec-Fetch-Site", tc.fetchSite)
+			}
+			s := &Server{devMode: tc.devMode}
+			if got := s.sameOriginOK(r); got != tc.want {
+				t.Fatalf("sameOriginOK(host=%q, origin=%q) = %v, want %v", tc.host, tc.origin, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSameOriginOKRejectsSchemeDowngrade(t *testing.T) {
+	cases := []struct {
+		name           string
+		tls            bool
+		forwardedProto string
+		origin         string
+		want           bool
+	}{
+		{"https request, http origin (downgrade)", true, "", "http://10.0.0.5:9280", false},
+		{"https request, https origin", true, "", "https://10.0.0.5:9280", true},
+		{"forwarded https, http origin (downgrade)", false, "https", "http://10.0.0.5:9280", false},
+		{"forwarded https, https origin", false, "https", "https://10.0.0.5:9280", true},
+		{"plain http request, http origin", false, "", "http://10.0.0.5:9280", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/api/cloud/install/prepare", nil)
+			r.Host = "10.0.0.5:9280"
+			if tc.tls {
+				r.TLS = &tls.ConnectionState{}
+			}
+			if tc.forwardedProto != "" {
+				r.Header.Set("X-Forwarded-Proto", tc.forwardedProto)
+			}
+			r.Header.Set("Origin", tc.origin)
+			if got := (&Server{}).sameOriginOK(r); got != tc.want {
+				t.Fatalf("sameOriginOK(tls=%v xfp=%q origin=%q) = %v, want %v", tc.tls, tc.forwardedProto, tc.origin, got, tc.want)
+			}
+		})
+	}
+}
+
+// An admission webhook can quote the Secret it denied, so a provisioning error
+// may carry the cluster token. It must not reach the status API — the wire
+// structs having no token FIELD is not enough when the value rides inside a
+// message string.
+func TestCloudInstallProvisionErrorNeverLeaksTokenIntoStatus(t *testing.T) {
+	fx := newManagerFixture(cloudinstall.ProvisionFresh, cloudinstall.InstallModeFresh, nil)
+	// The apiserver folds stringData into base64 `data` before admission runs,
+	// so a webhook quoting the object it denied reports the ENCODED token.
+	// Exercise both representations.
+	encoded := base64.StdEncoding.EncodeToString([]byte(testToken))
+	fx.provision.err = fmt.Errorf(
+		`admission webhook "policy.example.com" denied the request: Secret radar-cloud-config has disallowed data: {"token":%q} (raw %s)`,
+		encoded, testToken,
+	)
+
+	// Capture the log sink too — it is as readable as the status API.
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	if _, _, err := fx.m.prepare(context.Background()); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	st := waitForState(t, fx.m, cloudFlowReady)
+	if _, err := fx.m.start(cloudInstallStartRequest{FlowID: st.FlowID}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	fx.connect.approve <- &cloud.PollResponse{Status: "approved", ClusterID: "cl_1", Token: testToken, WSSURL: "wss://api.test.example/agent"}
+
+	st = waitForState(t, fx.m, cloudFlowFailed)
+	if st.Failure.Kind != cloudFailProvision {
+		t.Fatalf("failure = %+v", st.Failure)
+	}
+	assertNoTokenInStatus(t, fx.m)
+
+	// The operator still needs to see WHAT failed, just not the credential.
+	raw, _ := json.Marshal(st)
+	if !strings.Contains(string(raw), "admission webhook") {
+		t.Fatalf("redaction destroyed the diagnostic: %s", raw)
+	}
+	if !strings.Contains(string(raw), "[REDACTED]") {
+		t.Fatalf("expected an explicit redaction marker: %s", raw)
+	}
+	if strings.Contains(string(raw), encoded) {
+		t.Fatalf("status leaks the base64 token: %s", raw)
+	}
+	if got := logs.String(); strings.Contains(got, testToken) || strings.Contains(got, encoded) {
+		t.Fatalf("server log leaks the token: %s", got)
+	}
+}
+
+func TestConnectRequestFailureHeadlines(t *testing.T) {
+	dial := errors.New("dial tcp 127.0.0.1:9: connect: connection refused")
+	cases := []struct {
+		name        string
+		err         error
+		wantMessage string
+	}{
+		{"unreachable", &cloud.HubUnreachableError{HubBase: "http://127.0.0.1:9", Err: dial}, "Radar couldn't reach Radar Hub, so no connection was requested."},
+		{"other", errors.New("hub response missing required fields"), "Radar couldn't start the connection request."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := connectRequestFailure(tc.err)
+			if f.Kind != cloudFailConnectRequest || !f.RetrySafe {
+				t.Fatalf("kind/retrySafe = %q/%v", f.Kind, f.RetrySafe)
+			}
+			if f.Message != tc.wantMessage {
+				t.Fatalf("message = %q, want %q", f.Message, tc.wantMessage)
+			}
+			// The raw error is detail, never the headline.
+			if strings.Contains(f.Message, tc.err.Error()) {
+				t.Fatalf("headline carries the raw error: %q", f.Message)
+			}
+			if f.Guidance == nil || len(f.Guidance.Inspect) != 1 || f.Guidance.Inspect[0] != tc.err.Error() {
+				t.Fatalf("guidance.inspect = %+v, want the raw error", f.Guidance)
+			}
+		})
+	}
+}
+
+func TestInspectBlockedKeepsTheAdoptionTarget(t *testing.T) {
+	plan := cloudinstall.InstallPlan{Mode: cloudinstall.InstallModeAdopt, Namespace: "monitoring", Release: "radar-prod"}
+	denied := apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "radar-cloud-token",
+		errors.New(`User "dev" cannot get resource "secrets" in API group "" in the namespace "monitoring"`))
+	blocked, err := inspectBlocked(fmt.Errorf("inspect token Secret: %w", denied), attemptedFor(plan, attemptStagePrepare))
+	if err != nil || blocked == nil {
+		t.Fatalf("blocked=%+v err=%v", blocked, err)
+	}
+	if blocked.Cause != string(cloudinstall.BlockCausePermissions) {
+		t.Fatalf("cause = %q, want permissions", blocked.Cause)
+	}
+	// The link the card builds must still adopt the release inspection found,
+	// not open a fresh install over it.
+	if blocked.Attempted == nil || blocked.Attempted.Mode != "adopt" || blocked.Attempted.Release != "radar-prod" || blocked.Attempted.Namespace != "monitoring" || blocked.Attempted.Stage != attemptStagePrepare {
+		t.Fatalf("attempted = %+v, want the adoption target", blocked.Attempted)
+	}
+	// A refusal that is not about permissions keeps the target too.
+	refused, err := inspectBlocked(errors.New("Helm release \"radar-prod\" in namespace \"monitoring\" cannot be adopted: already connected"), attemptedFor(plan, attemptStagePrepare))
+	if err != nil || refused.Reason != "unsupported" || refused.Attempted == nil || refused.Attempted.Mode != "adopt" {
+		t.Fatalf("refused=%+v err=%v", refused, err)
+	}
+}
+
+func TestInspectBlockedOffersFreshOnlyWhenNothingRunsAndTheScanWasComplete(t *testing.T) {
+	err := errors.New(`secrets is forbidden: User "dev" cannot list resource "secrets" in API group "" in the namespace "radar"`)
+	// Mirrors runPrepare's switch over ReleaseInspectError.
+	pick := func(e *cloudinstall.ReleaseInspectError) *cloudInstallAttempted {
+		switch {
+		case e.Existing:
+			return &cloudInstallAttempted{Mode: "adopt", Namespace: e.Namespace, Release: e.Release, Stage: attemptStageInspect}
+		case !e.Found && !e.ScanIncomplete:
+			return &cloudInstallAttempted{Mode: "fresh", Namespace: e.Namespace, Release: e.Release, Stage: attemptStageInspect, ReleaseUnread: true}
+		}
+		return nil
+	}
+	// A Radar Deployment without matching native-Helm ownership is neither
+	// adoptable nor absent: no target is offered at all.
+	if unmanaged := pick(&cloudinstall.ReleaseInspectError{Namespace: "radar", Release: "radar", Found: true, Existing: false, Err: err}); unmanaged != nil {
+		t.Fatalf("an unmanaged Deployment must not become an install target: %+v", unmanaged)
+	}
+	complete := pick(&cloudinstall.ReleaseInspectError{Namespace: "radar", Release: "radar", Err: err})
+	if complete == nil || complete.Mode != "fresh" || !complete.ReleaseUnread {
+		t.Fatalf("a complete scan finding nothing offers fresh, flagged unconfirmed: %+v", complete)
+	}
+	if partial := pick(&cloudinstall.ReleaseInspectError{Namespace: "radar", Release: "radar", ScanIncomplete: true, Err: err}); partial != nil {
+		t.Fatalf("a partial scan establishes nothing: %+v", partial)
+	}
+	blocked, berr := inspectBlocked(err, complete)
+	if berr != nil || blocked.Cause != string(cloudinstall.BlockCausePermissions) || blocked.Attempted != complete {
+		t.Fatalf("blocked=%+v err=%v", blocked, berr)
+	}
+}
+
+func TestAttemptedForFlagsAFreshPlanFromAPartialScan(t *testing.T) {
+	partial := cloudinstall.InstallPlan{Mode: cloudinstall.InstallModeFresh, Namespace: "radar", Release: "radar", ClusterWideScanError: errors.New("deployments is forbidden")}
+	got := attemptedFor(partial, attemptStagePreflight)
+	// The stage reached is still told — the refusals below describe a dry run
+	// that did run — but the target is not one the card may link to.
+	if got == nil || got.Stage != attemptStagePreflight || !got.PartialScan {
+		t.Fatalf("attempted = %+v, want the preflight stage flagged as a partial scan", got)
+	}
+	adopt := partial
+	adopt.Mode = cloudinstall.InstallModeAdopt
+	if got := attemptedFor(adopt, attemptStagePreflight); got == nil || got.PartialScan {
+		t.Fatalf("an adopt target is established regardless of scan scope: %+v", got)
+	}
+	complete := cloudinstall.InstallPlan{Mode: cloudinstall.InstallModeFresh, Namespace: "radar", Release: "radar"}
+	if got := attemptedFor(complete, attemptStagePreflight); got == nil || got.PartialScan {
+		t.Fatalf("a complete scan establishes fresh: %+v", got)
+	}
+}
+
+func TestGitOpsBlockedCarriesTheVerifiedOwnersMethod(t *testing.T) {
+	stale := cloudinstall.ControllerCandidate{Ref: subject.Ref{Group: "argoproj.io", Kind: "Application", Name: "old"}, Verification: cloudinstall.ControllerStale}
+	verified := cloudinstall.ControllerCandidate{Ref: subject.Ref{Group: "helm.toolkit.fluxcd.io", Kind: "HelmRelease", Name: "radar"}, Verification: cloudinstall.ControllerVerified}
+	// Candidate order is not confidence order: the stale Argo CD candidate
+	// comes first, and the method must still come from the verified Flux owner.
+	owner := verifiedController([]cloudinstall.ControllerCandidate{stale, verified})
+	if owner == nil || wizardMethodFor(owner.Ref) != "flux" {
+		t.Fatalf("verified owner not selected: %+v", owner)
+	}
+	if verifiedController([]cloudinstall.ControllerCandidate{stale}) != nil {
+		t.Fatal("a stale-only candidate list must not pick a method")
+	}
+}
+
+func TestDiscoverConnectedNamesAlreadyCloudDeployments(t *testing.T) {
+	m := newCloudInstallManager(CloudConnectConfig{HubAPIURL: "https://api.test.example", HubAppURL: "https://app.test.example"})
+	m.backend.captureClients = func() (cloudInstallClients, string, error) { return cloudInstallClients{}, "kind-dev", nil }
+	m.backend.discover = func(context.Context, cloudInstallClients) (cloudinstall.DiscoveryResult, error) {
+		return cloudinstall.DiscoveryResult{
+			Namespace: []cloudinstall.RadarTarget{
+				{Namespace: "legacy", DeploymentName: "radar", ReleaseName: "radar", Runtime: cloudinstall.DeploymentRuntime{
+					AlreadyCloud: true, CloudTokenConfigured: true,
+				}},
+			},
+			ClusterWide: []cloudinstall.RadarTarget{
+				// An explicit default port is still our Hub.
+				{Namespace: "radar", DeploymentName: "radar", ReleaseName: "radar", Runtime: cloudinstall.DeploymentRuntime{
+					AlreadyCloud: true, CloudURLConfigured: true, CloudURL: "wss://api.test.example:443/agent",
+					ClusterNameConfigured: true, ClusterName: "abc123",
+				}},
+				{Namespace: "tools", DeploymentName: "radar", ReleaseName: "radar", Runtime: cloudinstall.DeploymentRuntime{}},
+				{Namespace: "ops", DeploymentName: "radar", Runtime: cloudinstall.DeploymentRuntime{
+					AlreadyCloud: true, CloudURLConfigured: true, CloudURL: "wss://hub.corp.example/agent",
+					ClusterNameConfigured: true, ClusterName: "def456",
+				}},
+				{Namespace: "staging", DeploymentName: "radar", ReleaseName: "radar", Runtime: cloudinstall.DeploymentRuntime{
+					AlreadyCloud: true, CloudURLConfigured: true, CloudURL: "wss://api.test.example/agent",
+					ClusterNameConfigured: true, ClusterNameUnresolved: true,
+				}},
+			},
+			ClusterWideError: errors.New("forbidden"),
+		}, nil
+	}
+
+	got, err := m.discoverConnected(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.PartialScan {
+		t.Fatal("a refused cluster-wide list must be reported as a partial scan")
+	}
+	if len(got.Connected) != 4 {
+		t.Fatalf("connected = %+v, want the four Deployments carrying Cloud settings", got.Connected)
+	}
+	// Linkable first, then nameable, then settings-only — regardless of discovery order.
+	if got.Connected[0].ClusterURL != "https://app.test.example/c/abc123" || got.Connected[0].HubHost != "" {
+		t.Errorf("configured Hub + literal cluster id should deep-link and lead: %+v", got.Connected[0])
+	}
+	if got.Connected[1].ClusterURL != "https://app.test.example/clusters" {
+		t.Errorf("a cluster id read from a Secret ref falls back to the clusters list: %+v", got.Connected[1])
+	}
+	if got.Connected[2].ClusterURL != "" || got.Connected[2].HubHost != "hub.corp.example" {
+		t.Errorf("another Hub is named by host, never linked through ours: %+v", got.Connected[2])
+	}
+	if got.Connected[3].Namespace != "legacy" || got.Connected[3].ClusterURL != "" || got.Connected[3].HubHost != "" {
+		t.Errorf("settings without a resolvable URL say nothing about where, and sort last: %+v", got.Connected[3])
+	}
+}

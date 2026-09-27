@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"slices"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,7 +19,7 @@ import (
 // AllowedNamespaces describes namespace-list scope for *namespaced* resources:
 //
 //   - nil:  user can list namespaced resources cluster-wide (no per-namespace
-//           filter required at read time)
+//     filter required at read time)
 //   - []:   user has no namespace access — every read returns empty
 //   - non-empty: user can read only the listed namespaces
 //
@@ -79,9 +81,51 @@ func (p *UserPermissions) SetCanI(verb, group, resource, namespace string, allow
 // PermissionCache caches per-user permission lookups (thread-safe)
 type PermissionCache struct {
 	mu          sync.RWMutex
-	cache       map[string]*UserPermissions // keyed by username
+	cache       map[string]*UserPermissions // keyed by cacheKey(username, groups)
 	ttl         time.Duration
 	contextName func() string // current K8s context; entries with a different stamp are invisible
+}
+
+// cacheKeySep separates the username from the groups fingerprint in a cache
+// key. It is a control byte that cannot appear in a Kubernetes username or
+// group name, so a username's entries remain enumerable by splitting on it.
+const cacheKeySep = "\x00"
+
+// cacheKey builds the composite cache key for an identity. The verdicts stored
+// in a UserPermissions entry are computed by SubjectAccessReviews that run with
+// the username AND its groups, so an entry is only valid for that exact
+// (username, groups) identity — keying by username alone lets a different group
+// set inherit another identity's RBAC ceiling for the cache TTL. Groups are
+// canonicalized (sorted + deduped) so order and duplicates don't fork the key;
+// empty/nil groups is a valid, distinct identity (not a wildcard).
+func cacheKey(username string, groups []string) string {
+	return username + cacheKeySep + groupsFingerprint(groups)
+}
+
+// groupsFingerprint returns a deterministic fingerprint of a group set:
+// sorted, deduped, and joined. Empty-string elements are dropped (an empty
+// group is not a real principal), so nil, [], [""], and ["", ""] all
+// fingerprint to "" — one identity. The proxy path already trims empties, but
+// the OIDC path (internal/auth/oidc.go) does not; dropping them here makes the
+// no-groups collision explicit rather than accidental.
+func groupsFingerprint(groups []string) string {
+	if len(groups) == 0 {
+		return ""
+	}
+	uniq := make([]string, 0, len(groups))
+	seen := make(map[string]struct{}, len(groups))
+	for _, g := range groups {
+		if g == "" {
+			continue // empty group is not a real principal
+		}
+		if _, ok := seen[g]; ok {
+			continue
+		}
+		seen[g] = struct{}{}
+		uniq = append(uniq, g)
+	}
+	sort.Strings(uniq)
+	return strings.Join(uniq, cacheKeySep)
 }
 
 // NewPermissionCache creates a new permission cache with a 2-minute TTL.
@@ -111,11 +155,11 @@ func (pc *PermissionCache) WithContextName(provider func() string) *PermissionCa
 
 // Get returns cached permissions for a user, or nil if not cached / expired
 // / stamped with a different context than the current one.
-func (pc *PermissionCache) Get(username string) *UserPermissions {
+func (pc *PermissionCache) Get(username string, groups []string) *UserPermissions {
 	pc.mu.RLock()
 	defer pc.mu.RUnlock()
 
-	perms, ok := pc.cache[username]
+	perms, ok := pc.cache[cacheKey(username, groups)]
 	if !ok || time.Now().After(perms.ExpiresAt) {
 		return nil
 	}
@@ -132,7 +176,7 @@ func (pc *PermissionCache) Get(username string) *UserPermissions {
 // current context so cross-cluster requests can't see it. Opportunistically
 // evicts expired entries so a long-running deploy with churning users
 // doesn't accumulate.
-func (pc *PermissionCache) Set(username string, perms *UserPermissions) {
+func (pc *PermissionCache) Set(username string, groups []string, perms *UserPermissions) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 
@@ -141,14 +185,15 @@ func (pc *PermissionCache) Set(username string, perms *UserPermissions) {
 	if pc.contextName != nil {
 		perms.ContextName = pc.contextName()
 	}
-	pc.cache[username] = perms
+	key := cacheKey(username, groups)
+	pc.cache[key] = perms
 
-	for u, p := range pc.cache {
-		if u == username {
+	for k, p := range pc.cache {
+		if k == key {
 			continue
 		}
 		if now.After(p.ExpiresAt) {
-			delete(pc.cache, u)
+			delete(pc.cache, k)
 		}
 	}
 }
@@ -240,30 +285,47 @@ func DiscoverNamespaces(ctx context.Context, client kubernetes.Interface, userna
 	return allowedNS, nil
 }
 
-// SubjectCanI performs a SubjectAccessReview (not SelfSubject) to check if a specific
-// user can perform an action. This uses the ServiceAccount's permissions to check
-// on behalf of the user.
-func SubjectCanI(ctx context.Context, client kubernetes.Interface, username string, groups []string, namespace, group, resource, verb string) (bool, error) {
+// ReviewSubjectAccess asks the apiserver authorizer whether a subject can
+// perform the action described by attrs.
+func ReviewSubjectAccess(ctx context.Context, client kubernetes.Interface, username string, groups []string, attrs authv1.ResourceAttributes) (authv1.SubjectAccessReviewStatus, error) {
 	review := &authv1.SubjectAccessReview{
 		Spec: authv1.SubjectAccessReviewSpec{
-			User:   username,
-			Groups: groups,
-			ResourceAttributes: &authv1.ResourceAttributes{
-				Namespace: namespace,
-				Group:     group,
-				Resource:  resource,
-				Verb:      verb,
-			},
+			User:               username,
+			Groups:             groups,
+			ResourceAttributes: &attrs,
 		},
 	}
 
 	result, err := client.AuthorizationV1().SubjectAccessReviews().Create(ctx, review, metav1.CreateOptions{})
 	if err != nil {
+		return authv1.SubjectAccessReviewStatus{}, err
+	}
+	return result.Status, nil
+}
+
+// SubjectCanI performs a SubjectAccessReview (not SelfSubject) to check if a specific
+// user can perform an action. This uses the ServiceAccount's permissions to check
+// on behalf of the user.
+func SubjectCanI(ctx context.Context, client kubernetes.Interface, username string, groups []string, namespace, group, resource, verb string) (bool, error) {
+	return SubjectCanISubresource(ctx, client, username, groups, namespace, group, resource, "", verb)
+}
+
+// SubjectCanISubresource performs the same impersonated authorization check
+// for an exact resource/subresource tuple such as nodes/proxy.
+func SubjectCanISubresource(ctx context.Context, client kubernetes.Interface, username string, groups []string, namespace, group, resource, subresource, verb string) (bool, error) {
+	status, err := ReviewSubjectAccess(ctx, client, username, groups, authv1.ResourceAttributes{
+		Namespace:   namespace,
+		Group:       group,
+		Resource:    resource,
+		Subresource: subresource,
+		Verb:        verb,
+	})
+	if err != nil {
 		log.Printf("[auth] SubjectAccessReview failed for user=%s %s %s/%s: %v", username, verb, group, resource, err)
 		return false, err
 	}
 
-	return result.Status.Allowed, nil
+	return status.Allowed, nil
 }
 
 // FilterNamespacesForUser intersects requested namespaces with user's allowed namespaces.

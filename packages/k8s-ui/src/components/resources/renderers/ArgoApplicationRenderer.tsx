@@ -1,4 +1,4 @@
-import { GitBranch, FolderTree, Settings, Target, XCircle, History, ListChecks } from 'lucide-react'
+import { GitBranch, FolderTree, Settings, Target, XCircle, History, ListChecks, ExternalLink } from 'lucide-react'
 import { clsx } from 'clsx'
 import { Section, PropertyList, Property, ConditionsSection, ProblemAlerts } from '../../ui/drawer-components'
 import { formatAge } from '../resource-utils'
@@ -10,6 +10,9 @@ import {
   type ArgoResource,
 } from '../../../types/gitops'
 import { BADGE_INACTIVE } from '../../../utils/badge-colors'
+import { buildRepoBrowseUrl, buildPathBrowseUrl } from '../../../utils/git-provider-urls'
+
+const REPO_LINK_CLASS = 'text-blue-400 hover:text-blue-300 hover:underline break-all'
 
 interface ArgoApplicationRendererProps {
   data: any
@@ -19,10 +22,51 @@ interface ArgoApplicationRendererProps {
 
 function SourceProperties({ source }: { source: any }) {
   if (!source) return null
+  // Helm chart sources point repoURL at a chart registry, not a browseable git repo.
+  const isHelmSource = !!source.chart
+  const repoHref = isHelmSource ? null : buildRepoBrowseUrl(source.repoURL)
+  const pathHref = isHelmSource ? null : buildPathBrowseUrl(source.repoURL, source.path, source.targetRevision)
   return (
     <>
-      <Property label="Repository" value={source.repoURL} />
-      {source.path && <Property label="Path" value={source.path} />}
+      <Property
+        label="Repository"
+        value={
+          repoHref ? (
+            <a
+              href={repoHref}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={source.repoURL}
+              className={`${REPO_LINK_CLASS} inline-flex items-center gap-1`}
+            >
+              {source.repoURL}
+              <ExternalLink className="w-3 h-3 shrink-0" />
+            </a>
+          ) : (
+            source.repoURL
+          )
+        }
+      />
+      {source.path && (
+        <Property
+          label="Path"
+          value={
+            pathHref ? (
+              <a
+                href={pathHref}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={source.path}
+                className={REPO_LINK_CLASS}
+              >
+                {source.path}
+              </a>
+            ) : (
+              source.path
+            )
+          }
+        />
+      )}
       {source.targetRevision && (
         <Property
           label="Target Revision"
@@ -134,7 +178,7 @@ export function ArgoApplicationRenderer({ data, onTerminate, isTerminating }: Ar
               <button
                 onClick={() => onTerminate({ namespace, name })}
                 disabled={isTerminating}
-                className="flex items-center gap-1.5 px-2 py-1 rounded text-xs bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-colors disabled:opacity-50"
+                className="flex items-center gap-1.5 px-2 py-1 rounded text-xs status-red hover:opacity-80 transition-colors disabled:opacity-50"
                 title="Terminate sync"
               >
                 <XCircle className="w-3.5 h-3.5" />
@@ -193,7 +237,7 @@ export function ArgoApplicationRenderer({ data, onTerminate, isTerminating }: Ar
               <span
                 className={clsx(
                   'badge',
-                  syncPolicy.automated ? 'bg-green-500/20 text-green-400' : BADGE_INACTIVE
+                  syncPolicy.automated ? 'status-green' : BADGE_INACTIVE
                 )}
               >
                 {syncPolicy.automated ? 'Enabled' : 'Disabled'}
@@ -237,11 +281,11 @@ export function ArgoApplicationRenderer({ data, onTerminate, isTerminating }: Ar
                   className={clsx(
                     'badge',
                     operationState.phase === 'Succeeded'
-                      ? 'bg-green-500/20 text-green-400'
+                      ? 'status-green'
                       : operationState.phase === 'Running'
-                      ? 'bg-blue-500/20 text-blue-400'
+                      ? 'status-blue'
                       : operationState.phase === 'Failed' || operationState.phase === 'Error'
-                      ? 'bg-red-500/20 text-red-400'
+                      ? 'status-red'
                       : BADGE_INACTIVE
                   )}
                 >

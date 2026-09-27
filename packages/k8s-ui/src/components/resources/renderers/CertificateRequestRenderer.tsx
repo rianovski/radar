@@ -1,6 +1,6 @@
 import { Shield, FileText, Info } from 'lucide-react'
 import { clsx } from 'clsx'
-import { Section, PropertyList, Property, ConditionsSection, AlertBanner } from '../../ui/drawer-components'
+import { Section, PropertyList, Property, ConditionsSection, AlertBanner, useOperationalIssuesShown} from '../../ui/drawer-components'
 
 interface CertificateRequestRendererProps {
   data: any
@@ -20,6 +20,7 @@ export function CertificateRequestRenderer({ data }: CertificateRequestRendererP
 
   const isReady = readyCond?.status === 'True'
   const isNotReady = readyCond?.status === 'False'
+  const operationalIssuesShown = useOperationalIssuesShown()
   const isApproved = approvedCond?.status === 'True'
   const isDenied = deniedCond?.status === 'True'
 
@@ -28,7 +29,7 @@ export function CertificateRequestRenderer({ data }: CertificateRequestRendererP
   return (
     <>
       {/* Problem detection alerts */}
-      {isNotReady && (
+      {isNotReady && !operationalIssuesShown && (
         <AlertBanner
           variant="error"
           title="Certificate Request Not Ready"
@@ -53,8 +54,8 @@ export function CertificateRequestRenderer({ data }: CertificateRequestRendererP
               <span className={clsx(
                 'badge',
                 isReady
-                  ? 'bg-green-500/20 text-green-400'
-                  : 'bg-red-500/20 text-red-400'
+                  ? 'status-green'
+                  : 'status-red'
               )}>
                 {isReady ? 'Ready' : 'Not Ready'}
               </span>
@@ -66,10 +67,10 @@ export function CertificateRequestRenderer({ data }: CertificateRequestRendererP
               <span className={clsx(
                 'badge',
                 isApproved
-                  ? 'bg-green-500/20 text-green-400'
+                  ? 'status-green'
                   : isDenied
-                    ? 'bg-red-500/20 text-red-400'
-                    : 'bg-yellow-500/20 text-yellow-400'
+                    ? 'status-red'
+                    : 'status-amber'
               )}>
                 {isApproved ? 'Yes' : isDenied ? 'No' : 'Pending'}
               </span>

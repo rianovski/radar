@@ -38,7 +38,7 @@ func (opts PodGroupingOptions) matchesNamespaceFilter(ns string) bool {
 	return MatchesNamespace(opts.Namespaces, ns)
 }
 
-// GroupPods groups pods by app label or owner reference
+// GroupPods groups pods by run identity, app label, or owner reference
 func GroupPods(pods []*corev1.Pod, opts PodGroupingOptions) *PodGroupingResult {
 	result := &PodGroupingResult{
 		Groups: make(map[string]*PodGroup),
@@ -88,7 +88,7 @@ func GroupPods(pods []*corev1.Pod, opts PodGroupingOptions) *PodGroupingResult {
 		}
 
 		// Track health
-		status := getPodStatus(string(pod.Status.Phase))
+		status := podSummaryStatus(pod)
 		switch status {
 		case StatusHealthy:
 			group.Healthy++
@@ -104,6 +104,16 @@ func GroupPods(pods []*corev1.Pod, opts PodGroupingOptions) *PodGroupingResult {
 
 // determineGroupKey determines the group key, kind, and name for a pod
 func determineGroupKey(pod *corev1.Pod) (key, kind, name string) {
+	if workflowName := pod.Labels["workflows.argoproj.io/workflow"]; workflowName != "" {
+		return fmt.Sprintf("%s/Workflow/%s", pod.Namespace, workflowName), "Workflow", workflowName
+	}
+	if jobName := pod.Labels["batch.kubernetes.io/job-name"]; jobName != "" {
+		return fmt.Sprintf("%s/Job/%s", pod.Namespace, jobName), "Job", jobName
+	}
+	if jobName := pod.Labels["job-name"]; jobName != "" {
+		return fmt.Sprintf("%s/Job/%s", pod.Namespace, jobName), "Job", jobName
+	}
+
 	// First try app labels (groups all pods of the same app together)
 	if appName := pod.Labels["app.kubernetes.io/name"]; appName != "" {
 		return fmt.Sprintf("%s/app/%s", pod.Namespace, appName), "app", appName
@@ -176,7 +186,7 @@ func CreatePodNode(pod *corev1.Pod, provider ResourceProvider, includeNodeName b
 		ID:     podID,
 		Kind:   KindPod,
 		Name:   pod.Name,
-		Status: getPodStatus(string(pod.Status.Phase)),
+		Status: getPodStatus(pod),
 		Data:   data,
 	}
 }
@@ -189,6 +199,7 @@ type PodDetail struct {
 	Restarts    int32  `json:"restarts"`
 	Containers  int    `json:"containers"`
 	StatusIssue string `json:"statusIssue"`
+	Status      string `json:"status"`
 }
 
 // CreatePodGroupNode creates a Node for a group of pods
@@ -222,14 +233,29 @@ func CreatePodGroupNode(group *PodGroup, provider ResourceProvider) Node {
 			}
 		}
 
-		podDetails = append(podDetails, map[string]any{
+		detail := map[string]any{
 			"name":        pod.Name,
 			"namespace":   pod.Namespace,
 			"phase":       string(pod.Status.Phase),
 			"restarts":    restarts,
 			"containers":  len(pod.Spec.Containers),
 			"statusIssue": podIssue,
-		})
+			// Expanding a group must not re-derive health from the phase: a
+			// crash-looping pod stays Phase=Running, and pkg/health already
+			// tracks that across the kubelet's Waiting->Running oscillation.
+			"status": string(getPodStatus(pod)),
+		}
+		// ownerKey identifies which of the group's (possibly several — see
+		// the large-group path in builder.go) distinct owners this specific
+		// pod belongs to, so the caller can later resolve it to the exact
+		// edge-source node ID that owns this pod. Without it, expanding a
+		// mixed-owner group (e.g. canary + stable ReplicaSets) can't tell
+		// which pod goes with which owner.
+		if len(pod.OwnerReferences) > 0 {
+			ref := pod.OwnerReferences[0]
+			detail["ownerKey"] = pod.Namespace + "/" + ref.Kind + "/" + ref.Name
+		}
+		podDetails = append(podDetails, detail)
 	}
 
 	return Node{
@@ -247,6 +273,36 @@ func CreatePodGroupNode(group *PodGroup, provider ResourceProvider) Node {
 			"totalRestarts": totalRestarts,
 			"pods":          podDetails,
 			"statusIssue":   groupStatusIssue,
+		},
+	}
+}
+
+// CreateOrphanPodSummaryNode creates a single summary-only node for pods that
+// couldn't be attributed to a workload in summary mode (standalone pods, bare
+// ReplicaSets, or controllers whose node wasn't created — e.g. RBAC-denied).
+// It carries counts/status/restarts only — NO per-pod "pods" array and no
+// expand affordance — so a large orphan set can't re-introduce the pod-tier
+// payload/render cost that summary mode exists to avoid.
+func CreateOrphanPodSummaryNode(namespace string, summary PodSummary, totalRestarts int32) Node {
+	status := StatusHealthy
+	if summary.Unhealthy > 0 {
+		status = StatusUnhealthy
+	} else if summary.Degraded > 0 {
+		status = StatusDegraded
+	}
+	return Node{
+		ID:     "podgroup-orphans-" + namespace,
+		Kind:   KindPodGroup,
+		Name:   "unattributed pods",
+		Status: status,
+		Data: map[string]any{
+			"namespace":     namespace,
+			"podCount":      summary.Total,
+			"healthy":       summary.Healthy,
+			"degraded":      summary.Degraded,
+			"unhealthy":     summary.Unhealthy,
+			"totalRestarts": totalRestarts,
+			"summaryOnly":   true,
 		},
 	}
 }

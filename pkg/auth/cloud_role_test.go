@@ -5,6 +5,27 @@ import (
 	"testing"
 )
 
+func TestCloudRoleFromGroupsRadarVocabulary(t *testing.T) {
+	cases := []struct {
+		name   string
+		groups []string
+		want   CloudRole
+	}{
+		{"radar canonical", []string{"radar:member", "radar:org:o1", "radar:user:u1"}, RoleMember},
+		{"dual-emit picks tier once", []string{"radar:viewer", "radar:org:o1", "cloud:viewer", "cloud:org:o1"}, RoleViewer},
+		{"legacy cloud only (old hub)", []string{"cloud:owner", "cloud:org:o1"}, RoleOwner},
+		{"idp groups are not tiers", []string{"radar:idp:owner", "radar:idp:member"}, RoleNone},
+		{"highest rank wins across vocabularies", []string{"cloud:viewer", "radar:owner"}, RoleOwner},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CloudRoleFromGroups(tc.groups); got != tc.want {
+				t.Errorf("CloudRoleFromGroups(%v) = %q, want %q", tc.groups, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCloudRoleFromGroups(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -12,20 +33,20 @@ func TestCloudRoleFromGroups(t *testing.T) {
 		want   CloudRole
 	}{
 		{"empty groups", nil, RoleNone},
-		{"no cloud prefix", []string{"developers", "sre"}, RoleNone},
-		{"viewer", []string{"cloud:viewer"}, RoleViewer},
-		{"member", []string{"cloud:member"}, RoleMember},
-		{"owner", []string{"cloud:owner"}, RoleOwner},
-		{"unknown cloud tier", []string{"cloud:superuser"}, RoleNone},
-		{"viewer + non-cloud", []string{"cloud:viewer", "team:platform"}, RoleViewer},
-		// Cloud injects multiple cloud:* groups (cloud:<tier>, cloud:org:<id>,
-		// cloud:user:<id>). Only the tier should drive the role.
-		{"multiple cloud groups", []string{"cloud:viewer", "cloud:org:abc", "cloud:user:xyz"}, RoleViewer},
+		{"no Radar prefix", []string{"developers", "sre"}, RoleNone},
+		{"viewer", []string{"radar:viewer"}, RoleViewer},
+		{"member", []string{"radar:member"}, RoleMember},
+		{"owner", []string{"radar:owner"}, RoleOwner},
+		{"unknown Radar tier", []string{"radar:superuser"}, RoleNone},
+		{"viewer + unrelated group", []string{"radar:viewer", "team:platform"}, RoleViewer},
+		// Cloud injects multiple radar:* groups (radar:<tier>, radar:org:<id>,
+		// radar:user:<id>). Only the tier should drive the role.
+		{"multiple Radar groups", []string{"radar:viewer", "radar:org:abc", "radar:user:xyz"}, RoleViewer},
 		// If two tiers are present (shouldn't happen in practice), prefer
 		// the highest. Defensive: a header-stuffing attempt to downgrade
 		// shouldn't succeed by adding a lower-tier alongside.
-		{"two tiers — pick highest", []string{"cloud:viewer", "cloud:owner"}, RoleOwner},
-		{"member + viewer", []string{"cloud:member", "cloud:viewer"}, RoleMember},
+		{"two tiers — pick highest", []string{"radar:viewer", "radar:owner"}, RoleOwner},
+		{"member + viewer", []string{"radar:member", "radar:viewer"}, RoleMember},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -74,7 +95,7 @@ func TestCloudRoleFromContext(t *testing.T) {
 	t.Run("user with Cloud groups", func(t *testing.T) {
 		ctx := ContextWithUser(context.Background(), &User{
 			Username: "alice",
-			Groups:   []string{"cloud:member", "cloud:org:abc"},
+			Groups:   []string{"radar:member", "radar:org:abc"},
 		})
 		if got := CloudRoleFromContext(ctx); got != RoleMember {
 			t.Errorf("CloudRoleFromContext = %q, want member", got)
@@ -86,7 +107,7 @@ func TestCloudRoleFromContext(t *testing.T) {
 			Groups:   []string{"sre", "platform-team"},
 		})
 		if got := CloudRoleFromContext(ctx); got != RoleNone {
-			t.Errorf("CloudRoleFromContext = %q, want RoleNone (no cloud: prefix)", got)
+			t.Errorf("CloudRoleFromContext = %q, want RoleNone (no radar: prefix)", got)
 		}
 	})
 }

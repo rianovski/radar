@@ -39,7 +39,7 @@ func parseArgoManagedResources(root *unstructured.Unstructured) []managedResourc
 		if hm, ok := m["health"].(map[string]any); ok {
 			health = gitops.StringValue(hm["status"])
 		}
-		out = append(out, managedResource{
+		res := managedResource{
 			Ref:    ref,
 			Sync:   normalizeSync(gitops.StringValue(m["status"])),
 			Health: normalizeHealth(health),
@@ -48,9 +48,26 @@ func parseArgoManagedResources(root *unstructured.Unstructured) []managedResourc
 				"syncWave":  gitops.StringValue(m["syncWave"]),
 				"syncPhase": gitops.StringValue(m["syncPhase"]),
 			},
-		})
+		}
+		if res.Health != "" {
+			res.HealthSource = HealthSourceController
+		}
+		out = append(out, res)
 	}
 	return out
+}
+
+// argoHealthMode reads where the Application keeps per-resource health.
+// Argo writes status.resourceHealthSource only in appTree mode; the inline
+// mode is its zero value. Only the explicit field decides — "some entry has
+// health" is not evidence of inline mode, since a kind without a health
+// check has no health in either mode.
+func argoHealthMode(root *unstructured.Unstructured) HealthMode {
+	src, _, _ := unstructured.NestedString(root.Object, "status", "resourceHealthSource")
+	if strings.EqualFold(strings.TrimSpace(src), string(HealthModeAppTree)) {
+		return HealthModeAppTree
+	}
+	return HealthModeInline
 }
 
 func parseFluxManagedResources(root *unstructured.Unstructured) []managedResource {
@@ -73,19 +90,9 @@ func parseFluxManagedResources(root *unstructured.Unstructured) []managedResourc
 }
 
 func parseFluxInventoryID(id string) (ResourceRef, bool) {
-	parts := strings.Split(id, "_")
-	if len(parts) < 4 {
+	group, kind, namespace, name, ok := gitops.ParseFluxInventoryID(id)
+	if !ok {
 		return ResourceRef{}, false
-	}
-	kind := parts[len(parts)-1]
-	group := parts[len(parts)-2]
-	namespace := parts[0]
-	name := strings.Join(parts[1:len(parts)-2], "_")
-	if kind == "" || name == "" {
-		return ResourceRef{}, false
-	}
-	if group == "core" {
-		group = ""
 	}
 	return ResourceRef{Group: group, Kind: kind, Namespace: namespace, Name: name}, true
 }
@@ -96,45 +103,8 @@ func rootStatus(root *unstructured.Unstructured, tool Tool) gitOpsStatus {
 		health, _, _ := unstructured.NestedString(root.Object, "status", "health", "status")
 		return gitOpsStatus{Sync: normalizeSync(sync), Health: normalizeHealth(health)}
 	}
-	conditions, _, _ := unstructured.NestedSlice(root.Object, "status", "conditions")
-	ready := ""
-	reconciling := false
-	stalled := false
-	for _, item := range conditions {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		t := gitops.StringValue(m["type"])
-		s := gitops.StringValue(m["status"])
-		if t == "Ready" {
-			ready = s
-		}
-		if t == "Reconciling" && s == "True" {
-			reconciling = true
-		}
-		if t == "Stalled" && s == "True" {
-			stalled = true
-		}
-	}
-	if root.Object["spec"] != nil {
-		if suspended, _, _ := unstructured.NestedBool(root.Object, "spec", "suspend"); suspended {
-			return gitOpsStatus{Sync: "Unknown", Health: "Suspended"}
-		}
-	}
-	if reconciling {
-		return gitOpsStatus{Sync: "Reconciling", Health: "Progressing"}
-	}
-	if stalled {
-		return gitOpsStatus{Sync: "OutOfSync", Health: "Degraded"}
-	}
-	if ready == "True" {
-		return gitOpsStatus{Sync: "Synced", Health: "Healthy"}
-	}
-	if ready == "False" {
-		return gitOpsStatus{Sync: "OutOfSync", Health: "Degraded"}
-	}
-	return gitOpsStatus{Sync: "Unknown", Health: "Unknown"}
+	st := gitops.FluxStatus(root)
+	return gitOpsStatus{Sync: st.Sync, Health: st.Health}
 }
 
 func normalizeSync(status string) string {
@@ -147,6 +117,11 @@ func normalizeSync(status string) string {
 		return "Unknown"
 	}
 }
+
+// NormalizeHealth maps a controller-reported health string onto the
+// vocabulary Node.Health carries; anything else becomes Unknown.
+func NormalizeHealth(status string) string { return normalizeHealth(status) }
+
 func normalizeHealth(status string) string {
 	switch status {
 	case "Healthy", "Progressing", "Degraded", "Suspended", "Missing", "Unknown":

@@ -107,22 +107,62 @@ export function getKyvernoPolicyStatus(resource: any): StatusBadge {
     return { text: readyCond.reason || 'Not Ready', color: healthColors.unhealthy, level: 'unhealthy' }
   }
 
-  // Fallback: if spec exists, likely active
-  if (resource.spec?.rules?.length > 0) {
-    return { text: 'Active', color: healthColors.healthy, level: 'healthy' }
-  }
-
-  return { text: 'Unknown', color: healthColors.unknown, level: 'unknown' }
+  // Reached when the controller has not written Ready, or wrote it as Unknown.
+  // Declaring rules is not the controller accepting them.
+  return { text: 'Not assessed', color: healthColors.unknown, level: 'unknown' }
 }
 
+/**
+ * Kyverno's ValidationFailureAction enum accepts the deprecated lowercase
+ * `enforce` alongside `Enforce`, and the admission controller blocks on the
+ * lowercase spelling exactly as on the capitalized one. Match case-insensitively
+ * so a legacy policy carrying the lowercase value is not read as non-blocking.
+ */
+export function isKyvernoEnforceAction(action: unknown): boolean {
+  return String(action ?? '').toLowerCase() === 'enforce'
+}
+
+/** The rule blocks whose failure an admission request can be rejected for. */
+function rejectingActions(rule: any): string[] {
+  if (!rule) return []
+  const actions: string[] = []
+  if (rule.validate) actions.push(rule.validate.failureAction)
+  if (Array.isArray(rule.verifyImages)) {
+    for (const v of rule.verifyImages) actions.push(v?.failureAction)
+  }
+  return actions.filter(Boolean)
+}
+
+/**
+ * Whether this policy can REJECT an admission request, as Audit or Enforce.
+ *
+ * Three things make the obvious reading wrong. A rule-level failureAction
+ * OVERRIDES `spec.validationFailureAction` rather than deferring to it, so
+ * consulting the spec field first answers Audit for a policy whose rule
+ * enforces. Image verification carries its own failureAction on
+ * `verifyImages[]` rather than under `validate`, so a signing policy blocks
+ * without either of the fields the name suggests. And the spec field is
+ * defaulted to Audit when absent, so its presence proves nothing.
+ *
+ * Only validate and verifyImages rules can reject at all, so only they inherit
+ * the spec-level action — a mutate or generate rule sitting in the same policy
+ * would otherwise carry Enforce into a policy where nothing enforces.
+ *
+ * Rules can disagree, and one value has to stand for the whole policy. The
+ * question worth answering is whether anything here can reject, so any Enforce
+ * wins; the Rules section is where a mixed policy is read rule by rule.
+ */
 export function getKyvernoPolicyAction(resource: any): string {
-  // Check spec-level validationFailureAction (deprecated but still widely used)
-  const action = resource.spec?.validationFailureAction
-  if (action) return action
-  // Fallback: check first rule's validate.failureAction
+  const specAction = resource.spec?.validationFailureAction
   const rules = resource.spec?.rules || []
-  for (const rule of rules) {
-    if (rule.validate?.failureAction) return rule.validate.failureAction
+  if (rules.length === 0) return isKyvernoEnforceAction(specAction) ? 'Enforce' : 'Audit'
+  const rejecting = rules.filter((rule: any) => rule?.validate || rule?.verifyImages)
+  // Rules, but none that can reject: the spec-level action governs nothing here.
+  if (rejecting.length === 0) return 'Audit'
+  for (const rule of rejecting) {
+    const overrides = rejectingActions(rule)
+    const effective = overrides.length > 0 ? overrides : [specAction]
+    if (effective.some(isKyvernoEnforceAction)) return 'Enforce'
   }
   return 'Audit'
 }
@@ -171,6 +211,45 @@ export function getKyvernoPolicyBackground(resource: any): boolean {
   return resource.spec?.background !== false
 }
 
+/**
+ * `spec.admission`, defaulting to true — the same reading as Kyverno's own
+ * AdmissionProcessingEnabled(). When false the policy is never registered with
+ * the admission webhook, so it rejects nothing at admission whatever its
+ * failureAction says; it can only be seen by background scans.
+ */
+export function getKyvernoPolicyAdmission(resource: any): boolean {
+  return resource.spec?.admission !== false
+}
+
+export interface KyvernoEnforcement {
+  /** Badge label. */
+  label: string
+  /** True only when a violating request is actually rejected at admission. */
+  blocks: boolean
+  /** Declared to reject, but admission is off — it enforces nothing at admission. */
+  discrepancy: boolean
+}
+
+/**
+ * What a legacy policy does at admission, not just what its failureAction field
+ * reads. An Enforce policy with admission disabled blocks nothing — presenting
+ * it as a blocking "Enforce" would tell an operator the cluster is guarded when
+ * it is not. Labels match the modern CEL family's vocabulary for the same
+ * posture: "Background only" when background scans still report violations,
+ * "Inactive" when background is disabled too and the policy does nothing.
+ */
+export function getKyvernoEnforcement(resource: any): KyvernoEnforcement {
+  const action = getKyvernoPolicyAction(resource)
+  if (action !== 'Enforce' || getKyvernoPolicyAdmission(resource)) {
+    return { label: action, blocks: action === 'Enforce', discrepancy: false }
+  }
+  return {
+    label: getKyvernoPolicyBackground(resource) ? 'Background only' : 'Inactive',
+    blocks: false,
+    discrepancy: true,
+  }
+}
+
 export function getKyvernoPolicyRuleCountByType(resource: any): {
   validate: number
   mutate: number
@@ -184,7 +263,10 @@ export function getKyvernoPolicyRuleCountByType(resource: any): {
       validate: statusCount.validate ?? 0,
       mutate: statusCount.mutate ?? 0,
       generate: statusCount.generate ?? 0,
-      verifyImages: statusCount.verifyImages ?? 0,
+      // Kyverno writes this key all-lowercase (`verifyimages`), verified on
+      // 1.18.2. Reading the camelCase spelling alone returns 0 for every
+      // image-verification policy in existence.
+      verifyImages: statusCount.verifyImages ?? statusCount.verifyimages ?? 0,
     }
   }
 

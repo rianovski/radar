@@ -13,7 +13,7 @@ const CONFIG_KINDS = ['ConfigMap', 'Secret', 'HorizontalPodAutoscaler', 'PodDisr
 const STORAGE_KINDS = ['PersistentVolumeClaim', 'PersistentVolume', 'StorageClass', 'VolumeAttachment']
 const ACCESS_CONTROL_KINDS = ['ServiceAccount', 'Role', 'ClusterRole', 'RoleBinding', 'ClusterRoleBinding']
 const CLUSTER_KINDS = ['Node', 'Namespace', 'Event']
-
+const CORE_CATEGORY_NAMES = new Set(['Workloads', 'Networking', 'Configuration', 'Storage', 'Access Control', 'Cluster'])
 // Core resources that must always be present (fallback if API discovery misses them)
 export const CORE_RESOURCES: APIResource[] = [
   { group: '', version: 'v1', kind: 'Pod', name: 'pods', namespaced: true, isCrd: false, verbs: ['list', 'get', 'watch'] },
@@ -33,7 +33,11 @@ export const CORE_RESOURCES: APIResource[] = [
   { group: 'batch', version: 'v1', kind: 'CronJob', name: 'cronjobs', namespaced: true, isCrd: false, verbs: ['list', 'get', 'watch'] },
   { group: 'networking.k8s.io', version: 'v1', kind: 'Ingress', name: 'ingresses', namespaced: true, isCrd: false, verbs: ['list', 'get', 'watch'] },
   { group: 'networking.k8s.io', version: 'v1', kind: 'NetworkPolicy', name: 'networkpolicies', namespaced: true, isCrd: false, verbs: ['list', 'get', 'watch'] },
+  { group: 'discovery.k8s.io', version: 'v1', kind: 'EndpointSlice', name: 'endpointslices', namespaced: true, isCrd: false, verbs: ['list', 'get', 'watch'] },
   { group: 'autoscaling', version: 'v2', kind: 'HorizontalPodAutoscaler', name: 'horizontalpodautoscalers', namespaced: true, isCrd: false, verbs: ['list', 'get', 'watch'] },
+  { group: 'policy', version: 'v1', kind: 'PodDisruptionBudget', name: 'poddisruptionbudgets', namespaced: true, isCrd: false, verbs: ['list', 'get', 'watch'] },
+  { group: '', version: 'v1', kind: 'LimitRange', name: 'limitranges', namespaced: true, isCrd: false, verbs: ['list', 'get', 'watch'] },
+  { group: '', version: 'v1', kind: 'ResourceQuota', name: 'resourcequotas', namespaced: true, isCrd: false, verbs: ['list', 'get', 'watch'] },
   { group: '', version: 'v1', kind: 'Event', name: 'events', namespaced: true, isCrd: false, verbs: ['list', 'get', 'watch'] },
   { group: 'rbac.authorization.k8s.io', version: 'v1', kind: 'Role', name: 'roles', namespaced: true, isCrd: false, verbs: ['list', 'get', 'watch'] },
   { group: 'rbac.authorization.k8s.io', version: 'v1', kind: 'ClusterRole', name: 'clusterroles', namespaced: false, isCrd: false, verbs: ['list', 'get', 'watch'] },
@@ -45,8 +49,52 @@ export const CORE_RESOURCES: APIResource[] = [
   { group: 'scheduling.k8s.io', version: 'v1', kind: 'PriorityClass', name: 'priorityclasses', namespaced: false, isCrd: false, verbs: ['list', 'get', 'watch'] },
   { group: 'node.k8s.io', version: 'v1', kind: 'RuntimeClass', name: 'runtimeclasses', namespaced: false, isCrd: false, verbs: ['list', 'get', 'watch'] },
   { group: 'coordination.k8s.io', version: 'v1', kind: 'Lease', name: 'leases', namespaced: true, isCrd: false, verbs: ['list', 'get', 'watch'] },
+  { group: 'storage.k8s.io', version: 'v1', kind: 'StorageClass', name: 'storageclasses', namespaced: false, isCrd: false, verbs: ['list', 'get', 'watch'] },
   { group: 'storage.k8s.io', version: 'v1', kind: 'VolumeAttachment', name: 'volumeattachments', namespaced: false, isCrd: false, verbs: ['list', 'get', 'watch'] },
 ]
+
+// These identities are built-in but must not become always-present sidebar rows.
+const ADDITIONAL_BUILTIN_IDENTITIES: Record<string, string> = {
+  endpoints: '',
+  controllerrevision: 'apps', controllerrevisions: 'apps',
+  resourceclaim: 'resource.k8s.io', resourceclaims: 'resource.k8s.io',
+  resourceclaimtemplate: 'resource.k8s.io', resourceclaimtemplates: 'resource.k8s.io',
+  resourceslice: 'resource.k8s.io', resourceslices: 'resource.k8s.io',
+  deviceclass: 'resource.k8s.io', deviceclasses: 'resource.k8s.io',
+};
+
+export function builtinGroupForKind(kindOrResource: string): string | undefined {
+  const value = kindOrResource.toLowerCase()
+  return CORE_RESOURCES.find(resource =>
+    resource.kind.toLowerCase() === value || resource.name.toLowerCase() === value,
+  )?.group ?? ADDITIONAL_BUILTIN_IDENTITIES[value]
+}
+
+export function canonicalResourceGroup(kindOrResource: string, group: string | undefined): string | undefined {
+  const builtin = builtinGroupForKind(kindOrResource)
+  if (!group) return builtin
+  return group
+}
+
+export function findAPIResourceForRoute(
+  resources: APIResource[] | undefined,
+  routeSlug: string,
+  group = '',
+): APIResource | undefined {
+  const matchesRoute = (resource: APIResource) =>
+    resource.name === routeSlug || resource.kind === routeSlug
+  if (group) {
+    return resources?.find(r => matchesRoute(r) && r.group === group)
+      ?? CORE_RESOURCES.find(r => matchesRoute(r) && r.group === group)
+  }
+  return CORE_RESOURCES.find(matchesRoute)
+    ?? resources?.find(matchesRoute)
+}
+
+export function isCoreBatchJob(kind: string, group?: string): boolean {
+  const normalizedKind = kind.toLowerCase()
+  return (normalizedKind === 'job' || normalizedKind === 'jobs') && (!group || group === 'batch')
+}
 
 // Resources that should be hidden from the sidebar
 const HIDDEN_KINDS = ['PodMetrics', 'NodeMetrics']
@@ -82,6 +130,7 @@ export function categorizeResources(resources: APIResource[]): ResourceCategory[
   const storage = coreResources.filter(r => STORAGE_KINDS.includes(r.kind))
   const accessControl = coreResources.filter(r => ACCESS_CONTROL_KINDS.includes(r.kind))
   const cluster = coreResources.filter(r => CLUSTER_KINDS.includes(r.kind))
+  const otherKubernetesAPIs = coreResources.filter(r => r.featured)
 
   const crds = uniqueResources.filter(r => r.isCrd)
   const crdGroups = new Map<string, APIResource[]>()
@@ -97,6 +146,7 @@ export function categorizeResources(resources: APIResource[]): ResourceCategory[
   addToCategory('Storage', storage)
   addToCategory('Access Control', accessControl)
   addToCategory('Cluster', cluster)
+  addToCategory('Other Kubernetes APIs', otherKubernetesAPIs)
 
   for (const [group, groupResources] of crdGroups) {
     addToCategory(formatGroupName(group), groupResources)
@@ -111,6 +161,7 @@ export function categorizeResources(resources: APIResource[]): ResourceCategory[
 export function formatGroupName(group: string): string {
   const knownGroups: Record<string, string> = {
     'argoproj.io': 'Argo',
+    'apiregistration.k8s.io': 'API Registration',
     'cert-manager.io': 'Cert Manager',
     'acme.cert-manager.io': 'Cert Manager',
     'istio.io': 'Istio',
@@ -118,14 +169,19 @@ export function formatGroupName(group: string): string {
     'security.istio.io': 'Istio',
     'telemetry.istio.io': 'Istio',
     'monitoring.coreos.com': 'Prometheus',
+    'monitoring.googleapis.com': 'Google Cloud Monitoring',
     'velero.io': 'Velero',
     'external-secrets.io': 'External Secrets',
     'keda.sh': 'KEDA',
     'gateway.networking.k8s.io': 'Gateway API',
+    'gateway.envoyproxy.io': 'Envoy Gateway',
     'traefik.io': 'Traefik',
     'traefik.containo.us': 'Traefik',
+    'crossplane.io': 'Crossplane',
     'pkg.crossplane.io': 'Crossplane',
     'apiextensions.crossplane.io': 'Crossplane',
+    'helm.crossplane.io': 'Crossplane',
+    'kubernetes.crossplane.io': 'Crossplane',
     'source.toolkit.fluxcd.io': 'Flux',
     'helm.toolkit.fluxcd.io': 'Flux',
     'kustomize.toolkit.fluxcd.io': 'Flux',
@@ -162,18 +218,113 @@ export function formatGroupName(group: string): string {
     'infrastructure.cluster.x-k8s.io': 'Cluster API',
     'ceph.rook.io': 'Rook',
     'kyverno.io': 'Kyverno',
+    'policies.kyverno.io': 'Kyverno',
     'k8s.nginx.org': 'NGINX',
+    'networking.gke.io': 'GKE Networking',
+    'warden.gke.io': 'GKE Warden',
+    'cloud.google.com': 'Google Cloud',
     'sparkoperator.k8s.io': 'Spark',
     'kubeflow.org': 'Kubeflow',
     'snapshot.storage.k8s.io': 'Snapshots',
+    'karpenter.sh': 'Karpenter',
+    'karpenter.k8s.aws': 'Karpenter',
+    'karpenter.azure.com': 'Karpenter',
+    'karpenter.k8s.gcp': 'Karpenter',
+    'resource.k8s.io': 'Dynamic Resource Allocation',
+    'kueue.x-k8s.io': 'Kueue',
+    'autoscaling.x-k8s.io': 'Cluster Autoscaler',
+    'crd.k8s.amazonaws.com': 'AWS VPC CNI',
+    'vpcresources.k8s.aws': 'AWS VPC CNI',
+    'elbv2.k8s.aws': 'AWS Load Balancer',
+    'eks.amazonaws.com': 'EKS',
+    'networking.k8s.aws': 'AWS Networking',
+    'acid.zalan.do': 'Zalando Postgres',
+    'postgresql.cnpg.io': 'CloudNativePG',
+    'barmancloud.cnpg.io': 'CloudNativePG',
+    'serving.kserve.io': 'KServe',
+    'ray.io': 'KubeRay',
+    'leaderworkerset.x-k8s.io': 'LeaderWorkerSet',
+    'jobset.x-k8s.io': 'JobSet',
+    'inference.networking.k8s.io': 'Inference Gateway',
+    'inference.networking.x-k8s.io': 'Inference Gateway',
+    'llm-d.ai': 'llm-d',
+    'nvidia.com': 'NVIDIA GPU Operator',
+    'apps.nvidia.com': 'NVIDIA NIM',
+    'amd.com': 'AMD GPU Operator',
+    'trainer.kubeflow.org': 'Kubeflow',
+    'scheduling.run.ai': 'KAI Scheduler',
+    'kai.scheduler': 'KAI Scheduler',
+    'kaito.sh': 'KAITO',
+    'batch.volcano.sh': 'Volcano',
+    'scheduling.volcano.sh': 'Volcano',
+    'flow.volcano.sh': 'Volcano',
+    'bus.volcano.sh': 'Volcano',
   }
-  return knownGroups[group] || group
+  if (knownGroups[group]) return knownGroups[group]
+  // Suffix rules — for unbounded provider group sets (Crossplane providers ship
+  // their own per-service groups like s3.aws.upbound.io, compute.gcp.upbound.io).
+  if (group.endsWith('.upbound.io')) return 'Crossplane'
+  if (group.endsWith('.crossplane.io')) return 'Crossplane'
+  if (group === 'cluster.x-k8s.io' || group.endsWith('.cluster.x-k8s.io')) return 'Cluster API'
+  if (group.endsWith('.cnrm.cloud.google.com')) return 'Config Connector'
+  if (group.endsWith('.openshift.io')) return 'OpenShift'
+  return formatUnmappedGroupName(group)
 }
 
 export function shortenGroupName(group: string): string {
   return group
     .replace(/\.(io|com|org|dev|sh)$/, '')
     .replace(/\.k8s$/, '')
+}
+
+const GROUP_SUFFIX_LABELS = new Set([
+  'io', 'com', 'org', 'dev', 'sh', 'net', 'do', 'ai', 'cloud', 'co', 'app',
+  'k8s', 'x-k8s', 'k8s-sigs', 'sigs',
+])
+const GROUP_ACRONYMS: Record<string, string> = {
+  api: 'API',
+  aws: 'AWS',
+  amazonaws: 'AWS',
+  cnrm: 'CNRM',
+  crd: 'CRD',
+  csi: 'CSI',
+  dns: 'DNS',
+  gcp: 'GCP',
+  gke: 'GKE',
+  gpu: 'GPU',
+  hpa: 'HPA',
+  ipam: 'IPAM',
+  k8s: 'K8s',
+  nfd: 'NFD',
+  tcp: 'TCP',
+  tls: 'TLS',
+  udp: 'UDP',
+}
+
+function formatUnmappedGroupName(group: string): string {
+  const labels = group
+    .split('.')
+    .map(label => label.trim().toLowerCase())
+    .filter(label => label && !GROUP_SUFFIX_LABELS.has(label))
+
+  if (labels.length === 0) return group
+  if (labels.length === 1) return avoidCoreCategoryCollision(formatGroupToken(labels[0]))
+
+  const owner = labels[labels.length - 1]
+  const descriptors = labels.slice(0, -1)
+  return avoidCoreCategoryCollision([owner, ...descriptors].map(formatGroupToken).join(' '))
+}
+
+function avoidCoreCategoryCollision(label: string): string {
+  return CORE_CATEGORY_NAMES.has(label) ? `${label} APIs` : label
+}
+
+function formatGroupToken(token: string): string {
+  return token
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map(part => GROUP_ACRONYMS[part] ?? part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
 }
 
 function sortResources(resources: APIResource[]): APIResource[] {

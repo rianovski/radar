@@ -1,19 +1,36 @@
 import { useState, useEffect } from 'react'
+import { clsx } from 'clsx'
 import { Download, X, Copy, Check, RotateCw, ArrowDownToLine, Loader2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import {
   useVersionCheck,
+  useCapabilities,
   useStartDesktopUpdate,
   useDesktopUpdateStatus,
   useApplyDesktopUpdate,
 } from '../../api/client'
 import type { DesktopUpdateState } from '../../api/client'
 import { WithTooltip } from './Tooltip'
+import { TRANSITION_MENU, overlayExitMs, overlayTransitionStyle } from '../../utils/animation'
+import { useAnimatedUnmount } from '../../hooks/useAnimatedUnmount'
 
 const DISMISSED_KEY = 'radar-update-dismissed'
 
+// Whether the notice for this release was dismissed. The usage-data card
+// shares the corner and waits for it.
+export function isUpdateDismissed(latestVersion: string): boolean {
+  try {
+    return localStorage.getItem(DISMISSED_KEY) === latestVersion
+  } catch {
+    // localStorage unavailable (e.g. Safari private mode)
+    return false
+  }
+}
+
 export function UpdateNotification() {
   const queryClient = useQueryClient()
+  const { data: capabilities } = useCapabilities()
+  const deploymentMode = capabilities ? (capabilities.deployment?.mode ?? 'local') : undefined
   const { data: versionInfo } = useVersionCheck()
   const [dismissed, setDismissed] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -27,21 +44,16 @@ export function UpdateNotification() {
 
   const isDesktop = versionInfo?.installMethod === 'desktop'
 
-  // Listen for "Check for Updates" menu item in desktop app (Wails runtime event).
-  // Un-dismisses the notification and invalidates the version check cache.
+  // Listen for "Check for Updates" menu item in desktop app.
   useEffect(() => {
-    const wailsRuntime = (window as unknown as Record<string, unknown>).runtime as
-      | { EventsOn?: (event: string, callback: () => void) => () => void }
-      | undefined
-    if (!wailsRuntime?.EventsOn) return
-
-    const cleanup = wailsRuntime.EventsOn('check-for-updates', () => {
+    const handler = () => {
       setDismissed(false)
       try { localStorage.removeItem(DISMISSED_KEY) } catch { /* ignore */ }
       queryClient.invalidateQueries({ queryKey: ['version-check'] })
-    })
+    }
 
-    return cleanup
+    window.addEventListener('radar:check-for-updates', handler)
+    return () => window.removeEventListener('radar:check-for-updates', handler)
   }, [queryClient])
 
   // Log version check errors for debugging
@@ -53,15 +65,8 @@ export function UpdateNotification() {
 
   // Check if this version was already dismissed
   useEffect(() => {
-    if (versionInfo?.latestVersion) {
-      try {
-        const dismissedVersion = localStorage.getItem(DISMISSED_KEY)
-        if (dismissedVersion === versionInfo.latestVersion) {
-          setDismissed(true)
-        }
-      } catch {
-        // localStorage unavailable (e.g. Safari private mode)
-      }
+    if (versionInfo?.latestVersion && isUpdateDismissed(versionInfo.latestVersion)) {
+      setDismissed(true)
     }
   }, [versionInfo?.latestVersion])
 
@@ -103,8 +108,13 @@ export function UpdateNotification() {
     })
   }
 
-  // Don't show if no update available, dismissed, or error
-  if (!versionInfo?.updateAvailable || dismissed) {
+  // Shared in-cluster viewers get a persistent Home notice instead of a
+  // floating action prompt they may not be able to act on.
+  const show = !!versionInfo?.updateAvailable && !dismissed && deploymentMode !== undefined && deploymentMode !== 'in-cluster' && deploymentMode !== 'cloud'
+  // Presence outlives `show` by the menu exit so a dismiss fades the chip out
+  // instead of snapping it away; the enter runs the same transition in reverse.
+  const { shouldRender, isOpen } = useAnimatedUnmount(show, overlayExitMs('menu'))
+  if (!shouldRender || !versionInfo) {
     return null
   }
 
@@ -112,7 +122,16 @@ export function UpdateNotification() {
   const effectiveState: DesktopUpdateState = updateStatus?.state ?? 'idle'
 
   return (
-    <div className="fixed bottom-4 right-4 z-50 max-w-sm bg-theme-surface border border-accent/50 rounded-lg shadow-xl p-4 animate-in slide-in-from-right">
+    <div
+      inert={!show || undefined}
+      className={clsx(
+        'fixed bottom-4 right-4 z-50 max-w-sm bg-theme-surface border border-accent/50 rounded-lg shadow-xl p-4 origin-bottom-right',
+        TRANSITION_MENU,
+        isOpen ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 translate-y-1 scale-[0.97]',
+        !show && 'pointer-events-none',
+      )}
+      style={overlayTransitionStyle(isOpen, 'menu')}
+    >
       <div className="flex items-start gap-3">
         <div className="flex items-center justify-center w-8 h-8 bg-accent-muted rounded-full shrink-0">
           <UpdateIcon state={effectiveState} />
@@ -147,7 +166,7 @@ export function UpdateNotification() {
                   onClick={handleCopyCommand}
                   className="flex items-center gap-2 mt-2 px-2 py-1.5 bg-theme-elevated rounded font-mono text-theme-text-primary hover:bg-theme-surface-hover transition-colors w-full"
                 >
-                  <code className="flex-1 text-left truncate text-[11px]">{versionInfo.updateCommand}</code>
+                  <code className="inline-code flex-1 truncate text-left text-[11px]">{versionInfo.updateCommand}</code>
                   <CopyIcon copied={copied} failed={copyFailed} />
                 </button>
               </WithTooltip>

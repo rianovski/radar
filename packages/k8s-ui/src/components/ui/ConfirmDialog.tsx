@@ -1,4 +1,4 @@
-import { ReactNode } from 'react'
+import { ReactNode, useId } from 'react'
 import { AlertTriangle, X } from 'lucide-react'
 import { clsx } from 'clsx'
 import { SEVERITY_TEXT, SEVERITY_BADGE_BORDERED } from '../../utils/badge-colors'
@@ -17,6 +17,9 @@ interface ConfirmDialogProps {
   variant?: 'danger' | 'warning'
   isLoading?: boolean
   isClosable?: boolean // Allow closing even when isLoading (e.g., for long-running ops the user can dismiss)
+  confirmDisabled?: boolean // Block the confirm action while custom content is invalid (e.g., bad YAML)
+  showWarning?: boolean
+  className?: string
   children?: ReactNode // Optional custom content (e.g., checkboxes)
 }
 
@@ -32,14 +35,18 @@ export function ConfirmDialog({
   variant = 'danger',
   isLoading = false,
   isClosable = false,
+  confirmDisabled = false,
+  showWarning = true,
+  className,
   children,
 }: ConfirmDialogProps) {
   const canClose = !isLoading || isClosable
   const isDanger = variant === 'danger'
   const severity = isDanger ? 'error' : 'warning'
+  const titleId = useId()
 
   return (
-    <DialogPortal open={open} onClose={onClose} closable={canClose} className="max-w-md w-full">
+    <DialogPortal open={open} onClose={onClose} closable={canClose} className={clsx('w-full', className ?? 'max-w-md')} ariaLabelledBy={titleId}>
       {/* Header */}
       <div className="flex items-start gap-3 p-4 border-b border-theme-border">
         <div
@@ -51,12 +58,13 @@ export function ConfirmDialog({
           <AlertTriangle className={clsx('w-5 h-5', SEVERITY_TEXT[severity])} />
         </div>
         <div className="flex-1 min-w-0">
-          <h3 className="text-lg font-semibold text-theme-text-primary">{title}</h3>
+          <h3 id={titleId} className="text-lg font-semibold text-theme-text-primary">{title}</h3>
           <p className="text-sm text-theme-text-secondary mt-1">{message}</p>
         </div>
         <button
           onClick={onClose}
           disabled={!canClose}
+          aria-label="Close"
           className="p-1 text-theme-text-secondary hover:text-theme-text-primary hover:bg-theme-elevated rounded disabled:opacity-50"
         >
           <X className="w-5 h-5" />
@@ -74,13 +82,13 @@ export function ConfirmDialog({
 
       {/* Custom content */}
       {children && (
-        <div className="px-4 pt-4">
+        <div className="px-4 py-4">
           {children}
         </div>
       )}
 
       {/* Warning message — hidden once the action is in progress */}
-      {!isLoading && !children && (
+      {showWarning && !isLoading && !children && (
         <div className="p-4">
           <div
             className={clsx(
@@ -109,9 +117,9 @@ export function ConfirmDialog({
         </button>
         <button
           onClick={onConfirm}
-          disabled={isLoading}
+          disabled={isLoading || confirmDisabled}
           className={clsx(
-            'px-4 py-2 text-sm font-medium rounded-lg transition-colors disabled:opacity-50 flex items-center gap-2',
+            'px-4 py-2 text-sm font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2',
             isDanger
               ? 'bg-red-600 hover:bg-red-700 text-theme-text-primary'
               : 'bg-amber-600 hover:bg-amber-700 text-theme-text-primary'

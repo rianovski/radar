@@ -1,46 +1,64 @@
 package server
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/skyhook-io/radar/internal/auth"
 	"github.com/skyhook-io/radar/internal/filter"
+	"github.com/skyhook-io/radar/internal/helm"
 	"github.com/skyhook-io/radar/internal/issues"
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/internal/meaningfulchanges"
+	"github.com/skyhook-io/radar/pkg/issuesapi"
 )
 
-// handleIssues serves GET /api/issues — the unified cluster-health
-// endpoint. Composes problems + condition fallback by default; audit
-// + event sources are opt-in (both are loud — audit findings run 50–
-// 200 per cluster, and events flood with thousands of redundant
-// rows on noisy clusters).
+// filterRecentChangesByRBAC drops RecentChange rows the ctx user can't read, via
+// the shared per-kind gate (RecentChange.APIVersion disambiguates CRD kind
+// collisions). Auth off → returned unchanged. Used by both the /api/issues
+// recent_changes enrichment and per-issue change correlation.
+func (s *Server) filterRecentChangesByRBAC(ctx context.Context, changes []issuesapi.RecentChange) []issuesapi.RecentChange {
+	if auth.UserFromContext(ctx) == nil {
+		return changes
+	}
+	authz := s.changeAuthorizerForCtx(ctx)
+	out := changes[:0]
+	for _, c := range changes {
+		if k8s.ChangeReadAllowed(c.Kind, c.APIVersion, c.Namespace, authz) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// handleIssues serves GET /api/issues — "what's broken right now."
+// Composes the curated operational sources (workload/pod problems,
+// dangling references, pod-startup blockers, and False CRD conditions),
+// severity-ranked. Raw Warning events live at /api/events + the timeline;
+// policy posture (Kyverno) and static best-practice findings live in
+// /api/audit. Those are deliberately NOT issue sources — detection
+// provenance is not a triage axis, so there is no source= filter (the
+// `source` field is still on each returned row, and filter= CEL can slice
+// on it for power users).
 //
 // Query params:
 //
 //	namespace= / namespaces=  one or comma-separated
 //	severity=  critical,warning  (default: all)
-//	source=    problem,audit,event,condition. Defaults to problem+
-//	           condition (audit + event excluded). Pass any source
-//	           explicitly to opt it in; "audit" lifts include_audit,
-//	           "event" lifts include_events. The two flags exist so
-//	           callers can opt those sources in without also
-//	           narrowing to ONLY them.
 //	kind=      Pod,Deployment,...  (default: all)
-//	since=     duration like 15m, 1h. Affects event source only;
-//	           when events are enabled and since is omitted, the
-//	           handler defaults to 1h to avoid pulling the full
-//	           cached event backlog.
-//	limit=     default 200, max 1000
-//	include_audit=true   opt audit findings in
-//	include_events=true  opt warning events in
+//	filter=    optional CEL predicate over each row (bindings include source)
+//	limit=     default 200, max 1000 (counts issue groups, not member objects)
+//	view=      flat → raw pre-fold evidence rows (debug); default → grouped
 func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
 	}
-	provider := issues.NewCacheProvider()
+	provider := s.issuesProviderFor(r)
 	if provider == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
@@ -50,10 +68,17 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 
 	// Auth-filter the requested namespaces. nil = "all namespaces" (user
 	// is unrestricted); non-nil empty = "user has no access to anything
-	// they asked for" → return empty rather than leak cluster-wide rows.
+	// they asked for".
 	namespaces := s.parseNamespacesForUser(r)
 	if noNamespaceAccess(namespaces) {
-		s.writeJSON(w, map[string]any{"issues": []any{}, "total": 0})
+		// If the caller EXPLICITLY named namespace(s) they can't access, that's
+		// a denial — surface it as 403, not an empty (reads-as-"nothing broken")
+		// list. Bad trust boundary otherwise, especially for an agent.
+		if q.Get("namespace") != "" || q.Get("namespaces") != "" {
+			s.writeError(w, http.StatusForbidden, "no access to the requested namespace(s)")
+			return
+		}
+		s.writeJSON(w, map[string]any{"issues": []any{}, "total": 0, "total_matched": 0})
 		return
 	}
 
@@ -62,44 +87,17 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	sources, err := parseSources(q.Get("source"))
-	if err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	since, err := parseDuration(q.Get("since"))
-	if err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	includeEvents := q.Get("include_events") == "true" || hasSource(q.Get("source"), "event")
-	// When events are enabled and no explicit window was passed, cap
-	// the lookback at 1h. Without this an opt-in immediately yields
-	// the full cache window (hours of accumulated Warning events,
-	// most of which duplicate problem-source rows already returned).
-	if includeEvents && since == 0 {
-		since = time.Hour
-	}
 	filters := issues.Filters{
-		Namespaces:    namespaces,
-		Severities:    severities,
-		Sources:       sources,
-		Kinds:         splitCSV(q.Get("kind")),
-		Since:         since,
-		Limit:         parseLimit(q.Get("limit")),
-		IncludeAudit:  q.Get("include_audit") == "true" || hasSource(q.Get("source"), "audit"),
-		IncludeEvents: includeEvents,
-		CanReadClusterScoped: func(kind, group string) bool {
-			if auth.UserFromContext(r.Context()) == nil {
-				return true
-			}
-			clusterScoped, gvrGroup, gvrResource := k8s.ClassifyKindScope(kind, group)
-			if !clusterScoped {
-				return false
-			}
-			return s.canRead(r, gvrGroup, gvrResource, "", "list")
-		},
+		Namespaces: namespaces,
+		Severities: severities,
+		Kinds:      splitCSV(q.Get("kind")),
+		Limit:      parseLimit(q.Get("limit")),
+		// Grouped is the product default — one row per subject+category.
+		// ?view=flat returns the raw pre-fold evidence rows for debugging
+		// ("what folded into this group?") and internal inspection.
+		Grouped:              q.Get("view") != "flat",
+		CanReadClusterScoped: s.issueClusterScopedAccess(r),
+		CanReadRelated:       s.issueRelatedResourceAccess(r),
 	}
 	if expr := q.Get("filter"); expr != "" {
 		f, err := filter.CachedIssueFilter(expr)
@@ -110,22 +108,186 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 		filters.Filter = f
 	}
 
-	out, stats := issues.ComposeWithStats(provider, filters)
-	resp := map[string]any{
-		"issues": out,
-		"total":  len(out),
-		// total_matched is the uncapped count — i.e. how many issues
-		// would have been in `issues` if no limit applied. Tells the
-		// caller whether they're looking at a windowed view or the
-		// whole set. The hub forwards this per-cluster in fleet
-		// envelopes so the SPA can render "X of N total".
-		"total_matched": stats.TotalMatched,
+	composeFilters := filters
+	composeFilters.Limit = issues.NoLimit
+	composeFilters.Filter = nil
+	out, stats := issues.ComposeWithStats(provider, composeFilters)
+	out, stats = issues.MergeExternalIssues(out, stats, filters, s.nativeHelmIssuesForRequest(r, namespaces, filters))
+	// Shared base response shape (issues.ListResponse); surfaces add their
+	// own enrichments after this point.
+	resp := issues.NewListResponse(out, stats)
+	resp.ClusterContext = provider.ClusterContextForIssues(namespaces, func(group, resource string) bool {
+		return s.canRead(r, group, resource, "kube-system", "list")
+	})
+	if len(namespaces) == 1 && stats.TotalMatched == len(out) && meaningfulchanges.IssueChangesQueryEligible(q.Get("kind"), q.Get("filter"), q.Get("severity")) {
+		if recentChangesReason := meaningfulchanges.IssueChangesReason(out); recentChangesReason != "" {
+			if recentResult, err := meaningfulchanges.Recent(r.Context(), meaningfulchanges.Query{
+				Namespaces: []string{namespaces[0]},
+				Since:      meaningfulchanges.DefaultSince,
+				Limit:      meaningfulchanges.IssueChangesFetchLimit(recentChangesReason),
+				FieldLimit: meaningfulchanges.DefaultFieldLimit,
+			}); err == nil && len(recentResult.Changes) > 0 {
+				// Per-kind RBAC: recent_changes is namespace-filtered but not
+				// per-kind — drop changes for kinds the caller can't read before
+				// ranking, so priority/recap logic operates on the visible set.
+				recentResult.Changes = s.filterRecentChangesByRBAC(r.Context(), recentResult.Changes)
+				changes, guidance, recapped := meaningfulchanges.PrioritizeIssueChanges(
+					recentResult.Changes, out, meaningfulchanges.IssueChangePriorityOptions{
+						Reason:             recentChangesReason,
+						Limit:              meaningfulchanges.IssueChangesLimit,
+						UnfilteredIssueSet: meaningfulchanges.IssueSeveritySetComplete(severities),
+						FetchSaturated:     recentResult.FetchSaturated,
+					},
+				)
+				resp.RecentChanges = changes
+				resp.RecentChangesReason = recentChangesReason
+				resp.RecentChangesGuidance = guidance
+				resp.RecentChangesTruncated = recentResult.OutputCapped || recentResult.FetchSaturated || recapped
+			}
+		}
 	}
-	if stats.FilterErrors > 0 {
-		resp["filter_errors"] = stats.FilterErrors
-		resp["filter_error_sample"] = stats.FilterErrorSample
+	if result := k8s.GetCachedPermissionResult(); result != nil {
+		if visibility := k8s.BuildVisibilitySummary(result, k8s.VisibilityNamespace(namespaces)); visibility != nil {
+			resp.Visibility = visibility
+		}
 	}
 	s.writeJSON(w, resp)
+}
+
+func (s *Server) issueClusterScopedAccess(r *http.Request) func(kind, group string) bool {
+	return func(kind, group string) bool {
+		if auth.UserFromContext(r.Context()) == nil {
+			return true
+		}
+		clusterScoped, gvrGroup, gvrResource := k8s.ClassifyKindScope(kind, group)
+		if !clusterScoped {
+			return false
+		}
+		return s.canRead(r, gvrGroup, gvrResource, "", "list")
+	}
+}
+
+func (s *Server) issueRelatedResourceAccess(r *http.Request) func(issues.Ref) bool {
+	return func(ref issues.Ref) bool {
+		if auth.UserFromContext(r.Context()) == nil {
+			return true
+		}
+		if ref.Namespace != "" || strings.EqualFold(ref.Kind, "Namespace") {
+			_, _, ok := s.preflightResourceGet(r, normalizeKind(ref.Kind), ref.Namespace, ref.Name, ref.Group)
+			if !ok {
+				return false
+			}
+			switch {
+			case ref.Group == "apps" && ref.Kind == "ReplicaSet":
+				return s.canRead(r, ref.Group, "replicasets", ref.Namespace, "get")
+			case ref.Group == "batch" && ref.Kind == "Job":
+				return s.canRead(r, ref.Group, "jobs", ref.Namespace, "get")
+			}
+			return true
+		}
+		clusterScoped, group, resource := k8s.ClassifyKindScope(ref.Kind, ref.Group)
+		return clusterScoped && s.canRead(r, group, resource, "", "get")
+	}
+}
+
+func (s *Server) nativeHelmIssuesForRequest(r *http.Request, namespaces []string, filters issues.Filters) []issues.Issue {
+	if !issues.KindFilterIncludes(filters.Kinds, "HelmRelease", "helmreleases") {
+		return nil
+	}
+	helmClient := helm.GetClient()
+	if helmClient == nil {
+		return nil
+	}
+	username, groups := "", []string(nil)
+	if user := auth.UserFromContext(r.Context()); user != nil {
+		username = user.Username
+		groups = user.Groups
+	}
+	helmNamespaces := namespaces
+	if helmNamespaces == nil {
+		var ok bool
+		helmNamespaces, ok = s.resolveHelmNamespaces(r)
+		if !ok {
+			return nil
+		}
+	}
+	releases, err := s.helmClientFor(r, helmClient).ListReleasesAcrossNamespaces(helmNamespaces, username, groups)
+	if err != nil {
+		if !helm.IsForbiddenError(err) {
+			log.Printf("[issues] Failed to list Helm releases for issue stream: %v", err)
+		}
+		return nil
+	}
+	return issues.NativeHelmReleaseIssues(releases, time.Now())
+}
+
+// handleResourceIssues serves GET /api/issues/resource/{kind}/{namespace}/{name}
+// — the live Issues that touch ONE resource: its own issues plus, for a workload,
+// the issues on its owned pods (owner rollup). Backs the "Operational Issues"
+// section in the resource detail. Namespace "_" denotes a cluster-scoped resource;
+// optional ?group= disambiguates a CRD whose kind collides with a core kind.
+//
+// RBAC: namespaced targets are gated by the namespace auth-filter (the frontend
+// passes ?namespaces=<ns> to scope the scan); cluster-scoped targets are gated by
+// the same list permission /api/issues uses, so this can't surface a node's
+// issues to a user who can't list nodes.
+func (s *Server) handleResourceIssues(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConnected(w) {
+		return
+	}
+	provider := s.issuesProviderFor(r)
+	if provider == nil {
+		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
+		return
+	}
+	rawKind := chi.URLParam(r, "kind")
+	namespace := chi.URLParam(r, "namespace")
+	name := chi.URLParam(r, "name")
+	if namespace == "_" { // cluster-scoped sentinel
+		namespace = ""
+	}
+	group := r.URL.Query().Get("group")
+
+	// Authorize exactly like the resource drawer's GET (preflightResourceGet):
+	// cluster-scoped get-SAR (fails closed), namespace access, and the
+	// per-namespace Secret get-SAR — so this can't surface issues for a resource
+	// the caller couldn't open in the drawer.
+	if status, msg, ok := s.preflightResourceGet(r, normalizeKind(rawKind), namespace, name, group); !ok {
+		s.writeError(w, status, msg)
+		return
+	}
+
+	// RelatedIssues matches by canonical Kind (EqualFold). Resolve the route's
+	// plural name to the canonical Kind via discovery — covers every kind + CRDs
+	// (jobs, cronjobs, nodes, pvcs, hpas, pdbs, …), so a direct API consumer
+	// passing a plural can't silently get an empty result. Canonical (PascalCase)
+	// input passes straight through the rawKind fallback when discovery can't
+	// resolve it (e.g. not yet connected).
+	kind := rawKind
+	if disc := k8s.GetResourceDiscovery(); disc != nil {
+		if gvr, ok := disc.GetGVRWithGroup(rawKind, group); ok {
+			if canonical := disc.GetKindForGVR(gvr); canonical != "" {
+				kind = canonical
+			}
+		}
+	}
+
+	// Scope the scan to the resource's namespace (a workload's owned pods live
+	// there too); cluster-scoped resources scan all namespaces (nil).
+	var namespaces []string
+	if namespace != "" {
+		namespaces = []string{namespace}
+	}
+
+	related := issues.RelatedIssues(provider, issues.RelatedIssueOptions{
+		Namespaces:           namespaces,
+		CanReadClusterScoped: s.issueClusterScopedAccess(r),
+		CanReadRelated:       s.issueRelatedResourceAccess(r),
+	}, group, kind, namespace, name)
+	if related == nil {
+		related = []issues.Issue{}
+	}
+	s.writeJSON(w, related)
 }
 
 func parseSeverities(v string) ([]issues.Severity, error) {
@@ -150,46 +312,6 @@ func parseSeverities(v string) ([]issues.Severity, error) {
 	return out, nil
 }
 
-func parseSources(v string) ([]issues.Source, error) {
-	if v == "" {
-		return nil, nil
-	}
-	parts := strings.Split(v, ",")
-	out := make([]issues.Source, 0, len(parts))
-	for _, p := range parts {
-		s := strings.ToLower(strings.TrimSpace(p))
-		switch s {
-		case "":
-			continue
-		case "problem":
-			out = append(out, issues.SourceProblem)
-		case "audit":
-			out = append(out, issues.SourceAudit)
-		case "event":
-			out = append(out, issues.SourceEvent)
-		case "condition":
-			out = append(out, issues.SourceCondition)
-		default:
-			return nil, fmt.Errorf("unknown source %q (want: problem, audit, event, condition)", p)
-		}
-	}
-	return out, nil
-}
-
-// hasSource reports whether the caller's `?source=` list explicitly
-// names `target`. Used to derive the opt-in flags for audit and
-// event sources — passing them in the source list is more
-// discoverable than the parallel include_* booleans, and we honor
-// both.
-func hasSource(v, target string) bool {
-	for _, p := range strings.Split(v, ",") {
-		if strings.EqualFold(strings.TrimSpace(p), target) {
-			return true
-		}
-	}
-	return false
-}
-
 func splitCSV(v string) []string {
 	if v == "" {
 		return nil
@@ -202,18 +324,4 @@ func splitCSV(v string) []string {
 		}
 	}
 	return out
-}
-
-func parseDuration(v string) (time.Duration, error) {
-	if v == "" {
-		return 0, nil
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return 0, fmt.Errorf("invalid since=%q: %w", v, err)
-	}
-	if d < 0 {
-		return 0, fmt.Errorf("since must be non-negative, got %s", d)
-	}
-	return d, nil
 }

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -29,6 +30,7 @@ type PoolEntry struct {
 	DynCache    *DynamicResourceCache
 	Discovery   *ResourceDiscovery
 	Client      kubernetes.Interface
+	Dynamic     dynamic.Interface
 	RestConfig  *rest.Config
 	ContextName string
 	ClusterName string
@@ -86,12 +88,44 @@ func (p *CachePool) Seed(contextName string, entry PoolEntry, cancel context.Can
 func (p *CachePool) EntryForUser(username string) *PoolEntry {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	ref := p.refForUserLocked(username)
+	ctxName := p.userContextLocked(username)
+	ref := p.entries[ctxName]
 	if ref == nil {
 		return nil
 	}
-	e := ref.entry
+	e := p.resolveEntryLocked(ctxName, ref)
 	return &e
+}
+
+// resolveEntryLocked returns the entry to serve for contextName. The default
+// context's informers are owned by the process-global subsystems, which can
+// publish a cache after the pool was seeded (progressive sync) or replace it
+// (credential recovery, reconnect), so its entry is read live from those
+// globals instead of the seed-time snapshot. Caller must hold p.mu.
+func (p *CachePool) resolveEntryLocked(contextName string, ref *poolRef) PoolEntry {
+	e := ref.entry
+	if contextName != p.defaultCtx {
+		return e
+	}
+	if c := GetResourceCache(); c != nil {
+		e.Cache = c
+	}
+	if d := GetDynamicResourceCache(); d != nil {
+		e.DynCache = d
+	}
+	if d := GetResourceDiscovery(); d != nil {
+		e.Discovery = d
+	}
+	if c := GetClient(); c != nil {
+		e.Client = c
+	}
+	if d := GetDynamicClient(); d != nil {
+		e.Dynamic = d
+	}
+	if c := GetConfig(); c != nil {
+		e.RestConfig = c
+	}
+	return e
 }
 
 // EntryForContext returns the PoolEntry for a specific context name, regardless
@@ -103,7 +137,7 @@ func (p *CachePool) EntryForContext(contextName string) *PoolEntry {
 	if !ok || ref == nil {
 		return nil
 	}
-	e := ref.entry
+	e := p.resolveEntryLocked(contextName, ref)
 	return &e
 }
 
@@ -224,12 +258,6 @@ func (p *CachePool) userContextLocked(username string) string {
 	return p.defaultCtx
 }
 
-// refForUserLocked returns the poolRef for username's current context.
-// Caller must hold p.mu.
-func (p *CachePool) refForUserLocked(username string) *poolRef {
-	return p.entries[p.userContextLocked(username)]
-}
-
 // BuildEntryForContext creates a fully independent cluster connection for the
 // named kubeconfig context. It does not touch any global variables. The
 // returned cancel function shuts down all informers when called.
@@ -268,30 +296,43 @@ func BuildEntryForContext(ctx context.Context, contextName string) (*PoolEntry, 
 	// Typed resource cache. Use a pointer that the OnEventChange closure
 	// captures by reference so it resolves after construction.
 	var typedCache *ResourceCache
+	secretWriteTimes := newSecretDataManagerWriteIndex()
+	cronJobScheduleObservations := newCronJobScheduleObservationTracker()
 
 	coreCfg := k8score.CacheConfig{
-		Client:              client,
-		ResourceScopes:      scopes,
-		DeferredTypes:       deferredResources,
-		DebugEvents:         DebugEvents,
-		TimingLogger:        func(string, ...any) {}, // silent for pool entries
-		PatienceWindow:      firstPaintPatience,
-		MinimalSet:          minimalFirstPaintSet,
-		SyncTimeout:         firstPaintBackstop,
-		DeferredSyncTimeout: 3 * time.Minute,
+		Client:                  client,
+		ResourceScopes:          scopes,
+		ResourceScopeNamespaces: permResult.ScopeNamespaces,
+		DeferredTypes:           deferredResources,
+		DebugEvents:             DebugEvents,
+		TimingLogger:            func(string, ...any) {}, // silent for pool entries
+		PatienceWindow:          firstPaintPatience,
+		MinimalSet:              minimalFirstPaintSet,
+		SyncTimeout:             FirstPaintBackstop,
+		DeferredSyncTimeout:     3 * time.Minute,
+		ListPageSize:            ListPageSize,
 
+		OnTransform: func(obj any) {
+			secretWriteTimes.capture(obj)
+		},
+		OnObservedChange: func(change k8score.ResourceChange, obj, _ any) {
+			secretWriteTimes.reconcile(change, obj)
+			if cj, ok := obj.(*batchv1.CronJob); ok {
+				cronJobScheduleObservations.observe(change.Operation, cj)
+			}
+		},
 		OnChange: func(change k8score.ResourceChange, obj, oldObj any) {
-			recordToTimelineStore(change.Kind, change.Namespace, change.Name, change.UID, change.Operation, oldObj, obj)
+			recordToTimelineStore(contextName, change.Kind, change.Namespace, change.Name, change.UID, change.Operation, oldObj, obj, change.Diff, true)
 		},
 		OnEventChange: func(obj any, op string) {
 			if op == "delete" {
 				return
 			}
 			// Owner lookup uses typedCache (set after construction).
-			recordK8sEventToTimelineWithCache(obj, typedCache)
+			recordK8sEventToTimelineWithCache(contextName, obj, typedCache)
 		},
 		OnDrop: func(kind, ns, name, reason, op string) {
-			timeline.RecordDrop(kind, ns, name, reason, op)
+			timeline.RecordDrop(kind, ns, name, reason, op, contextName)
 		},
 		ComputeDiff:     func(kind string, oldObj, newObj any) *k8score.DiffInfo { return ComputeDiff(kind, oldObj, newObj) },
 		IsNoisyResource: isNoisyResource,
@@ -303,7 +344,13 @@ func BuildEntryForContext(ctx context.Context, contextName string) (*PoolEntry, 
 		return nil, nil, fmt.Errorf("create resource cache for %q: %w", contextName, err)
 	}
 
-	typedCache = &ResourceCache{ResourceCache: core, secretsEnabled: scopes["secrets"].Enabled}
+	typedCache = &ResourceCache{
+		ResourceCache:               core,
+		secretsEnabled:              scopes["secrets"].Enabled,
+		argoDrift:                   newArgoDriftTracker(),
+		cronJobScheduleObservations: cronJobScheduleObservations,
+		secretWriteTimes:            secretWriteTimes,
+	}
 
 	// API resource discovery — async, non-blocking.
 	coreDisc, err := k8score.NewResourceDiscovery(discClient)
@@ -320,17 +367,19 @@ func BuildEntryForContext(ctx context.Context, contextName string) (*PoolEntry, 
 		nsFallback = permResult.Namespace
 	}
 	dynCore, err := k8score.NewDynamicResourceCache(k8score.DynamicCacheConfig{
-		DynamicClient:     dynClient,
-		Discovery:         coreDisc,
-		Changes:           core.ChangesRaw(),
-		NamespaceFallback: nsFallback,
-		DebugEvents:       DebugEvents,
+		DynamicClient:               dynClient,
+		Discovery:                   coreDisc,
+		Changes:                     core.ChangesRaw(),
+		NamespaceFallback:           nsFallback,
+		NamespaceFallbacks:          permResult.ScopeCandidates,
+		NamespaceFallbacksTruncated: permResult.ScopeCandidatesTruncated,
+		DebugEvents:                 DebugEvents,
 		OnChange: func(change k8score.ResourceChange, obj, oldObj any) {
 			if u := extractUnstructured(obj); u != nil {
-				recordToTimelineStore(change.Kind, change.Namespace, change.Name, change.UID, change.Operation, oldObj, obj)
+				recordToTimelineStore(contextName, change.Kind, change.Namespace, change.Name, change.UID, change.Operation, oldObj, obj, change.Diff, true)
 			}
 		},
-		OnDrop: func(kind, ns, name, reason, op string) { timeline.RecordDrop(kind, ns, name, reason, op) },
+		OnDrop: func(kind, ns, name, reason, op string) { timeline.RecordDrop(kind, ns, name, reason, op, contextName) },
 		ComputeDiff: func(kind string, oldObj, newObj any) *k8score.DiffInfo {
 			return ComputeDiff(kind, oldObj, newObj)
 		},
@@ -357,6 +406,7 @@ func BuildEntryForContext(ctx context.Context, contextName string) (*PoolEntry, 
 		DynCache:    &DynamicResourceCache{DynamicResourceCache: dynCore},
 		Discovery:   disc,
 		Client:      client,
+		Dynamic:     dynClient,
 		RestConfig:  restCfg,
 		ContextName: contextName,
 		ClusterName: clusterName,

@@ -10,6 +10,77 @@ import (
 	"github.com/skyhook-io/radar/internal/traffic"
 )
 
+// namespaceLookup builds a set for membership tests. A nil input (all-namespace
+// access from parseNamespacesForUser) returns nil, which flowVisibleForNamespaces
+// treats as "no restriction".
+func namespaceLookup(namespaces []string) map[string]bool {
+	if namespaces == nil {
+		return nil
+	}
+	set := make(map[string]bool, len(namespaces))
+	for _, ns := range namespaces {
+		set[ns] = true
+	}
+	return set
+}
+
+// redactPolicyRefs removes, from the plugin's attribution of a flow, every
+// policy the caller may not list — a policy's name is a read of that policy,
+// and a cluster-wide one is a cluster-scoped read that visibility of the
+// flow's namespaces does not imply. The count of removed references is kept
+// so the panel can still say a policy was named.
+func (s *Server) redactPolicyRefs(r *http.Request, pv *traffic.PolicyVerdict) *traffic.PolicyVerdict {
+	if pv == nil {
+		return nil
+	}
+	out := &traffic.PolicyVerdict{}
+	keep := func(refs []traffic.PolicyRef, count *int) []traffic.PolicyRef {
+		var kept []traffic.PolicyRef
+		for _, ref := range refs {
+			group, resource, ok := policyRefResource(ref.Kind)
+			if ok && s.canRead(r, group, resource, ref.Namespace, "list") {
+				kept = append(kept, ref)
+			} else if count != nil {
+				*count++
+			}
+		}
+		return kept
+	}
+	out.AllowedBy = keep(pv.AllowedBy, nil)
+	out.DeniedBy = keep(pv.DeniedBy, &out.Withheld)
+	return out
+}
+
+// policyRefResource maps the policy kinds a network plugin attributes flows
+// to onto the API resource a caller must be able to list to learn their
+// names. A kind Radar does not know is withheld rather than shown.
+func policyRefResource(kind string) (group, resource string, ok bool) {
+	switch kind {
+	case "NetworkPolicy":
+		return "networking.k8s.io", "networkpolicies", true
+	case "CiliumNetworkPolicy":
+		return "cilium.io", "ciliumnetworkpolicies", true
+	case "CiliumClusterwideNetworkPolicy":
+		return "cilium.io", "ciliumclusterwidenetworkpolicies", true
+	}
+	return "", "", false
+}
+
+// flowVisibleForNamespaces reports whether a flow may be shown to a user whose
+// allowed namespaces are `allowed` (nil = all-namespace access). The traffic
+// source can only filter by a single namespace or none, so multi-namespace
+// users are filtered here: a flow is visible when either endpoint is in an
+// allowed namespace, so a user sees traffic to and from services in the
+// namespaces they can read. External/empty-namespace endpoints alone don't
+// make a flow visible.
+func flowVisibleForNamespaces(flow traffic.Flow, allowed map[string]bool) bool {
+	if allowed == nil {
+		return true
+	}
+	return (flow.Source.Namespace != "" && allowed[flow.Source.Namespace]) ||
+		(flow.Destination.Namespace != "" && allowed[flow.Destination.Namespace])
+}
+
 // handleGetTrafficSources returns available traffic sources and recommendations
 // GET /api/traffic/sources
 func (s *Server) handleGetTrafficSources(w http.ResponseWriter, r *http.Request) {
@@ -72,19 +143,58 @@ func (s *Server) handleGetTrafficFlows(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Aggregate flows by service pair
-	aggregated := traffic.AggregateFlows(response.Flows)
+	// The source only filters by a single namespace; restrict multi-namespace
+	// users here so flows outside their allowed namespaces aren't returned.
+	flows := response.Flows
+	if allowed := namespaceLookup(namespaces); allowed != nil {
+		kept := make([]traffic.Flow, 0, len(flows))
+		for _, f := range flows {
+			if flowVisibleForNamespaces(f, allowed) {
+				kept = append(kept, f)
+			}
+		}
+		flows = kept
+	}
+	for i := range flows {
+		flows[i].PolicyVerdict = s.redactPolicyRefs(r, flows[i].PolicyVerdict)
+	}
 
+	s.writeJSON(w, trafficFlowsPayload(response, flows))
+}
+
+// trafficFlowsPayload shapes the flows response. Split out so it can be tested
+// directly: the payload is hand-built rather than marshalled from a struct, so a
+// field the source sets is easy to drop here without anything failing.
+func trafficFlowsPayload(response *traffic.FlowsResponse, flows []traffic.Flow) map[string]any {
 	result := map[string]any{
 		"source":     response.Source,
 		"timestamp":  response.Timestamp,
-		"flows":      response.Flows,
-		"aggregated": aggregated,
+		"flows":      flows,
+		"aggregated": traffic.AggregateFlows(flows),
 	}
+
+	// A partial-data warning qualifies the flows it came with. If the namespace
+	// filtering above removed all of them, it now qualifies nothing this user can
+	// see — and describing the shape of edges they have no access to is both
+	// confusing and more than they asked. A source that returned no flows in the
+	// first place is different: there the warning is the explanation for the empty
+	// result, which is exactly what it is for.
+	filteredEverythingOut := len(flows) == 0 && len(response.Flows) > 0
+	if response.WarningKind == traffic.WarningPartial && filteredEverythingOut {
+		return result
+	}
+
 	if response.Warning != "" {
 		result["warning"] = response.Warning
+		// The kind has to travel with the warning: the client retries a transient
+		// one and must not retry a permanent one, and an absent kind is read as
+		// transient — so dropping it here turns a standing explanation into an
+		// endless retry loop.
+		if response.WarningKind != "" {
+			result["warningKind"] = response.WarningKind
+		}
 	}
-	s.writeJSON(w, result)
+	return result
 }
 
 // handleTrafficFlowsStream provides SSE stream of traffic flows
@@ -98,12 +208,22 @@ func (s *Server) handleTrafficFlowsStream(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Parse query parameters
-	namespace := r.URL.Query().Get("namespace")
+	// Enforce per-user namespace access (parseNamespacesForUser intersects the
+	// requested ?namespace= with the user's RBAC-allowed namespaces).
+	namespaces := s.parseNamespacesForUser(r)
+	if noNamespaceAccess(namespaces) {
+		s.writeError(w, http.StatusForbidden, "no namespace access")
+		return
+	}
+	allowed := namespaceLookup(namespaces)
 
 	opts := traffic.FlowOptions{
-		Namespace: namespace,
-		Follow:    true,
+		Follow: true,
+	}
+	// The source filters by a single namespace; multi-namespace users are
+	// filtered per-flow below.
+	if len(namespaces) == 1 {
+		opts.Namespace = namespaces[0]
 	}
 
 	flowCh, err := manager.StreamFlows(ctx, opts)
@@ -144,6 +264,11 @@ func (s *Server) handleTrafficFlowsStream(w http.ResponseWriter, r *http.Request
 			if !ok {
 				return
 			}
+
+			if !flowVisibleForNamespaces(flow, allowed) {
+				continue
+			}
+			flow.PolicyVerdict = s.redactPolicyRefs(r, flow.PolicyVerdict)
 
 			data, err := json.Marshal(flow)
 			if err != nil {

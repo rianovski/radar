@@ -2,78 +2,71 @@ package prometheus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
-	"sort"
 	"strings"
-
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/skyhook-io/radar/internal/errorlog"
+	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/internal/portforward"
+	"github.com/skyhook-io/radar/pkg/prom"
 )
 
-// Well-known Prometheus/VictoriaMetrics service locations
-// (similar to traffic/caretta.go but with different ordering for workload metrics discovery).
-var wellKnownLocations = []struct {
-	namespace string
-	name      string
-	port      int    // 0 = use service's first port
-	basePath  string // sub-path for Prometheus API
-}{
-	// VictoriaMetrics — monitoring namespace first (workload metrics)
-	{"monitoring", "victoria-metrics-victoria-metrics-single-server", 8428, ""},
-	{"monitoring", "victoria-metrics-single-server", 8428, ""},
-	{"monitoring", "vmsingle", 8428, ""},
-	{"monitoring", "vmselect", 8481, "/select/0/prometheus"},
-	{"victoria-metrics", "victoria-metrics-victoria-metrics-single-server", 8428, ""},
-	{"victoria-metrics", "victoria-metrics-single-server", 8428, ""},
-	{"victoria-metrics", "vmsingle", 8428, ""},
-	{"victoria-metrics", "vmselect", 8481, "/select/0/prometheus"},
-	// kube-prometheus-stack
-	{"monitoring", "kube-prometheus-stack-prometheus", 9090, ""},
-	{"monitoring", "prometheus-kube-prometheus-prometheus", 9090, ""},
-	{"monitoring", "prometheus-operated", 9090, ""},
-	// Standard Prometheus
-	{"opencost", "prometheus-server", 0, ""},
-	{"monitoring", "prometheus-server", 0, ""},
-	{"prometheus", "prometheus-server", 0, ""},
-	{"observability", "prometheus-server", 0, ""},
-	{"metrics", "prometheus-server", 0, ""},
-	{"kube-system", "prometheus", 0, ""},
-	{"default", "prometheus", 0, ""},
-	// VictoriaMetrics — caretta namespace (traffic-specific, may lack workload metrics)
-	{"caretta", "caretta-vm", 8428, ""},
-}
+var ErrPrometheusNotFound = errors.New("no Prometheus service found in cluster")
 
-// Namespaces commonly used for metrics services
-var metricsNamespaces = map[string]bool{
-	"monitoring":       true,
-	"prometheus":       true,
-	"observability":    true,
-	"metrics":          true,
-	"victoria-metrics": true,
-	"caretta":          true,
-	"opencost":         true,
-}
+// errPrometheusUnreachable is ErrPrometheusNotFound for the case where
+// discovery enumerated a candidate and could not reach it. It wraps the
+// sentinel with an identical message so every errors.Is caller and every
+// message a user sees stay the same, while Availability can tell an
+// unreachable installation from a cluster that has none.
+var errPrometheusUnreachable = fmt.Errorf("%w", ErrPrometheusNotFound)
 
-// Namespaces to skip during dynamic discovery
-var skipNamespaces = map[string]bool{
-	"kube-public":     true,
-	"kube-node-lease": true,
-}
+// errDiscoverySuperseded is returned when a configuration change (Reset /
+// SetManualURL / SetHeaders) invalidated a discovery mid-flight. The result is
+// dropped rather than published; the next request rediscovers under the new
+// configuration.
+var errDiscoverySuperseded = errors.New("prometheus: discovery superseded by a configuration change")
+
+// maxConcurrentProbes bounds the direct probe fan-out so a cluster with many
+// Prometheus-like services doesn't open an unbounded number of sockets at once.
+const maxConcurrentProbes = 4
+
+// directProbeBudget caps the whole direct-probe pass. It is deliberately larger
+// than the per-probe timeout (pkg/prom.Client.Probe uses 3s) so a real but slow
+// endpoint — a loaded Prometheus, or one reached over a high-latency VPN — gets
+// a full probe attempt rather than being cut short and pushed to port-forward.
+// Its real job is the off-cluster case: unresolvable *.svc.cluster.local names
+// can wedge in the platform's cgo resolver past their context deadline, so
+// without this ceiling the doomed pass would dead-wait for seconds before the
+// fallback even starts. This bounds that to one probe window plus margin.
+const directProbeBudget = 4 * time.Second
 
 // discover finds and connects to Prometheus using a multi-layer approach:
 //  1. Manual URL override (--prometheus-url)
 //  2. Existing traffic system port-forward
-//  3. Well-known service locations
-//  4. Dynamic cluster-wide discovery with scoring
+//  3. Well-known service locations (via pkg/prom.Discover)
+//  4. Dynamic cluster-wide discovery with scoring (via pkg/prom.Discover)
+//
+// Well-known + dynamic candidate enumeration lives in pkg/prom.Discover so
+// it can be shared by any consumer of the package. This function owns
+// Radar's port-forward fallback, which is only needed when Radar runs
+// outside the cluster and can't reach in-cluster Service DNS directly.
 //
 // The lock is only held briefly to read/write state, not during network I/O.
-func (c *Client) discover(ctx context.Context) (string, string, error) {
-	// Layer 1: Manual URL override (read under lock)
+//
+// gen is the discovery generation the singleflight was keyed with, threaded
+// through so markConnected commits against *that* generation. Reading the live
+// generation here instead would let a flight keyed at an old generation adopt a
+// newer one after a Reset and commit under it, undoing the reset.
+func (c *Client) discover(ctx context.Context, gen uint64) (string, string, error) {
+	start := time.Now()
+	startGen := gen
+
+	// Layer 1: Manual URL override
 	c.mu.RLock()
 	manualURL := c.manualURL
 	contextName := c.contextName
@@ -82,346 +75,453 @@ func (c *Client) discover(ctx context.Context) (string, string, error) {
 
 	if manualURL != "" {
 		addr := strings.TrimRight(manualURL, "/")
-		if c.probe(ctx, addr) {
-			log.Printf("[prometheus] Using manual URL: %s", addr)
-			c.markConnected(addr, "")
+		c.mu.RLock()
+		tr := prom.NewHTTPTransport(addr, "", c.httpClient)
+		tr.Headers = copyHeaders(c.headers)
+		c.mu.RUnlock()
+		ok, reason := prom.NewClient(tr).ProbeQueryAPI(ctx)
+		if ok {
+			log.Printf("[prometheus] connected via manual URL %s (%s)", addr, took(start))
+			if !c.markConnected(addr, "", "url:"+addr, startGen) {
+				return "", "", errDiscoverySuperseded
+			}
 			return addr, "", nil
 		}
-		errorlog.Record("prometheus", "error", "manual Prometheus URL %s not reachable", addr)
-		return "", "", fmt.Errorf("manual Prometheus URL %s not reachable", addr)
+		// A cancelled probe means the run was superseded (Reset / config change),
+		// not that the operator's URL is bad — don't slander it in errorlog.
+		if err := ctx.Err(); err != nil {
+			logDiscoveryEnded(start, err)
+			return "", "", err
+		}
+		message := "The configured Prometheus endpoint could not be reached. Check its address, network access and TLS configuration."
+		switch reason {
+		case prom.ProbeReasonAuthError:
+			message = "The configured Prometheus endpoint rejected authentication or access (HTTP 401/403). Check credentials, tenant headers and permissions."
+		case prom.ProbeReasonPromError:
+			message = "The configured Prometheus query API returned an error. Check the backend's query and storage health, including ingester/store availability; this is not an empty metrics result."
+		case prom.ProbeReasonHTTPError:
+			message = "The configured Prometheus endpoint responded with an HTTP error. Check the backend and proxy health; this is not a network reachability failure."
+		case prom.ProbeReasonNotPrometheus:
+			message = "The configured endpoint did not return a Prometheus query response. Check the API base path and whether a proxy is returning a login page."
+		}
+		if !discoveryDiagnosticsSuppressed(ctx) {
+			errorlog.Record("prometheus", "error", "%s", message)
+		}
+		return "", "", errors.New(message)
 	}
 
-	// Layer 2: Check if traffic system already has a port-forward
-	if pfAddr := portforward.GetAddress(contextName); pfAddr != "" {
-		if c.probe(ctx, pfAddr) {
-			log.Printf("[prometheus] Using traffic system port-forward: %s", pfAddr)
-			c.markConnected(pfAddr, "")
-			return pfAddr, "", nil
-		}
-	}
+	// Reuse of an existing managed port-forward happens later, per candidate, in
+	// the port-forward fallback loop below — not here as a blind cross-owner
+	// shortcut. A generic probe can't tell the traffic source's caretta-vm
+	// (traffic-specific, may lack workload metrics) apart from a general
+	// Prometheus, so adopting whatever forward is up before enumeration would let
+	// resource metrics bind to caretta-vm and silently lose workload data. Reusing
+	// only a forward that targets a discovered candidate ties reuse to the same
+	// candidate ranking the port-forward attempts already follow.
 
 	if k8sClient == nil {
 		return "", "", fmt.Errorf("no Kubernetes client available for discovery")
 	}
 
-	// Layer 3: Well-known service locations — try each reachable candidate
-	candidates := c.findWellKnownServices(ctx)
-	if len(candidates) > 0 {
-		log.Printf("[prometheus] Found %d well-known service(s), probing...", len(candidates))
+	// Layers 3 + 4: Enumerate candidates via the shared pkg/prom discovery
+	// logic. Well-known first, then dynamic fallbacks.
+	enumStart := time.Now()
+	candidates, err := prom.Discover(ctx, k8sClient, prom.DiscoverOptions{
+		IncludeDynamic: true,
+		Logger: func(format string, args ...interface{}) {
+			log.Printf("[prometheus] "+format, args...)
+		},
+	})
+	if err != nil {
+		log.Printf("[prometheus] Discover error: %v", err)
 	}
-
-	for _, info := range candidates {
-		if c.probe(ctx, info.clusterAddr+info.basePath) {
-			log.Printf("[prometheus] Connected to %s/%s at %s", info.namespace, info.name, info.clusterAddr)
-			c.setDiscoveryService(info)
-			c.markConnected(info.clusterAddr, info.basePath)
-			return info.clusterAddr, info.basePath, nil
+	// A cancelled enumeration returns no candidates; that's supersession, not an
+	// empty cluster — surface it instead of recording "no Prometheus found".
+	if err := ctx.Err(); err != nil {
+		logDiscoveryEnded(start, err)
+		return "", "", err
+	}
+	if len(candidates) == 0 {
+		if err != nil {
+			return "", "", fmt.Errorf("Prometheus discovery failed: %w", err)
 		}
-		log.Printf("[prometheus] Well-known service %s/%s not reachable in-cluster, trying next...", info.namespace, info.name)
-	}
-
-	// If well-known services exist but none reachable in-cluster, try port-forward on first candidate
-	if len(candidates) > 0 {
-		info := candidates[0]
-		log.Printf("[prometheus] No well-known service reachable in-cluster, trying port-forward to %s/%s...", info.namespace, info.name)
-		c.setDiscoveryService(info)
-
-		connInfo, pfErr := portforward.Start(ctx, info.namespace, info.name, info.targetPort, contextName)
-		if pfErr == nil {
-			addr := connInfo.Address
-			if c.probe(ctx, addr+info.basePath) {
-				c.markConnected(addr, info.basePath)
-				return addr, info.basePath, nil
-			}
-			log.Printf("[prometheus] Well-known service %s/%s not responding after port-forward, falling back to dynamic discovery", info.namespace, info.name)
-			portforward.Stop()
-		} else {
-			errorlog.Record("prometheus", "error", "port-forward to %s/%s failed: %v", info.namespace, info.name, pfErr)
+		if !discoveryDiagnosticsSuppressed(ctx) {
+			errorlog.Record("prometheus", "warning", "no Prometheus service found in cluster")
 		}
+		return "", "", ErrPrometheusNotFound
 	}
 
-	// Layer 4: Dynamic discovery
-	info := c.discoverDynamic(ctx)
-	if info == nil {
+	log.Printf("[prometheus] enumerated %d candidate(s) in %s: %s", len(candidates), took(enumStart), summarizeCandidates(candidates))
+
+	// Direct pass: probe each candidate at its in-cluster Service address, with
+	// bounded concurrency. This connects immediately when Radar runs in-cluster,
+	// and also when Radar runs outside the cluster on a network that routes
+	// Service DNS / ClusterIPs (VPN, routed dev cluster) — the reachability of
+	// the address decides, not how the kubeconfig was loaded. Off-cluster
+	// without such routing, every probe fails fast and we fall through to
+	// port-forwarding. The winner is the earliest candidate in priority order,
+	// so endpoint selection is deterministic.
+	directStart := time.Now()
+	directCtx, cancelDirect := context.WithTimeout(ctx, directProbeBudget)
+	idx, reasons := c.probeCandidatesWithReasons(directCtx, candidates)
+	cancelDirect()
+	if idx >= 0 {
+		cand := candidates[idx]
+		if !c.markConnected(cand.ClusterAddr, cand.BasePath, cand.Key(), startGen) {
+			return "", "", errDiscoverySuperseded
+		}
+		log.Printf("[prometheus] connected to %s/%s via direct probe at %s (source=%s, score=%d, direct %s, total %s)",
+			cand.Namespace, cand.Name, cand.ClusterAddr, cand.Source, cand.Score, took(directStart), took(start))
+		c.setDiscoveryServiceFromCandidate(cand)
+		return cand.ClusterAddr, cand.BasePath, nil
+	}
+	// A context error here means the run ended before finding anything — either
+	// superseded (Reset / context switch) or timed out (the hang backstop) — not
+	// that the cluster has no Prometheus. Don't run the fallback or log a scary
+	// failure.
+	if err := ctx.Err(); err != nil {
+		logDiscoveryEnded(start, err)
+		return "", "", err
+	}
+
+	// In-cluster, the direct Service-address probe is the whole story: pods/
+	// portforward is normally denied, so falling back to a forward here only
+	// burns ~10s per candidate on an attempt that cannot open. Fail closed on the
+	// direct pass instead of chasing a port-forward Radar can't establish.
+	if c.inCluster {
+		log.Printf("[prometheus] no candidate reachable via direct probe (%s); in-cluster, not attempting port-forward", took(directStart))
 		c.mu.Lock()
 		c.discoveryService = nil
 		c.mu.Unlock()
-		errorlog.Record("prometheus", "warning", "no Prometheus service found in cluster")
-		return "", "", fmt.Errorf("no Prometheus service found in cluster")
+		blocked := c.attributeNetworkPolicyBlock(ctx, k8s.GetResourceCache(), candidates, reasons)
+		// Attribution reads the API; a run superseded or timed out during it
+		// must end as such, not be recorded as a cluster without Prometheus.
+		if err := ctx.Err(); err != nil {
+			logDiscoveryEnded(start, err)
+			return "", "", err
+		}
+		if blocked != nil {
+			log.Printf("[prometheus] %v", blocked)
+			if !discoveryDiagnosticsSuppressed(ctx) {
+				errorlog.Record("prometheus", "warning", "%v", blocked)
+			}
+			return "", "", blocked
+		}
+		if !discoveryDiagnosticsSuppressed(ctx) {
+			errorlog.Record("prometheus", "warning", "no Prometheus service reachable in cluster")
+		}
+		return "", "", errPrometheusUnreachable
 	}
 
-	c.setDiscoveryService(info)
+	log.Printf("[prometheus] no candidate reachable via direct probe (%s); falling back to port-forward", took(directStart))
 
-	if c.probe(ctx, info.clusterAddr+info.basePath) {
-		log.Printf("[prometheus] Connected to %s/%s at %s (dynamic)", info.namespace, info.name, info.clusterAddr)
-		c.markConnected(info.clusterAddr, info.basePath)
-		return info.clusterAddr, info.basePath, nil
+	// Fallback: try port-forwarding candidates in priority order. This is the
+	// primary path off-cluster (where Service DNS can't resolve from the user's
+	// machine). Serial by necessity — port-forwarding mutates the owner's shared
+	// forward state.
+	var lastErr error
+	for _, cand := range candidates {
+		// Bail promptly if the run was superseded mid-fallback (Reset / context
+		// switch) rather than churning the rest of the list while holding the gate.
+		if err := ctx.Err(); err != nil {
+			logDiscoveryEnded(start, err)
+			return "", "", err
+		}
+		c.setDiscoveryServiceFromCandidate(cand)
+
+		// Reuse an existing managed forward (this owner's own, or a peer's such as
+		// the traffic source) only when it already targets THIS candidate. Matching
+		// on (namespace, service) avoids adopting a forward bound to a different
+		// backend — the reason resource metrics could otherwise land on caretta-vm
+		// via a blind cross-owner shortcut. Reuse follows the same per-candidate
+		// order as the port-forward attempts below.
+		if pfAddr := portforward.GetAddressForService(portforward.OwnerPrometheus, contextName, cand.Namespace, cand.Name); pfAddr != "" {
+			if c.probe(ctx, pfAddr+cand.BasePath) {
+				if !c.markConnected(pfAddr, cand.BasePath, cand.Key(), startGen) {
+					// Superseded mid-reuse: drop the stale service metadata we just
+					// published, same as the port-forward path below. The forward
+					// itself is pre-existing (own from a prior run, or a peer's), so
+					// unlike that path we must not Stop it here.
+					c.mu.Lock()
+					c.discoveryService = nil
+					c.mu.Unlock()
+					return "", "", errDiscoverySuperseded
+				}
+				log.Printf("[prometheus] reusing managed port-forward %s for %s/%s (%s)",
+					pfAddr, cand.Namespace, cand.Name, took(start))
+				return pfAddr, cand.BasePath, nil
+			}
+			// The reuse probe failed. If that is because the run was superseded
+			// (ctx cancelled) rather than the reused forward being genuinely
+			// unreachable, bail now instead of falling through to Start: Start
+			// would fast-path this same pre-existing forward and the doomed
+			// re-probe below would then Stop a tunnel we must leave up (a newer
+			// generation may already own it) — the very teardown the reuse
+			// supersession path above deliberately avoids.
+			if err := ctx.Err(); err != nil {
+				logDiscoveryEnded(start, err)
+				return "", "", err
+			}
+		}
+
+		log.Printf("[prometheus] port-forward → %s/%s:%d (source=%s, score=%d)...",
+			cand.Namespace, cand.Name, cand.TargetPort, cand.Source, cand.Score)
+
+		connInfo, pfErr := portforward.Start(portforward.OwnerPrometheus, ctx, cand.Namespace, cand.Name, cand.TargetPort, contextName)
+		if pfErr != nil {
+			// A cancelled Start means the run was superseded, not that the
+			// port-forward genuinely failed — surface it instead of recording one.
+			if err := ctx.Err(); err != nil {
+				logDiscoveryEnded(start, err)
+				return "", "", err
+			}
+			lastErr = fmt.Errorf("port-forward to %s/%s failed: %w", cand.Namespace, cand.Name, pfErr)
+			if !discoveryDiagnosticsSuppressed(ctx) {
+				errorlog.Record("prometheus", "error", "port-forward to %s/%s failed: %v", cand.Namespace, cand.Name, pfErr)
+			}
+			continue
+		}
+
+		addr := connInfo.Address
+		if c.probe(ctx, addr+cand.BasePath) {
+			if !c.markConnected(addr, cand.BasePath, cand.Key(), startGen) {
+				// Superseded: don't leave the shared forward up for an endpoint
+				// we're discarding.
+				portforward.Stop(portforward.OwnerPrometheus)
+				c.mu.Lock()
+				c.discoveryService = nil
+				c.mu.Unlock()
+				return "", "", errDiscoverySuperseded
+			}
+			log.Printf("[prometheus] connected to %s/%s via port-forward at %s (%s)",
+				cand.Namespace, cand.Name, addr, took(start))
+			return addr, cand.BasePath, nil
+		}
+
+		portforward.Stop(portforward.OwnerPrometheus)
+		// A failed probe on a cancelled context is supersession, not a dead
+		// Prometheus — don't slander the endpoint in errorlog.
+		if err := ctx.Err(); err != nil {
+			logDiscoveryEnded(start, err)
+			return "", "", err
+		}
+		lastErr = fmt.Errorf("Prometheus at %s/%s not responding after port-forward", cand.Namespace, cand.Name)
+		if !discoveryDiagnosticsSuppressed(ctx) {
+			errorlog.Record("prometheus", "error", "Prometheus at %s/%s not responding after port-forward", cand.Namespace, cand.Name)
+		}
 	}
 
-	log.Printf("[prometheus] Service %s/%s not reachable in-cluster, starting port-forward...", info.namespace, info.name)
-	connInfo, err := portforward.Start(ctx, info.namespace, info.name, info.targetPort, contextName)
-	if err != nil {
-		errorlog.Record("prometheus", "error", "port-forward to %s/%s failed: %v", info.namespace, info.name, err)
-		return "", "", fmt.Errorf("port-forward to %s/%s failed: %w", info.namespace, info.name, err)
+	c.mu.Lock()
+	c.discoveryService = nil
+	c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		logDiscoveryEnded(start, err)
+		return "", "", err
 	}
-
-	addr := connInfo.Address
-	if c.probe(ctx, addr+info.basePath) {
-		c.markConnected(addr, info.basePath)
-		return addr, info.basePath, nil
+	log.Printf("[prometheus] discovery failed after %s: no reachable Prometheus among %d candidate(s)", took(start), len(candidates))
+	if lastErr != nil {
+		return "", "", lastErr
 	}
-
-	portforward.Stop()
-	errorlog.Record("prometheus", "error", "Prometheus at %s/%s not responding after port-forward", info.namespace, info.name)
-	return "", "", fmt.Errorf("Prometheus at %s/%s not responding after port-forward", info.namespace, info.name)
+	return "", "", errPrometheusUnreachable
 }
 
-// setDiscoveryService records the discovered service metadata under write lock.
-func (c *Client) setDiscoveryService(info *serviceInfo) {
+// logDiscoveryEnded logs a discovery that ended on a context error, telling a
+// supersession (Reset / config change / context switch → Canceled) apart from
+// the hang backstop (discoveryTimeout → DeadlineExceeded) so the trail is honest.
+func logDiscoveryEnded(start time.Time, err error) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		log.Printf("[prometheus] discovery timed out after %s", took(start))
+		return
+	}
+	log.Printf("[prometheus] discovery superseded after %s", took(start))
+}
+
+// took formats elapsed time for discovery log lines. Go's stdlib logger stamps
+// only whole seconds, so the timeline of sub-second discovery steps is only
+// legible when each line carries its own elapsed measurement.
+func took(start time.Time) string {
+	return time.Since(start).Round(time.Millisecond).String()
+}
+
+// summarizeCandidates renders the candidate list for a single log line:
+// "ns/name(wk)" for well-known, "ns/name(dyn:score)" for dynamically scored —
+// enough to see what discovery found and in what priority order without a line
+// per candidate.
+func summarizeCandidates(candidates []prom.Candidate) string {
+	parts := make([]string, len(candidates))
+	for i, cand := range candidates {
+		src := "wk"
+		if cand.Source == prom.CandidateSourceDynamic {
+			src = fmt.Sprintf("dyn:%d", cand.Score)
+		}
+		parts[i] = fmt.Sprintf("%s/%s(%s)", cand.Namespace, cand.Name, src)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// probe outcome states, published atomically per candidate.
+const (
+	probePending int32 = iota
+	probeFailed
+	probeSucceeded
+)
+
+// probeCandidatesConcurrently probes candidate addresses with bounded
+// concurrency and returns the index of the earliest candidate (in priority
+// order) that responded, or -1 if none did.
+//
+// Launching (in priority order, one slot per candidate) runs in its own
+// goroutine concurrently with collection, so a fast high-priority hit returns
+// immediately instead of waiting for the launcher to work through lower-priority
+// candidates that have wedged the semaphore. Each probe publishes its outcome in
+// a single atomic Store, so on budget expiry — which happens when a name wedges
+// in the platform cgo resolver past its context deadline — the scan for an
+// already-succeeded candidate is both race-free and complete (no success can be
+// recorded-but-unpublished). Selection stays deterministic: a lower-priority
+// success never wins while a higher-priority probe is still pending.
+func (c *Client) probeCandidatesConcurrently(ctx context.Context, candidates []prom.Candidate) int {
+	idx, _ := c.probeCandidatesWithReasons(ctx, candidates)
+	return idx
+}
+
+// probeCandidatesWithReasons is probeCandidatesConcurrently that also returns
+// each candidate's rejection reason (empty for a candidate that succeeded or
+// was never reached before the pass ended).
+func (c *Client) probeCandidatesWithReasons(ctx context.Context, candidates []prom.Candidate) (int, []prom.ProbeReason) {
+	n := len(candidates)
+	reasons := make([]prom.ProbeReason, n)
+	if n == 0 {
+		return -1, reasons
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // stops in-flight/queued probes once we return
+
+	var reasonsMu sync.Mutex
+	state := make([]atomic.Int32, n)
+	launched := make([]atomic.Bool, n)
+	sem := make(chan struct{}, maxConcurrentProbes)
+	woke := make(chan struct{}, n) // wake-ups; buffered so a worker never blocks
+
+	go func() {
+		for i := range candidates {
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			go func(i int) {
+				defer func() { <-sem }()
+				outcome := probeFailed
+				launched[i].Store(true)
+				ok, reason := c.probeWithReason(ctx, candidates[i].ClusterAddr+candidates[i].BasePath, false)
+				if ok {
+					outcome = probeSucceeded
+				}
+				reasonsMu.Lock()
+				reasons[i] = reason
+				reasonsMu.Unlock()
+				state[i].Store(outcome)
+				select {
+				case woke <- struct{}{}:
+				default:
+				}
+			}(i)
+		}
+	}()
+
+	earliestSuccess := func() int {
+		for i := range n {
+			if state[i].Load() == probeSucceeded {
+				return i
+			}
+		}
+		return -1
+	}
+	// A probe still running when the pass ends got no answer in the time the
+	// pass allowed — a policy that silently drops packets looks exactly like
+	// that — so it counts as a transport failure. One never launched stays
+	// unexplained.
+	snapshot := func() []prom.ProbeReason {
+		reasonsMu.Lock()
+		defer reasonsMu.Unlock()
+		out := make([]prom.ProbeReason, n)
+		copy(out, reasons)
+		for i := range out {
+			if out[i] == "" && launched[i].Load() && state[i].Load() == probePending {
+				out[i] = prom.ProbeReasonTransportError
+			}
+		}
+		return out
+	}
+
+	frontier := 0
+	for {
+		for frontier < n {
+			s := state[frontier].Load()
+			if s == probePending {
+				break
+			}
+			if s == probeSucceeded {
+				return frontier, snapshot()
+			}
+			frontier++
+		}
+		if frontier == n {
+			return -1, snapshot() // every candidate resolved, none reachable
+		}
+		select {
+		case <-woke:
+		case <-ctx.Done():
+			return earliestSuccess(), snapshot()
+		}
+	}
+}
+
+// setDiscoveryServiceFromCandidate records the discovered service metadata
+// from a pkg/prom.Candidate.
+func (c *Client) setDiscoveryServiceFromCandidate(cand prom.Candidate) {
 	c.mu.Lock()
-	c.discoveryService = &ServiceInfo{
-		Namespace: info.namespace,
-		Name:      info.name,
-		Port:      info.port,
-		BasePath:  info.basePath,
+	c.discoveryService = &prom.ServiceInfo{
+		Namespace: cand.Namespace,
+		Name:      cand.Name,
+		Port:      cand.Port,
+		BasePath:  cand.BasePath,
 	}
 	c.mu.Unlock()
 }
 
-// markConnected records the active connection and marks discovery as complete.
-func (c *Client) markConnected(addr, basePath string) {
+// markConnected records the active connection and marks discovery as
+// complete. Also clears any cached pkg/prom.Client so the next
+// getPromClient rebuilds against the (possibly new) address — otherwise
+// a stale cached client could survive a discovery that landed on a
+// different endpoint.
+//
+// gen is the discovery generation captured when this discovery began. If the
+// generation has since changed (Reset / SetManualURL / SetHeaders), the result
+// is stale — a config change raced this discovery — and is dropped rather than
+// published over the newer configuration. Returns whether it committed, so the
+// caller can surface a retryable error instead of a hollow success (a connected
+// address with an empty baseURL).
+func (c *Client) markConnected(addr, basePath, identity string, gen uint64) bool {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	// A stale generation, or a client retired by Reinitialize, means the result
+	// belongs to a superseded run — don't publish it (and, via the caller's
+	// superseded path, release any port-forward it opened for the old context).
+	if c.discoveryGen != gen || c.retired {
+		return false
+	}
+	if c.connectedIdentity != "" && c.connectedIdentity != identity {
+		c.connectionEpoch++
+		c.workloadScope = nil
+		c.cancelWorkloadAttributionsLocked()
+	}
+	c.connectedIdentity = identity
 	c.baseURL = addr
 	c.basePath = basePath
-	c.discovered = true
-	c.mu.Unlock()
-}
-
-type serviceInfo struct {
-	namespace   string
-	name        string
-	port        int // service port (for cluster-internal address)
-	targetPort  int // container port (for port-forwarding to pod)
-	clusterAddr string
-	basePath    string
-}
-
-func (c *Client) findWellKnownServices(ctx context.Context) []*serviceInfo {
-	c.mu.RLock()
-	k8sClient := c.k8sClient
-	c.mu.RUnlock()
-
-	var results []*serviceInfo
-	for _, loc := range wellKnownLocations {
-		svc, err := k8sClient.CoreV1().Services(loc.namespace).Get(ctx, loc.name, metav1.GetOptions{})
-		if err != nil {
-			if !apierrors.IsNotFound(err) {
-				log.Printf("[prometheus] Error checking well-known service %s/%s: %v", loc.namespace, loc.name, err)
-			}
-			continue
-		}
-
-		port := resolvePort(*svc, loc.port)
-		addr := buildClusterAddr(svc.Name, svc.Namespace, svc.Spec.ClusterIP, port)
-		tp := resolveTargetPort(*svc, port)
-
-		log.Printf("[prometheus] Found well-known service: %s/%s:%d (targetPort=%d)", svc.Namespace, svc.Name, port, tp)
-		results = append(results, &serviceInfo{
-			namespace:   svc.Namespace,
-			name:        svc.Name,
-			port:        port,
-			targetPort:  tp,
-			clusterAddr: addr,
-			basePath:    loc.basePath,
-		})
-	}
-	return results
-}
-
-type scoredCandidate struct {
-	info  serviceInfo
-	score int
-}
-
-func (c *Client) discoverDynamic(ctx context.Context) *serviceInfo {
-	log.Printf("[prometheus] Starting dynamic discovery...")
-
-	c.mu.RLock()
-	k8sClient := c.k8sClient
-	c.mu.RUnlock()
-
-	svcs, err := k8sClient.CoreV1().Services("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		log.Printf("[prometheus] Failed to list services: %v", err)
-		return nil
-	}
-
-	var candidates []scoredCandidate
-	for _, svc := range svcs.Items {
-		score, bp := scoreService(svc)
-		if score <= 0 {
-			continue
-		}
-		port := resolvePort(svc, 0)
-		candidates = append(candidates, scoredCandidate{
-			info: serviceInfo{
-				namespace:   svc.Namespace,
-				name:        svc.Name,
-				port:        port,
-				targetPort:  resolveTargetPort(svc, port),
-				clusterAddr: buildClusterAddr(svc.Name, svc.Namespace, svc.Spec.ClusterIP, port),
-				basePath:    bp,
-			},
-			score: score,
-		})
-	}
-
-	if len(candidates) == 0 {
-		log.Printf("[prometheus] Dynamic discovery found no candidates")
-		return nil
-	}
-
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].score > candidates[j].score
-	})
-
-	limit := min(len(candidates), 5)
-	log.Printf("[prometheus] Found %d candidates, top %d:", len(candidates), limit)
-	for i := range limit {
-		log.Printf("[prometheus]   %s/%s (score=%d)", candidates[i].info.namespace, candidates[i].info.name, candidates[i].score)
-	}
-
-	// Validate top candidates (no lock held during probes)
-	for i := range limit {
-		cand := &candidates[i]
-		addr := cand.info.clusterAddr
-
-		if c.probe(ctx, addr+cand.info.basePath) {
-			log.Printf("[prometheus] Validated: %s/%s", cand.info.namespace, cand.info.name)
-			return &cand.info
-		}
-	}
-
-	// Return best unvalidated candidate (caller will port-forward)
-	best := &candidates[0]
-	log.Printf("[prometheus] No candidates reachable in-cluster, returning best: %s/%s (score=%d)",
-		best.info.namespace, best.info.name, best.score)
-	return &best.info
-}
-
-// scoreService computes a heuristic score for a service being Prometheus-compatible.
-func scoreService(svc corev1.Service) (score int, basePath string) {
-	labels := svc.Labels
-	name := svc.Name
-	ns := svc.Namespace
-
-	if svc.Spec.Type == corev1.ServiceTypeExternalName {
-		return 0, ""
-	}
-	if skipNamespaces[ns] {
-		return 0, ""
-	}
-
-	// Label signals
-	appName := labels["app.kubernetes.io/name"]
-	appLabel := labels["app"]
-	component := labels["app.kubernetes.io/component"]
-
-	switch appName {
-	case "prometheus":
-		score += 100
-	case "victoria-metrics-single", "vmsingle":
-		score += 100
-	case "vmselect":
-		score += 90
-		basePath = "/select/0/prometheus"
-	case "thanos-query", "thanos-querier":
-		score += 80
-	}
-
-	switch appLabel {
-	case "prometheus", "prometheus-server":
-		score += 80
-	case "vmsingle":
-		score += 80
-	case "vmselect":
-		score += 80
-		basePath = "/select/0/prometheus"
-	}
-
-	if score > 0 && component == "server" {
-		score += 20
-	}
-
-	// Port signals
-	for _, p := range svc.Spec.Ports {
-		switch p.Port {
-		case 9090: // Prometheus default
-			score += 30
-		case 8428: // VictoriaMetrics single-node default
-			score += 30
-		case 8481: // VictoriaMetrics vmselect default
-			score += 25
-		case 9009: // Thanos Query default
-			score += 25
-		}
-		if strings.Contains(strings.ToLower(p.Name), "prometheus") {
-			score += 10
-		}
-	}
-
-	// Name signals
-	nameLower := strings.ToLower(name)
-	if strings.Contains(nameLower, "prometheus") {
-		score += 20
-	}
-	if strings.Contains(nameLower, "victoria") || strings.Contains(nameLower, "vmsingle") || strings.Contains(nameLower, "vmselect") {
-		score += 20
-		if strings.Contains(nameLower, "vmselect") && basePath == "" {
-			basePath = "/select/0/prometheus"
-		}
-	}
-	if strings.Contains(nameLower, "thanos") {
-		score += 15
-	}
-
-	// Namespace signal
-	if metricsNamespaces[ns] {
-		score += 10
-	}
-
-	return score, basePath
-}
-
-func resolvePort(svc corev1.Service, defaultPort int) int {
-	if defaultPort != 0 {
-		return defaultPort
-	}
-	if len(svc.Spec.Ports) > 0 {
-		return int(svc.Spec.Ports[0].Port)
-	}
-	return 80
-}
-
-// resolveTargetPort returns the container port for port-forwarding.
-// When the service port differs from the container's targetPort (e.g., service:80 → container:9090),
-// port-forwarding needs the container port since it bypasses the Service and connects directly to the pod.
-func resolveTargetPort(svc corev1.Service, servicePort int) int {
-	for _, p := range svc.Spec.Ports {
-		if int(p.Port) == servicePort {
-			if p.TargetPort.IntVal > 0 {
-				return int(p.TargetPort.IntVal)
-			}
-			// targetPort unset or zero defaults to the service port
-			return servicePort
-		}
-	}
-	return servicePort
-}
-
-func buildClusterAddr(name, namespace, clusterIP string, port int) string {
-	if clusterIP == "None" {
-		return fmt.Sprintf("http://%s-0.%s.%s.svc.cluster.local:%d", name, name, namespace, port)
-	}
-	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", name, namespace, port)
+	c.prom = nil
+	c.lastDiscoverErr = nil
+	c.lastDiscoverAt = time.Time{}
+	return true
 }

@@ -1,0 +1,92 @@
+# Four CNPG clusters, all reaching 2/2 Ready.
+#
+# That uniformity is deliberate: every interesting difference below is
+# invisible to instance counts, which is exactly the class of bug this fixture
+# exists to catch. A reviewer looking at four identical "2/2" rows should see
+# four different badges.
+---
+# Baseline. Everything healthy, no backup configuration at all — which also
+# makes it the cluster the `cnpgNoDeclarativeBackup` audit check reports.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-healthy
+  namespace: pg
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.5
+  storage:
+    size: 256Mi
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+---
+# The headline state — created CLEAN, with no backup stanza.
+#
+# The unreachable object store is patched in by the script only AFTER this
+# cluster reaches 2/2 Ready, and that ordering is not cosmetic. CNPG verifies
+# the store during bootstrap: with an unroutable endpoint present from the
+# start, the first WAL archive fails, the cluster never leaves "Waiting for the
+# instances to become active", and it never becomes Ready at all.
+#
+# That yields ContinuousArchiving=False on a cluster that is ALSO broken, which
+# is the wrong fixture — and a convincing one, because the condition looks
+# right. The scenario that matters is a cluster healthy on every availability
+# signal while its recovery point is silently frozen. Bootstrap first, break
+# archiving second.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-wal-failing
+  namespace: pg
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.5
+  storage:
+    size: 256Mi
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+---
+# Terminal phase with every pod still Ready. Renders red on a 2/2 row, and its
+# Instances and Primary cells are muted with a tooltip — the count is true but
+# means something different once reconciliation has stopped.
+#
+# `status.phase` is patched by the script AFTER the operator is frozen. Unlike
+# conditions, phase is not rewritten by the instance manager, so it holds.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-unrecoverable
+  namespace: pg
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.5
+  storage:
+    size: 256Mi
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+---
+# A second terminal cluster, so the Status filter shows a count of (2) on one
+# option rather than 1 on every option. A dropdown where every entry reads (1)
+# cannot distinguish "counts render" from "counts are always 1".
+#
+# It is also the one cluster that takes its image from an ImageCatalog instead
+# of a literal tag. `spec.imageName` is therefore absent, and anything reading
+# only spec shows a dash where an image is running — the resolved tag lives in
+# `status.image`. The catalog's major 17 entry is the same tag the other three
+# clusters use, so bootstrap behaviour is unchanged.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-doomed
+  namespace: pg
+spec:
+  instances: 2
+  imageCatalogRef:
+    apiGroup: postgresql.cnpg.io
+    kind: ImageCatalog
+    name: postgres-pinned
+    major: 17
+  storage:
+    size: 256Mi
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }

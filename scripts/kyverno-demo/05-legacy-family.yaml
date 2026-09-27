@@ -1,0 +1,106 @@
+# Legacy kyverno.io family — deprecated in Kyverno 1.18, removal planned for
+# 1.20. Present because the whole point of the integration is that BOTH
+# families coexist during migration: family selection, the Kyverno sidebar
+# group collapsing two API groups, and the legacy-vs-modern renderer split all
+# only have meaning with both installed.
+#
+# Note the vocabulary difference, which is deliberate and not an inconsistency:
+# legacy uses Enforce/Audit (validationFailureAction), modern uses
+# Deny/Audit/Warn (validationActions). Each family renders in its own upstream
+# terms.
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: legacy-disallow-latest-tag
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: validate-image-tag
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: "Using a mutable image tag e.g. 'latest' is not allowed."
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"
+---
+# Image verification, and the two ways a legacy policy's enforcement posture is
+# NOT what spec.validationFailureAction says.
+#
+# Kyverno defaults that field to Audit when it is absent, so a signing policy
+# reads as audit-only from the spec alone — but the action that governs it sits
+# on verifyImages[], and a rule-level failureAction overrides the spec-level one
+# rather than deferring to it. Verified against the admission controller on this
+# cluster: a pod running an unsigned busybox is REJECTED by
+# mutate.kyverno.svc-fail while the spec field still reads Audit.
+#
+# The key below is a well-formed PEM that is not a valid P-256 point, so
+# verification fails with an engine message rather than reaching a registry —
+# nothing here needs network or a real signature.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: legacy-verify-image-signature
+spec:
+  background: false
+  rules:
+    - name: verify-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [policy-demo]
+      verifyImages:
+        - failureAction: Enforce
+          imageReferences:
+            # Kyverno normalizes a bare `busybox` to `docker.io/busybox:latest`,
+            # NOT to the `library/` path the registry actually serves — the
+            # `library/` spelling silently matches nothing and the rule looks
+            # inert.
+            - "docker.io/busybox*"
+          attestors:
+            - entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEG7ZaBRLGoLDe8mgSzKmXHiRb5kdc
+                      nqCcTVsBJmCPcCiRQBBWCbBTiEcNVK1lRNCTNCFcqmXBLmXmYqEjHNqNaQ==
+                      -----END PUBLIC KEY-----
+---
+# The cleanup controller runs under its own aggregated ClusterRole and can't
+# delete anything it hasn't been granted. Without this, creating the
+# ClusterCleanupPolicy below is rejected:
+#   "cleanup controller has no permission to delete kind Pod"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno-cleanup-demo
+  labels:
+    rbac.kyverno.io/aggregate-to-cleanup-controller: "true"
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "configmaps"]
+    verbs: ["get", "list", "watch", "delete"]
+---
+# CleanupPolicy's replacement is DeletingPolicy, but the installed base still
+# runs this, and "what deleted my resource?" is expensive to answer without it.
+apiVersion: kyverno.io/v2
+kind: ClusterCleanupPolicy
+metadata:
+  name: legacy-cleanup-completed-pods
+spec:
+  schedule: "0 2 * * *"
+  match:
+    any:
+      - resources:
+          kinds: [Pod]
+  conditions:
+    all:
+      - key: "{{ target.status.phase }}"
+        operator: Equals
+        value: "Succeeded"

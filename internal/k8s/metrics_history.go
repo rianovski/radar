@@ -13,6 +13,7 @@ type ContainerMetricsHistory = k8score.ContainerMetricsHistory
 type PodMetricsHistory = k8score.PodMetricsHistory
 type NodeMetricsHistory = k8score.NodeMetricsHistory
 type TopPodMetrics = k8score.TopPodMetrics
+type ContainerResourceMetrics = k8score.ContainerResourceMetrics
 type TopNodeMetrics = k8score.TopNodeMetrics
 type MetricsCollectionHealth = k8score.MetricsCollectionHealth
 type MetricsSourceHealth = k8score.MetricsSourceHealth
@@ -34,7 +35,7 @@ func InitMetricsHistory() {
 	metricsHistoryMu.Lock()
 	defer metricsHistoryMu.Unlock()
 	metricsHistoryOnce.Do(func() {
-		metricsHistoryStore = k8score.NewMetricsHistoryStore(GetDynamicClient())
+		metricsHistoryStore = k8score.NewMetricsHistoryStoreWithResolver(GetDynamicClient(), ResolveMetricsGVR)
 		metricsHistoryStore.OnError = func(subsystem, level, format string, args ...any) {
 			errorlog.Record(subsystem, level, format, args...)
 		}

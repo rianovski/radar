@@ -105,6 +105,53 @@ func TestComputeDrift_ScalarChange(t *testing.T) {
 	}
 }
 
+// TestComputeDrift_ArrayElementFieldChange pins that a single field changing
+// inside one list element reads as that field's path — not a wall of
+// serialized JSON for the whole array. This is the container-resources case:
+// only spec.containers[0].resources.limits.memory changed.
+func TestComputeDrift_ArrayElementFieldChange(t *testing.T) {
+	desired := `{"spec":{"containers":[{"name":"app","image":"app:v1","resources":{"limits":{"memory":"128Mi"}}}]}}`
+	live := map[string]any{
+		"containers": []any{
+			map[string]any{
+				"name":      "app",
+				"image":     "app:v1",
+				"resources": map[string]any{"limits": map[string]any{"memory": "256Mi"}},
+			},
+		},
+	}
+	got := computeDriftFromLastApplied(liveWith(desired, live), nil)
+	if got == nil || len(got.Entries) != 1 {
+		t.Fatalf("expected exactly 1 entry, got %v", got)
+	}
+	e := got.Entries[0]
+	if e.Path != "spec.containers.[0].resources.limits.memory" || e.Op != DriftOpChanged {
+		t.Errorf("entry = %+v, want the specific nested array path", e)
+	}
+	if !strings.Contains(e.Desired, "128Mi") || !strings.Contains(e.Live, "256Mi") {
+		t.Errorf("desired/live should hold just the changed scalar, got desired=%q live=%q", e.Desired, e.Live)
+	}
+}
+
+// TestComputeDrift_ArrayLengthChange pins that adding a list element surfaces
+// just the new element at its index, not a whole-array rewrite.
+func TestComputeDrift_ArrayLengthChange(t *testing.T) {
+	desired := `{"spec":{"ports":[{"port":80}]}}`
+	live := map[string]any{
+		"ports": []any{
+			map[string]any{"port": int64(80)},
+			map[string]any{"port": int64(443)},
+		},
+	}
+	got := computeDriftFromLastApplied(liveWith(desired, live), nil)
+	if got == nil || len(got.Entries) != 1 {
+		t.Fatalf("expected 1 entry for the added element, got %v", got)
+	}
+	if e := got.Entries[0]; e.Path != "spec.ports.[1]" || e.Op != DriftOpAdded {
+		t.Errorf("entry = %+v, want spec.ports.[1] added", e)
+	}
+}
+
 func TestComputeDrift_TreatsEmptyAsNil(t *testing.T) {
 	// Defaulted-in empty maps and arrays shouldn't show as drift.
 	desired := `{"spec":{"a":{}}}`
@@ -275,6 +322,27 @@ func TestFilterIgnoredPaths_PrefixMatch(t *testing.T) {
 	}
 	if out[0].Path != "spec.strategy.type" {
 		t.Errorf("kept entry = %q, want spec.strategy.type", out[0].Path)
+	}
+}
+
+// TestFilterIgnoredPaths_ArrayIndexPointer pins that an ignoreDifferences JSON
+// pointer into a specific array index matches the bracketed drift path that
+// array descent now emits — a rule on /spec/containers/0/image must strip
+// spec.containers.[0].image.
+func TestFilterIgnoredPaths_ArrayIndexPointer(t *testing.T) {
+	entries := []DriftEntry{
+		{Path: "spec.containers.[0].image", Op: DriftOpChanged},
+		{Path: "spec.containers.[0].resources.limits.memory", Op: DriftOpChanged},
+		{Path: "spec.replicas", Op: DriftOpChanged},
+	}
+	out := filterIgnoredPaths(entries, []string{"/spec/containers/0/image"})
+	if len(out) != 2 {
+		t.Fatalf("expected the indexed image entry stripped, got %d (%v)", len(out), out)
+	}
+	for _, e := range out {
+		if e.Path == "spec.containers.[0].image" {
+			t.Errorf("array-index ignore pointer failed to match bracketed drift path")
+		}
 	}
 }
 

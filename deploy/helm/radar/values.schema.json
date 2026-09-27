@@ -5,6 +5,22 @@
   "type": "object",
   "additionalProperties": true,
   "properties": {
+    "audit": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["ignoredNamespaces", "disabledChecks"],
+      "properties": {
+        "ignoredNamespaces": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "disabledChecks": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "helm": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ociSources": { "type": "array", "items": { "type": "string", "pattern": "^oci://.+" } }
+      }
+    },
     "replicaCount": {
       "type": "integer",
       "minimum": 1,
@@ -46,11 +62,11 @@
         "create": { "type": "boolean" },
         "additionalRules": { "type": "array", "items": { "type": "object" } },
         "helm": { "type": "boolean", "description": "Allow Helm write operations. Grants broad permissions." },
-        "secrets": { "type": "boolean", "description": "Allow reading Secret contents." },
+        "secrets": { "type": "boolean", "description": "Allow reading Secret contents. Also granted by rbac.helm, by auth (auth.mode != none), and in cloud mode, where reads are re-checked per user." },
         "podExec": { "type": "boolean", "description": "Allow pod exec (terminal feature)." },
         "podLogs": { "type": "boolean" },
         "portForward": { "type": "boolean" },
-        "selfUpgrade": { "type": "boolean", "description": "Allow Radar Cloud to trigger in-app upgrades." },
+        "selfUpgrade": { "type": "boolean", "description": "Allow Radar Cloud organization owners to trigger in-app upgrades." },
         "traffic": { "type": "boolean", "description": "Read access to hubble-relay-client-certs for Hubble TLS." },
         "metrics": { "type": "boolean", "description": "Read metrics.k8s.io for CPU/memory widgets." },
         "crdGroups": {
@@ -58,8 +74,10 @@
           "additionalProperties": { "type": "boolean" },
           "properties": {
             "all": { "type": "boolean", "description": "Grant read access to ALL CRDs (overrides individual flags)." },
+            "apiRegistration": { "type": "boolean" },
             "argo": { "type": "boolean" },
             "awx": { "type": "boolean" },
+            "calico": { "type": "boolean" },
             "certManager": { "type": "boolean" },
             "cloudnativePg": { "type": "boolean" },
             "clusterApi": { "type": "boolean" },
@@ -103,15 +121,22 @@
       }
     },
     "podAnnotations": { "type": "object", "additionalProperties": { "type": "string" } },
+    "podLabels": { "type": "object", "additionalProperties": { "type": "string" } },
     "podSecurityContext": { "type": "object" },
     "securityContext": { "type": "object" },
     "service": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
+        "annotations": { "type": "object", "additionalProperties": { "type": "string" } },
         "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
       }
+    },
+    "basePath": {
+      "type": "string",
+      "pattern": "^$|^/?[A-Za-z0-9._~-]*[A-Za-z0-9_~-][A-Za-z0-9._~-]*(/[A-Za-z0-9._~-]*[A-Za-z0-9_~-][A-Za-z0-9._~-]*)*/?$",
+      "description": "Optional URL path prefix served by Radar itself, e.g. /radar. Use when ingress forwards the subpath without stripping it. Path segments accept letters, digits, '-', '_', '.' and '~', and no segment may be '.' or '..' — matching the server's --base-path validation, so an invalid value fails at install time instead of crash-looping the pod."
     },
     "ingress": {
       "type": "object",
@@ -154,17 +179,57 @@
         }
       }
     },
+    "httpRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "apiVersion": { "type": "string", "minLength": 1 },
+        "annotations": { "type": "object", "additionalProperties": { "type": "string" } },
+        "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+        "parentRefs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["name"],
+            "properties": { "name": { "type": "string", "minLength": 1 } }
+          }
+        },
+        "hostnames": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "defaultTimeout": { "type": "string" },
+        "rules": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        }
+      }
+    },
     "resources": { "type": "object" },
     "timeline": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "storage": { "type": "string", "enum": ["memory", "sqlite"] },
+        "storage": { "type": "string", "enum": ["memory", "sqlite", "postgres"] },
         "dbPath": { "type": "string" },
         "historyLimit": { "type": "integer", "minimum": 1 },
         "retention": {
           "type": "string",
-          "description": "SQLite retention as a Go duration (e.g. 168h). \"0\" disables cleanup."
+          "description": "Timeline retention as a Go duration (e.g. 168h). Applies to sqlite and postgres. \"0\" disables cleanup."
+        },
+        "maxSize": {
+          "type": "string",
+          "description": "SQLite max storage size before pruning oldest events (e.g. 800Mi, 8Gi). Not used for postgres or memory. \"0\" disables size pruning."
+        },
+        "postgres": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": { "type": "string", "description": "Name of an existing Secret holding the PostgreSQL DSN." },
+            "secretKey": { "type": "string", "description": "Key within existingSecret holding the DSN." }
+          }
         }
       }
     },
@@ -182,7 +247,8 @@
           "additionalProperties": false,
           "properties": {
             "userHeader": { "type": "string" },
-            "groupsHeader": { "type": "string" }
+            "groupsHeader": { "type": "string" },
+            "logoutURL": { "type": "string" }
           }
         },
         "oidc": {
@@ -190,6 +256,11 @@
           "additionalProperties": true,
           "properties": {
             "issuerURL": { "type": "string" },
+            "internalIssuerURL": { "type": "string" },
+            "authorizationURL": { "type": "string" },
+            "tokenURL": { "type": "string" },
+            "userInfoURL": { "type": "string" },
+            "jwksURL": { "type": "string" },
             "clientID": { "type": "string" },
             "clientSecret": { "type": "string" },
             "existingSecret": { "type": "string" },
@@ -201,7 +272,8 @@
             "groupsPrefix": { "type": "string" },
             "caCert": { "type": "string" },
             "insecureSkipVerify": { "type": "boolean" },
-            "backchannelLogout": { "type": "boolean", "description": "Single-replica only — revocations are in-memory." }
+            "backchannelLogout": { "type": "boolean", "description": "Single-replica only — revocations are in-memory." },
+            "enablePKCE": { "type": "boolean", "description": "Enable PKCE (S256) for the OIDC authorization-code flow (opt-in, default off)." }
           }
         }
       }
@@ -230,9 +302,36 @@
             "viewer": { "type": "boolean" },
             "ownerClusterRole": { "type": "string" },
             "memberClusterRole": { "type": "string" },
-            "viewerClusterRole": { "type": "string" }
+            "viewerClusterRole": { "type": "string" },
+            "clusterScopedRead": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "viewer": { "type": "boolean" },
+                "member": { "type": "boolean" },
+                "owner": { "type": "boolean" }
+              }
+            },
+            "integrationRead": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "viewer": { "type": "boolean" },
+                "member": { "type": "boolean" },
+                "owner": { "type": "boolean" }
+              }
+            },
+            "nodeOps": { "type": "boolean" }
           }
-        }
+        },
+        "insecureSkipVerify": { "type": "boolean" }
+      }
+    },
+    "usageReporting": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": ["boolean", "null"] }
       }
     },
     "mcp": {
@@ -242,11 +341,92 @@
         "enabled": { "type": "boolean" }
       }
     },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["", "auto", "prometheus", "kubecost"],
+          "description": "Cost source selection. Empty uses Auto; source controls remain editable only when source, kubecost.url, kubecost.clusterId, and kubecost.existingSecret are all empty."
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^$|^[A-Za-z]{3}$",
+          "description": "Optional ISO 4217 override for OpenCost/Kubecost values; empty auto-detects from a running cost tool, then uses USD."
+        },
+        "kubecost": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "url": {
+              "type": "string",
+              "pattern": "^$|^https?://[^?#]+$",
+              "description": "Kubecost 3 Aggregator base URL; empty auto-discovers tcp-api:9004 and, without an API key, can fall back to the same Service's tcp-api-rbac:9008 when 9004 requires SAML/OIDC."
+            },
+            "clusterId": {
+              "type": "string",
+              "description": "Cluster ID used to filter central/federated Aggregator results; empty detects CLUSTER_ID from a local FinOps Agent or Aggregator."
+            },
+            "existingSecret": {
+              "type": "string",
+              "description": "Name of a Secret holding an optional Kubecost service-account API key. A configured key is never bypassed through auto-discovered port 9008."
+            },
+            "existingSecretKey": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Key within existingSecret holding the API key sent as X-API-KEY."
+            }
+          }
+        }
+      }
+    },
     "traffic": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "prometheusUrl": { "type": "string" }
+        "prometheusUrl": { "type": "string" },
+        "prometheusSingleCluster": { "type": "boolean", "description": "Optional workload-metrics scope override for a dedicated backend. Replaces automatic matching; does not scope other metrics features. Leave false with empty prometheusClusterLabels for automatic matching." },
+        "prometheusClusterLabels": {
+          "type": "object",
+          "description": "Optional exact cluster label/value pairs for workload metrics, combined with AND. Alternative to prometheusSingleCluster; does not scope other metrics features.",
+          "propertyNames": {"pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$", "not": {"pattern": "^__"}},
+          "additionalProperties": {"type": "string", "minLength": 1}
+        },
+        "beylaJobSelector": { "type": "string", "description": "Beyla Live Traffic matcher fragment. Workload charts use it only with an explicit scope override and accept one job equality or regex matcher; automatic workload matching discovers custom jobs without it." },
+        "prometheusHeaders": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "prometheusHeadersFromEnv": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"required": ["prometheusSingleCluster"], "properties": {"prometheusSingleCluster": {"const": true}}},
+          "then": {"properties": {"prometheusClusterLabels": {"maxProperties": 0}}}
+        },
+        {
+          "if": { "properties": { "prometheusHeaders": { "minProperties": 1 } }, "required": ["prometheusHeaders"] },
+          "then": { "properties": { "prometheusUrl": { "pattern": "\\S" } }, "required": ["prometheusUrl"] }
+        },
+        {
+          "if": { "properties": { "prometheusHeadersFromEnv": { "minProperties": 1 } }, "required": ["prometheusHeadersFromEnv"] },
+          "then": { "properties": { "prometheusUrl": { "pattern": "\\S" } }, "required": ["prometheusUrl"] }
+        }
+      ]
+    },
+    "argocd": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "token": { "type": "string", "description": "Inline Argo CD API token (prefer existingSecret in production)." },
+        "existingSecret": { "type": "string", "description": "Name of a Secret holding the Argo CD token." },
+        "existingSecretKey": { "type": "string", "description": "Key within existingSecret holding the token." },
+        "url": { "type": "string", "description": "Explicit argocd-server URL; blank auto-discovers in-cluster." },
+        "insecureTls": { "type": "boolean", "description": "Skip TLS verification for a self-signed argocd-server." }
       }
     },
     "persistence": {
@@ -277,6 +457,21 @@
         },
         "required": ["name"]
       }
+    },
+    "initContainers": {
+      "type": "array",
+      "description": "Init containers to run before the main container.",
+      "items": { "type": "object" }
+    },
+    "extraVolumes": {
+      "type": "array",
+      "description": "Additional volumes to add to the pod.",
+      "items": { "type": "object" }
+    },
+    "extraVolumeMounts": {
+      "type": "array",
+      "description": "Additional volume mounts for the main container.",
+      "items": { "type": "object" }
     },
     "probes": {
       "type": "object",

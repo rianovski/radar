@@ -22,7 +22,7 @@ interface RoleGatedPanelProps {
  *
  * Bypasses for non-Cloud users (OSS, OIDC, etc.) — `canAtLeast` returns
  * true when no Cloud role is present. The backend gate has the same
- * shape, so the SPA stays in lockstep.
+ * shape, so the frontend stays in lockstep.
  */
 export function RoleGatedPanel({ min, feature, children }: RoleGatedPanelProps) {
   const { role, canAtLeast } = useCloudRole()
@@ -38,8 +38,8 @@ export function RoleGatedPanel({ min, feature, children }: RoleGatedPanelProps) 
         Your role can't view {feature}
       </div>
       <div className="mt-1 max-w-md text-xs text-theme-text-secondary">
-        You're signed in as <span className="font-mono text-theme-text-primary">{role ?? 'viewer'}</span>.
-        This view requires <span className="font-mono text-theme-text-primary">{min}</span> or higher.
+        You're signed in as <span className="inline-code">{role ?? 'viewer'}</span>.
+        This view requires <span className="inline-code">{min}</span> or higher.
         Ask a {min} or owner if you need access.
       </div>
     </div>

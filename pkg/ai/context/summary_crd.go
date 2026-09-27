@@ -19,6 +19,8 @@ func summarizeUnstructured(obj *unstructured.Unstructured) *ResourceSummary {
 		return summarizeArgoApp(obj)
 	case group == "argoproj.io" && kind == "Rollout":
 		return summarizeArgoRollout(obj)
+	case group == "argoproj.io" && kind == "AnalysisRun":
+		return summarizeArgoAnalysisRun(obj)
 	case group == "kustomize.toolkit.fluxcd.io" && kind == "Kustomization":
 		return summarizeFluxKustomization(obj)
 	case group == "helm.toolkit.fluxcd.io" && kind == "HelmRelease":
@@ -61,10 +63,186 @@ func summarizeUnstructured(obj *unstructured.Unstructured) *ResourceSummary {
 		return summarizeCAPIMachineHealthCheck(obj)
 	case group == "controlplane.cluster.x-k8s.io" && kind == "KubeadmControlPlane":
 		return summarizeCAPIKubeadmControlPlane(obj)
+	case group == "resource.k8s.io" && kind == "ResourceClaim":
+		return summarizeResourceClaim(obj)
+	case group == "resource.k8s.io" && kind == "ResourceClaimTemplate":
+		return summarizeResourceClaimTemplate(obj)
+	case group == "resource.k8s.io" && kind == "DeviceClass":
+		return summarizeDeviceClass(obj)
+	case group == "resource.k8s.io" && kind == "ResourceSlice":
+		return summarizeResourceSlice(obj)
+	case group == "nvidia.com" && kind == "ClusterPolicy":
+		return summarizeNvidiaClusterPolicy(obj)
+	case group == "nvidia.com" && kind == "NVIDIADriver":
+		return summarizeNvidiaDriver(obj)
 	}
 
 	// Generic fallback
 	return summarizeGenericCRD(obj)
+}
+
+// draRequestDeviceClasses collects deviceClassName values across all API
+// shapes: v1/v1beta2 nest under "exactly" or "firstAvailable" subrequests;
+// v1beta1 had deviceClassName directly on the request.
+func draRequestDeviceClasses(obj *unstructured.Unstructured, path ...string) []string {
+	var classes []string
+	seen := map[string]bool{}
+	add := func(dc string) {
+		if dc != "" && !seen[dc] {
+			seen[dc] = true
+			classes = append(classes, dc)
+		}
+	}
+	requests, _, _ := unstructured.NestedSlice(obj.Object, path...)
+	for _, r := range requests {
+		req, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		if dc, _, _ := unstructured.NestedString(req, "exactly", "deviceClassName"); dc != "" {
+			add(dc)
+		} else if dc, _, _ := unstructured.NestedString(req, "deviceClassName"); dc != "" {
+			add(dc)
+		}
+		subs, _, _ := unstructured.NestedSlice(req, "firstAvailable")
+		for _, s := range subs {
+			if sub, ok := s.(map[string]any); ok {
+				if dc, _, _ := unstructured.NestedString(sub, "deviceClassName"); dc != "" {
+					add(dc)
+				}
+			}
+		}
+	}
+	return classes
+}
+
+func summarizeResourceClaim(obj *unstructured.Unstructured) *ResourceSummary {
+	s := &ResourceSummary{
+		Kind:      "ResourceClaim",
+		Name:      obj.GetName(),
+		Namespace: obj.GetNamespace(),
+		Age:       age(obj.GetCreationTimestamp().Time),
+	}
+	if classes := draRequestDeviceClasses(obj, "spec", "devices", "requests"); len(classes) > 0 {
+		s.Type = strings.Join(classes, ", ")
+	}
+	// Allocated is keyed to devices.results — an allocation block without
+	// assigned devices must not read as allocated.
+	results, _, _ := unstructured.NestedSlice(obj.Object, "status", "allocation", "devices", "results")
+	reserved, _, _ := unstructured.NestedSlice(obj.Object, "status", "reservedFor")
+	switch {
+	case len(results) > 0 && len(reserved) > 0:
+		s.Status = "Allocated"
+		s.Ready = fmt.Sprintf("reserved by %d consumer(s)", len(reserved))
+	case len(results) > 0:
+		s.Status = "Allocated"
+		s.Issue = "allocated but not reserved by any consumer"
+	default:
+		s.Status = "Pending"
+		s.Issue = "no device allocated yet"
+	}
+	if len(results) > 0 {
+		if first, ok := results[0].(map[string]any); ok {
+			driver, _, _ := unstructured.NestedString(first, "driver")
+			device, _, _ := unstructured.NestedString(first, "device")
+			if driver != "" {
+				s.Target = fmt.Sprintf("%s/%s (%d device(s))", driver, device, len(results))
+			}
+		}
+	}
+	return s
+}
+
+func summarizeResourceClaimTemplate(obj *unstructured.Unstructured) *ResourceSummary {
+	s := &ResourceSummary{
+		Kind:      "ResourceClaimTemplate",
+		Name:      obj.GetName(),
+		Namespace: obj.GetNamespace(),
+		Age:       age(obj.GetCreationTimestamp().Time),
+	}
+	if classes := draRequestDeviceClasses(obj, "spec", "spec", "devices", "requests"); len(classes) > 0 {
+		s.Type = strings.Join(classes, ", ")
+	}
+	return s
+}
+
+func summarizeDeviceClass(obj *unstructured.Unstructured) *ResourceSummary {
+	s := &ResourceSummary{
+		Kind: "DeviceClass",
+		Name: obj.GetName(),
+		Age:  age(obj.GetCreationTimestamp().Time),
+	}
+	selectors, _, _ := unstructured.NestedSlice(obj.Object, "spec", "selectors")
+	if len(selectors) > 0 {
+		s.Ready = fmt.Sprintf("%d selector(s)", len(selectors))
+	}
+	return s
+}
+
+func summarizeResourceSlice(obj *unstructured.Unstructured) *ResourceSummary {
+	s := &ResourceSummary{
+		Kind: "ResourceSlice",
+		Name: obj.GetName(),
+		Age:  age(obj.GetCreationTimestamp().Time),
+	}
+	driver, _, _ := unstructured.NestedString(obj.Object, "spec", "driver")
+	pool, _, _ := unstructured.NestedString(obj.Object, "spec", "pool", "name")
+	if driver != "" {
+		s.Type = driver
+	}
+	if nodeName, _, _ := unstructured.NestedString(obj.Object, "spec", "nodeName"); nodeName != "" {
+		s.Node = nodeName
+	}
+	devices, _, _ := unstructured.NestedSlice(obj.Object, "spec", "devices")
+	s.Ready = fmt.Sprintf("%d device(s)", len(devices))
+	if pool != "" {
+		s.Ready += " in pool " + pool
+	}
+	return s
+}
+
+func summarizeNvidiaClusterPolicy(obj *unstructured.Unstructured) *ResourceSummary {
+	s := &ResourceSummary{
+		Kind: "ClusterPolicy",
+		Name: obj.GetName(),
+		Age:  age(obj.GetCreationTimestamp().Time),
+	}
+	state, _, _ := unstructured.NestedString(obj.Object, "status", "state")
+	s.Status = state
+	if state == "notReady" {
+		s.Issue = "GPU Operator components not ready"
+	}
+	var components []string
+	for _, c := range []string{"driver", "toolkit", "devicePlugin", "dcgmExporter", "migManager"} {
+		if enabled, found, _ := unstructured.NestedBool(obj.Object, "spec", c, "enabled"); found && enabled {
+			components = append(components, c)
+		}
+	}
+	if len(components) > 0 {
+		s.Ready = "enabled: " + strings.Join(components, ", ")
+	}
+	if mig, _, _ := unstructured.NestedString(obj.Object, "spec", "mig", "strategy"); mig != "" {
+		s.Type = "MIG: " + mig
+	}
+	return s
+}
+
+func summarizeNvidiaDriver(obj *unstructured.Unstructured) *ResourceSummary {
+	s := &ResourceSummary{
+		Kind: "NVIDIADriver",
+		Name: obj.GetName(),
+		Age:  age(obj.GetCreationTimestamp().Time),
+	}
+	state, _, _ := unstructured.NestedString(obj.Object, "status", "state")
+	s.Status = state
+	driverType, _, _ := unstructured.NestedString(obj.Object, "spec", "driverType")
+	version, _, _ := unstructured.NestedString(obj.Object, "spec", "version")
+	s.Type = driverType
+	s.Version = version
+	if state == "notReady" {
+		s.Issue = "driver rollout not ready"
+	}
+	return s
 }
 
 func summarizeArgoApp(obj *unstructured.Unstructured) *ResourceSummary {
@@ -116,6 +294,94 @@ func summarizeArgoRollout(obj *unstructured.Unstructured) *ResourceSummary {
 	replicas, _, _ := unstructured.NestedInt64(obj.Object, "spec", "replicas")
 	if replicas > 0 {
 		s.Ready = formatInt64Pair(readyReplicas, replicas)
+	}
+
+	s.Issue = rolloutBlockReason(obj)
+
+	return s
+}
+
+// A bare "Paused" phase tells an agent nothing actionable — the pause reason
+// and the analysis verdict decide whether to promote, abort, or wait.
+func rolloutBlockReason(obj *unstructured.Unstructured) string {
+	if aborted, _, _ := unstructured.NestedBool(obj.Object, "status", "abort"); aborted {
+		return "aborted; traffic is on the stable revision — retry or roll back"
+	}
+
+	var reasons []string
+	pauseConditions, _, _ := unstructured.NestedSlice(obj.Object, "status", "pauseConditions")
+	for _, raw := range pauseConditions {
+		condition, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if reason, ok := condition["reason"].(string); ok && reason != "" {
+			reasons = append(reasons, reason)
+		}
+	}
+
+	for _, path := range [][]string{
+		{"status", "canary", "currentStepAnalysisRunStatus"},
+		{"status", "canary", "currentBackgroundAnalysisRunStatus"},
+		{"status", "blueGreen", "prePromotionAnalysisRunStatus"},
+		{"status", "blueGreen", "postPromotionAnalysisRunStatus"},
+	} {
+		phase, _, _ := unstructured.NestedString(obj.Object, append(path, "status")...)
+		switch phase {
+		case "Failed", "Error", "Inconclusive":
+			name, _, _ := unstructured.NestedString(obj.Object, append(path, "name")...)
+			reasons = append(reasons, fmt.Sprintf("analysis %s (AnalysisRun %s)", strings.ToLower(phase), name))
+		}
+	}
+
+	if len(reasons) == 0 {
+		// Progressing narrates ordinary work here ("more replicas need to be
+		// updated"), so only a stuck phase makes status.message an issue.
+		if phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase"); phase != "Degraded" && phase != "Paused" {
+			return ""
+		}
+		message, _, _ := unstructured.NestedString(obj.Object, "status", "message")
+		return message
+	}
+	return strings.Join(reasons, "; ")
+}
+
+func summarizeArgoAnalysisRun(obj *unstructured.Unstructured) *ResourceSummary {
+	s := &ResourceSummary{
+		Kind:      "AnalysisRun",
+		Name:      obj.GetName(),
+		Namespace: obj.GetNamespace(),
+		Age:       age(obj.GetCreationTimestamp().Time),
+	}
+
+	s.Status, _, _ = unstructured.NestedString(obj.Object, "status", "phase")
+	s.Type = obj.GetLabels()["rollout-type"]
+
+	var failing []string
+	metricResults, _, _ := unstructured.NestedSlice(obj.Object, "status", "metricResults")
+	for _, raw := range metricResults {
+		metric, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		// Argo keeps dryRun metrics out of the run's verdict, so naming one as the
+		// failure would have an agent abort a rollout the controller called healthy.
+		if dryRun, _ := metric["dryRun"].(bool); dryRun {
+			continue
+		}
+		phase, _ := metric["phase"].(string)
+		switch phase {
+		case "Failed", "Error", "Inconclusive":
+			name, _ := metric["name"].(string)
+			failing = append(failing, fmt.Sprintf("%s %s", name, strings.ToLower(phase)))
+		}
+	}
+
+	switch {
+	case len(failing) > 0:
+		s.Issue = strings.Join(failing, "; ")
+	default:
+		s.Issue, _, _ = unstructured.NestedString(obj.Object, "status", "message")
 	}
 
 	return s
@@ -186,6 +452,16 @@ func summarizeGenericCRD(obj *unstructured.Unstructured) *ResourceSummary {
 		Age:       age(obj.GetCreationTimestamp().Time),
 	}
 
+	// Gateway API policies (GEP-713) report per-ancestor, at
+	// status.ancestors[].conditions, so the top-level lookups below find
+	// nothing and the status comes back empty. Matched on the shape rather
+	// than on a list of kinds: every implementation shares it, and Radar
+	// should read one it has never heard of.
+	if status, ok := gatewayPolicyStatus(obj); ok {
+		s.Status = status
+		return s
+	}
+
 	// Try status.conditions — most CRDs follow this convention
 	s.Status = extractReadyCondition(obj)
 
@@ -196,6 +472,282 @@ func summarizeGenericCRD(obj *unstructured.Unstructured) *ResourceSummary {
 	}
 
 	return s
+}
+
+// gatewayPolicyStatus summarizes a Gateway API PolicyStatus, aggregated across
+// the ancestors a policy attaches to. The second return reports whether the
+// object carries one at all.
+//
+// Failures are checked before acceptance, which is the reverse of
+// extractReadyCondition. A policy is routinely Accepted=True and
+// Programmed=False — the controller took ownership and then could not apply it
+// — and reading acceptance first calls that healthy. Mirrors
+// getGatewayPolicyStatus in packages/k8s-ui.
+// policyAncestorLabel identifies the ancestor a failure belongs to. GEP-713
+// keys an ancestor's status on the full ancestorRef plus the controllerName —
+// the same Gateway can appear once per controller, section, or kind — so the
+// label carries the short parts outright; the long controllerName is appended
+// by the caller only when two labels would otherwise collide.
+func policyAncestorLabel(ancestor map[string]any) string {
+	ref, _ := ancestor["ancestorRef"].(map[string]any)
+	name, _ := ref["name"].(string)
+	if name == "" {
+		return ""
+	}
+	label := name
+	if ns, _ := ref["namespace"].(string); ns != "" {
+		label = ns + "/" + name
+	}
+	prefix := ""
+	if kind, _ := ref["kind"].(string); kind != "" && kind != "Gateway" {
+		prefix = kind
+	}
+	if group, _ := ref["group"].(string); group != "" && group != "gateway.networking.k8s.io" {
+		if prefix != "" {
+			prefix += "." + group
+		} else {
+			prefix = group
+		}
+	}
+	if prefix != "" {
+		label = prefix + " " + label
+	}
+	if section, _ := ref["sectionName"].(string); section != "" {
+		label += ":" + section
+	}
+	switch port := ref["port"].(type) {
+	case int64:
+		label += fmt.Sprintf(":%d", port)
+	case float64:
+		label += fmt.Sprintf(":%d", int64(port))
+	}
+	return label
+}
+
+type policyFailureDetail struct {
+	label      string
+	controller string
+	problem    string
+}
+
+// Reasons are usually short CamelCase tokens, but the API allows 1024 chars
+// and this reader accepts any CRD with an ancestors array, so the in-text list
+// is capped rather than trusted to stay small.
+const maxPolicyFailureDetails = 4
+
+// Collisions are counted across every ancestor, not just the failed ones: a
+// failure and a success for the same Gateway under different controllers must
+// still say which controller failed.
+func renderPolicyFailureDetails(failures []policyFailureDetail, labelCounts map[string]int) string {
+	entries := make([]string, 0, len(failures))
+	for _, f := range failures {
+		label := f.label
+		if label != "" && labelCounts[f.label] > 1 && f.controller != "" {
+			label += " (" + f.controller + ")"
+		}
+		if label != "" {
+			entries = append(entries, label+": "+f.problem)
+		} else {
+			entries = append(entries, f.problem)
+		}
+	}
+	if len(entries) > maxPolicyFailureDetails {
+		hidden := len(entries) - maxPolicyFailureDetails
+		return strings.Join(entries[:maxPolicyFailureDetails], "; ") + fmt.Sprintf("; +%d more", hidden)
+	}
+	return strings.Join(entries, "; ")
+}
+
+func gatewayPolicyStatus(obj *unstructured.Unstructured) (string, bool) {
+	// NoCopy rather than NestedSlice: this is a read-only summary on a request
+	// path, and NestedSlice deep-copies every ancestor — and panics outright on
+	// content it cannot copy rather than returning an error.
+	raw, found, err := unstructured.NestedFieldNoCopy(obj.Object, "status", "ancestors")
+	if !found || err != nil {
+		return "", false
+	}
+	ancestors, ok := raw.([]any)
+	if !ok {
+		return "", false
+	}
+	// Not a verdict: a policy that also publishes top-level conditions is left
+	// to those, and one that says nothing at all is left to render as absent.
+	if len(ancestors) == 0 {
+		return "", false
+	}
+
+	failed, degraded, accepted := 0, 0, 0
+	// Tracked apart, not in one slot: a warning on the first ancestor and a
+	// failure on the second would otherwise report the warning's text with the
+	// failure's count, reading as though the warning was the failure.
+	failure, warning := "", ""
+	// Ancestors can fail for different reasons; reporting the first with a count
+	// would claim they all failed that way.
+	failureReasons := map[string]struct{}{}
+	// Which Gateway failed with what. MCP has no tooltip channel, so on mixed
+	// reasons this rides in the text itself.
+	var failureDetails []policyFailureDetail
+	ancestorLabelCounts := map[string]int{}
+	verdict := ""
+
+	for _, a := range ancestors {
+		aMap, ok := a.(map[string]any)
+		if !ok {
+			continue
+		}
+		if label := policyAncestorLabel(aMap); label != "" {
+			ancestorLabelCounts[label]++
+		}
+		rawConds, _, _ := unstructured.NestedFieldNoCopy(aMap, "conditions")
+		conds, _ := rawConds.([]any)
+
+		broke, warned := "", ""
+		hasAccepted := false
+		for _, c := range conds {
+			cond, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			condType, _ := cond["type"].(string)
+			condStatus, _ := cond["status"].(string)
+			reason, _ := cond["reason"].(string)
+			switch {
+			case isPolicyEffectCondition(condType) && condStatus == "False":
+				// A controller still converging is not a failure: GEP-713 lists
+				// Reconciling as a legitimate state on the way to applied.
+				if policyTransientReasons[reason] {
+					if warned == "" {
+						warned = reason
+					}
+				} else if broke == "" {
+					broke = policyProblem(cond, condType, false)
+				}
+			case (condType == "Degraded" || condType == "Warning") && condStatus == "True":
+				if warned == "" {
+					warned = policyProblem(cond, condType, true)
+				}
+			case isPolicyEffectCondition(condType) && condStatus == "True" && policyQualifiedReasons[reason]:
+				// Partially applied is not applied.
+				if warned == "" {
+					warned = reason
+				}
+			case isPolicyVerdictCondition(condType) && condStatus == "True":
+				// GKE reports a healthy policy as Attached=True with no
+				// Accepted condition, so checking only Accepted read it as
+				// pending. ResolvedRefs is excluded: refs resolving is a
+				// precondition, not a statement that the policy applies.
+				hasAccepted = true
+				if verdict == "" {
+					verdict = condType
+				}
+			}
+		}
+
+		switch {
+		case broke != "":
+			failed++
+			if failure == "" {
+				failure = broke
+			}
+			failureReasons[broke] = struct{}{}
+			controller, _ := aMap["controllerName"].(string)
+			failureDetails = append(failureDetails, policyFailureDetail{
+				label:      policyAncestorLabel(aMap),
+				controller: controller,
+				problem:    broke,
+			})
+		case warned != "":
+			degraded++
+			if warning == "" {
+				warning = warned
+			}
+		case hasAccepted:
+			accepted++
+		}
+	}
+
+	total := len(ancestors)
+	scope := func(n int) string {
+		if total > 1 {
+			return fmt.Sprintf(" (%d/%d)", n, total)
+		}
+		return ""
+	}
+
+	switch {
+	case failed > 0:
+		if len(failureReasons) > 1 {
+			return fmt.Sprintf("%d/%d failed (%s)", failed, total, renderPolicyFailureDetails(failureDetails, ancestorLabelCounts)), true
+		}
+		return failure + scope(failed), true
+	case degraded > 0:
+		return warning + scope(degraded), true
+	case accepted == total:
+		if verdict != "" {
+			return verdict, true
+		}
+		return "Accepted", true
+	default:
+		return "Pending" + scope(total-accepted), true
+	}
+}
+
+// Conditions that describe whether the policy took effect. Accepted is
+// GEP-713's own verdict; Programmed and ResolvedRefs are how Gateway API and
+// its implementations report that a policy the controller took on could not be
+// applied, and Attached is GKE's equivalent.
+func isPolicyEffectCondition(t string) bool {
+	switch t {
+	case "Accepted", "Attached", "Programmed", "ResolvedRefs":
+		return true
+	}
+	return false
+}
+
+// isPolicyVerdictCondition reports the subset of effect conditions that mean
+// the policy took effect when True. A condition can be conclusive when False
+// and say nothing when True, which is why this is not the same set.
+func isPolicyVerdictCondition(t string) bool {
+	switch t {
+	case "Accepted", "Attached", "Programmed":
+		return true
+	}
+	return false
+}
+
+// Reasons that mean not-settled-yet rather than failed.
+var policyTransientReasons = map[string]bool{
+	"Reconciling": true, "Pending": true,
+}
+
+// A True condition can still be qualified: partial application is not success.
+var policyQualifiedReasons = map[string]bool{
+	"PartiallyProgrammed": true,
+}
+
+// policyProblem prefers the controller's reason, which names the actual
+// failure (ResourceNotFound, Conflicted, NotAllowed) where the type does not.
+//
+// The reason-less fallback reads "NotAccepted" here and "Not Accepted" in the
+// TypeScript reader. That is deliberate rather than drift: this file's other
+// summarizers already use the unspaced form for MCP output, while the UI spells
+// it for a human to read. Every case where a controller supplied a reason —
+// which is nearly all of them — is identical in both.
+//
+// The fallback follows the condition's polarity: Accepted=False reads as
+// NotAccepted, but Warning=True means there *is* a warning and the same
+// construction would render NotWarning, inverting it.
+func policyProblem(cond map[string]any, condType string, trueMeansTrouble bool) string {
+	if reason, _ := cond["reason"].(string); reason != "" {
+		return reason
+	}
+	if condType == "" {
+		return "Failed"
+	}
+	if trueMeansTrouble {
+		return condType
+	}
+	return "Not" + condType
 }
 
 // extractReadyCondition extracts the most informative condition from status.conditions.

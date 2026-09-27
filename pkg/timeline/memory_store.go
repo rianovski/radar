@@ -5,6 +5,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/skyhook-io/radar/pkg/resourceid"
 )
 
 // MemoryStore is an in-memory implementation of EventStore using a ring buffer.
@@ -14,10 +16,18 @@ type MemoryStore struct {
 	maxSize       int
 	head          int // next write position
 	count         int
+	lastSeq       int64 // arrival counter; every head write (incl. upsert re-append) takes the next value
+	eventsEvicted bool
+	index         map[string]int // event id -> ring slot, for dedup + upsert
 	mu            sync.RWMutex
 	seenResources map[string]bool
 	seenMu        sync.RWMutex
 	filterCache   map[string]*CompiledFilter
+
+	// degradedReason, when non-empty, marks this store as a fallback for a
+	// persistent backend that could not be opened. Set once at construction
+	// before the store is published, so it needs no lock. Reported via Stats.
+	degradedReason string
 }
 
 // NewMemoryStore creates a new in-memory event store
@@ -28,21 +38,27 @@ func NewMemoryStore(maxSize int) *MemoryStore {
 	return &MemoryStore{
 		records:       make([]TimelineEvent, maxSize),
 		maxSize:       maxSize,
+		index:         make(map[string]int),
 		seenResources: make(map[string]bool),
 		filterCache:   make(map[string]*CompiledFilter),
 	}
+}
+
+// NewDegradedMemoryStore returns an in-memory store that reports itself as a
+// degraded fallback via Stats. Used when the configured persistent backend
+// could not be opened, so the timeline stays alive (without persistence) for
+// the session instead of the whole subsystem going dark.
+func NewDegradedMemoryStore(maxSize int, reason string) *MemoryStore {
+	m := NewMemoryStore(maxSize)
+	m.degradedReason = reason
+	return m
 }
 
 // Append adds a single event to the store
 func (m *MemoryStore) Append(ctx context.Context, event TimelineEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	m.records[m.head] = event
-	m.head = (m.head + 1) % m.maxSize
-	if m.count < m.maxSize {
-		m.count++
-	}
+	m.appendLocked(event)
 	return nil
 }
 
@@ -52,13 +68,73 @@ func (m *MemoryStore) AppendBatch(ctx context.Context, events []TimelineEvent) e
 	defer m.mu.Unlock()
 
 	for _, event := range events {
-		m.records[m.head] = event
-		m.head = (m.head + 1) % m.maxSize
-		if m.count < m.maxSize {
-			m.count++
-		}
+		m.appendLocked(event)
 	}
 	return nil
+}
+
+// appendLocked writes one event, collapsing duplicate ids so a relist/replay
+// never produces two visible rows. An existing id from a mutable K8s Event
+// (same uid, bumped count) vacates its old slot and re-appends at the head;
+// an identical informer/historical id keeps the original row (same state,
+// same first-observed timestamp).
+func (m *MemoryStore) appendLocked(event TimelineEvent) {
+	if event.ID != "" {
+		if idx, ok := m.index[event.ID]; ok && m.records[idx].ID == event.ID {
+			// K8s Events bump count/message on the same uid, but an out-of-order
+			// older revision must not clobber a newer one.
+			if event.Source == SourceK8sEvent && m.records[idx].Source == SourceK8sEvent && !event.Timestamp.Before(m.records[idx].Timestamp) {
+				// A bump that lost its enrichment (tombstone expired, object gone
+				// from the live cache) must not erase what the row already knows;
+				// a bump that carries enrichment wins as the fresher truth.
+				old := m.records[idx]
+				if event.CreatedAt == nil {
+					event.CreatedAt = old.CreatedAt
+				}
+				if !OwnerReplacesOnUpsert(event) {
+					event.Owner, event.OwnerEvidence = old.Owner, old.OwnerEvidence
+				}
+				if event.Labels == nil {
+					event.Labels = old.Labels
+				}
+				// Vacate the old slot and re-append at head. Queries iterate by
+				// ring position (newest insert first), so updating in place would
+				// leave a count-bump buried at its stale recency; moving it to
+				// head reflects the fresh timestamp. Keeps one live row per id.
+				m.records[idx] = TimelineEvent{}
+				delete(m.index, event.ID)
+				m.writeAtHead(event)
+			}
+			return
+		}
+	}
+
+	m.writeAtHead(event)
+}
+
+// writeAtHead writes event at the head slot, advancing the ring. count tracks
+// the window span behind head (holes left by upsert vacating are counted here
+// and skipped on read), so the oldest live row is never scanned past.
+func (m *MemoryStore) writeAtHead(event TimelineEvent) {
+	// Drop the slot's current occupant from the index before overwriting it,
+	// so a wrapped-over id can't leave a dangling mapping.
+	if evicted := m.records[m.head]; evicted.ID != "" {
+		m.eventsEvicted = true
+		if idx, ok := m.index[evicted.ID]; ok && idx == m.head {
+			delete(m.index, evicted.ID)
+		}
+	}
+
+	m.lastSeq++
+	event.Seq = m.lastSeq
+	m.records[m.head] = event
+	if event.ID != "" {
+		m.index[event.ID] = m.head
+	}
+	m.head = (m.head + 1) % m.maxSize
+	if m.count < m.maxSize {
+		m.count++
+	}
 }
 
 // Query retrieves events matching the given options
@@ -88,9 +164,21 @@ func (m *MemoryStore) Query(ctx context.Context, opts QueryOptions) ([]TimelineE
 	results := make([]TimelineEvent, 0, limit)
 	skipped := 0
 
-	// Iterate backwards from most recent
+	// Delta reads (SinceSeq>0) page by ascending arrival order so a burst larger
+	// than the limit isn't skipped: the server advances the client cursor by the
+	// max seq in the page, so the next poll must resume from the lowest unseen
+	// seq. Ring position tracks arrival order (each writeAtHead takes the next
+	// seq), so oldest-first iteration yields ascending seq. Non-delta reads page
+	// newest-first in arrival order unless ascending sequence order is explicit.
+	deltaAscending := opts.SeqPaging || opts.SinceSeq > 0 || opts.SequenceOrder == SequenceOrderAscending
+
 	for i := 0; i < m.count && len(results) < limit; i++ {
-		idx := (m.head - 1 - i + m.maxSize) % m.maxSize
+		var idx int
+		if deltaAscending {
+			idx = (m.head - m.count + i + m.maxSize) % m.maxSize
+		} else {
+			idx = (m.head - 1 - i + m.maxSize) % m.maxSize
+		}
 		event := m.records[idx]
 
 		// Skip empty records
@@ -115,65 +203,6 @@ func (m *MemoryStore) Query(ctx context.Context, opts QueryOptions) ([]TimelineE
 	return results, nil
 }
 
-// QueryGrouped retrieves events grouped according to the specified mode
-func (m *MemoryStore) QueryGrouped(ctx context.Context, opts QueryOptions) (*TimelineResponse, error) {
-	startTime := time.Now()
-
-	// First get all matching events
-	events, err := m.Query(ctx, QueryOptions{
-		Namespaces:       opts.Namespaces,
-		Kinds:            opts.Kinds,
-		Since:            opts.Since,
-		Until:            opts.Until,
-		Sources:          opts.Sources,
-		FilterPreset:     opts.FilterPreset,
-		Limit:            opts.Limit * 10, // Get more events for grouping
-		IncludeManaged:   opts.IncludeManaged,
-		IncludeK8sEvents: opts.IncludeK8sEvents,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	if opts.GroupBy == GroupByNone {
-		// No grouping - return flat list
-		if len(events) > opts.Limit {
-			events = events[:opts.Limit]
-		}
-		return &TimelineResponse{
-			Ungrouped: events,
-			Meta: TimelineMeta{
-				TotalEvents: len(events),
-				QueryTimeMs: time.Since(startTime).Milliseconds(),
-				HasMore:     len(events) == opts.Limit,
-			},
-		}, nil
-	}
-
-	// Group events using shared function
-	groups := GroupEvents(events, opts.GroupBy)
-
-	// Apply limit to groups
-	limit := opts.Limit
-	if limit <= 0 {
-		limit = 200
-	}
-	hasMore := len(groups) > limit
-	if hasMore {
-		groups = groups[:limit]
-	}
-
-	return &TimelineResponse{
-		Groups: groups,
-		Meta: TimelineMeta{
-			TotalEvents: len(events),
-			GroupCount:  len(groups),
-			QueryTimeMs: time.Since(startTime).Milliseconds(),
-			HasMore:     hasMore,
-		},
-	}, nil
-}
-
 // GetEvent retrieves a single event by ID
 func (m *MemoryStore) GetEvent(ctx context.Context, id string) (*TimelineEvent, error) {
 	m.mu.RLock()
@@ -189,61 +218,25 @@ func (m *MemoryStore) GetEvent(ctx context.Context, id string) (*TimelineEvent, 
 	return nil, nil
 }
 
-// GetChangesForOwner retrieves changes for resources owned by the given owner
-func (m *MemoryStore) GetChangesForOwner(ctx context.Context, ownerKind, ownerNamespace, ownerName string, since time.Time, limit int) ([]TimelineEvent, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if limit <= 0 {
-		limit = 100
-	}
-
-	results := make([]TimelineEvent, 0, limit)
-
-	for i := 0; i < m.count && len(results) < limit; i++ {
-		idx := (m.head - 1 - i + m.maxSize) % m.maxSize
-		event := m.records[idx]
-
-		if event.ID == "" {
-			continue
-		}
-
-		if !since.IsZero() && event.Timestamp.Before(since) {
-			continue
-		}
-
-		if event.Namespace != ownerNamespace {
-			continue
-		}
-
-		// Check if this event's owner matches
-		if event.Owner != nil && event.Owner.Kind == ownerKind && event.Owner.Name == ownerName {
-			results = append(results, event)
-		}
-	}
-
-	return results, nil
-}
-
 // MarkResourceSeen records that a resource has been seen
-func (m *MemoryStore) MarkResourceSeen(kind, namespace, name string) {
+func (m *MemoryStore) MarkResourceSeen(clusterContext, group, kind, namespace, name string) {
 	m.seenMu.Lock()
 	defer m.seenMu.Unlock()
-	m.seenResources[ResourceKey(kind, namespace, name)] = true
+	m.seenResources[SeenResourceKey(clusterContext, group, kind, namespace, name)] = true
 }
 
 // IsResourceSeen checks if a resource has been seen before
-func (m *MemoryStore) IsResourceSeen(kind, namespace, name string) bool {
+func (m *MemoryStore) IsResourceSeen(clusterContext, group, kind, namespace, name string) bool {
 	m.seenMu.RLock()
 	defer m.seenMu.RUnlock()
-	return m.seenResources[ResourceKey(kind, namespace, name)]
+	return m.seenResources[SeenResourceKey(clusterContext, group, kind, namespace, name)]
 }
 
 // ClearResourceSeen removes a resource from the seen set
-func (m *MemoryStore) ClearResourceSeen(kind, namespace, name string) {
+func (m *MemoryStore) ClearResourceSeen(clusterContext, group, kind, namespace, name string) {
 	m.seenMu.Lock()
 	defer m.seenMu.Unlock()
-	delete(m.seenResources, ResourceKey(kind, namespace, name))
+	delete(m.seenResources, SeenResourceKey(clusterContext, group, kind, namespace, name))
 }
 
 // Stats returns storage statistics
@@ -254,25 +247,43 @@ func (m *MemoryStore) Stats() StoreStats {
 	defer m.seenMu.RUnlock()
 
 	var oldest, newest time.Time
+	var oldestSeq, newestSeq int64
+	// count is the ring window span, which can include holes left by upsert
+	// vacating a slot — count live records instead of reporting the span.
+	var total int64
 	for i := 0; i < m.count; i++ {
 		idx := (m.head - 1 - i + m.maxSize) % m.maxSize
 		if m.records[idx].ID == "" {
 			continue
 		}
+		total++
 		ts := m.records[idx].Timestamp
+		seq := m.records[idx].Seq
 		if newest.IsZero() || ts.After(newest) {
 			newest = ts
 		}
 		if oldest.IsZero() || ts.Before(oldest) {
 			oldest = ts
 		}
+		if oldestSeq == 0 || seq < oldestSeq {
+			oldestSeq = seq
+		}
+		if seq > newestSeq {
+			newestSeq = seq
+		}
 	}
 
 	return StoreStats{
-		TotalEvents:   int64(m.count),
-		OldestEvent:   oldest,
-		NewestEvent:   newest,
-		SeenResources: len(m.seenResources),
+		TotalEvents:    total,
+		OldestEvent:    oldest,
+		NewestEvent:    newest,
+		OldestSeq:      oldestSeq,
+		NewestSeq:      newestSeq,
+		MaxEvents:      m.maxSize,
+		EventsEvicted:  m.eventsEvicted,
+		SeenResources:  len(m.seenResources),
+		Degraded:       m.degradedReason != "",
+		DegradedReason: m.degradedReason,
 	}
 }
 
@@ -289,6 +300,18 @@ func (m *MemoryStore) matchesFilters(event *TimelineEvent, opts QueryOptions, cf
 	}
 
 	// Apply individual filters (these override preset if both specified)
+	if opts.ClusterContext != "" && event.ClusterContext != opts.ClusterContext {
+		return false
+	}
+
+	if (opts.SeqPaging || opts.SinceSeq > 0) && event.Seq <= opts.SinceSeq {
+		return false
+	}
+
+	if opts.UntilSeq > 0 && event.Seq >= opts.UntilSeq {
+		return false
+	}
+
 	if !opts.Since.IsZero() && event.Timestamp.Before(opts.Since) {
 		return false
 	}
@@ -311,11 +334,38 @@ func (m *MemoryStore) matchesFilters(event *TimelineEvent, opts QueryOptions, cf
 		}
 	}
 
+	if opts.RequireAPIVersion && event.APIVersion == "" {
+		return false
+	}
+	if len(opts.APIGroups) > 0 && event.APIVersion != "" {
+		if !slices.Contains(opts.APIGroups, resourceid.GroupFromAPIVersion(event.APIVersion)) {
+			return false
+		}
+	}
+
+	if len(opts.Names) > 0 {
+		found := slices.Contains(opts.Names, event.Name)
+		if !found {
+			return false
+		}
+	}
+
 	if len(opts.Sources) > 0 {
 		found := slices.Contains(opts.Sources, event.Source)
 		if !found {
 			return false
 		}
+	}
+
+	if len(opts.EventTypes) > 0 {
+		found := slices.Contains(opts.EventTypes, event.EventType)
+		if !found {
+			return false
+		}
+	}
+
+	if opts.ExcludeDeleted && event.EventType == EventTypeDelete {
+		return false
 	}
 
 	// Handle IncludeManaged

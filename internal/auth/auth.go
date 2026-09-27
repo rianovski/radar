@@ -39,12 +39,14 @@ var (
 	NewPermissionCache       = pkgauth.NewPermissionCache
 	DiscoverNamespaces       = pkgauth.DiscoverNamespaces
 	SubjectCanI              = pkgauth.SubjectCanI
+	SubjectCanISubresource   = pkgauth.SubjectCanISubresource
 	FilterNamespacesForUser  = pkgauth.FilterNamespacesForUser
-	CreateSessionCookie      = pkgauth.CreateSessionCookie
 	NewSessionID             = pkgauth.NewSessionID
+	CreateSessionCookie      = pkgauth.CreateSessionCookie
 	ParseSessionCookie       = pkgauth.ParseSessionCookie
 	ClearSessionCookie       = pkgauth.ClearSessionCookie
 	CloudRoleFromGroups      = pkgauth.CloudRoleFromGroups
 	CloudRoleFromContext     = pkgauth.CloudRoleFromContext
 	NewAPIKeyStore           = pkgauth.NewAPIKeyStore
+	ForwardedIdentityAllowed = pkgauth.ForwardedIdentityAllowed
 )

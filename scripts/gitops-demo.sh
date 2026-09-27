@@ -29,8 +29,17 @@ FIXTURES_DIR="${SCRIPT_DIR}/gitops-demo"
 
 # Versions pinned so the demo behaves consistently across runs. Bump
 # when you want a newer release; otherwise leave alone.
-ARGOCD_VERSION="${ARGOCD_VERSION:-v2.13.2}"
+#
+# Argo CD 3.x is the default because it changes what Radar sees: from 3.0
+# the controller no longer persists per-resource health into the
+# Application CR (status.resourceHealthSource=appTree). Set
+# ARGOCD_VERSION=v2.13.2 to exercise the older inline shape.
+ARGOCD_VERSION="${ARGOCD_VERSION:-v3.5.2}"
 FLUX_VERSION="${FLUX_VERSION:-v2.4.0}"
+
+# The argo3-health Application sources its manifests from this repository
+# on GitHub. Point it at a branch to test fixture changes before they land.
+ARGO3_FIXTURE_REVISION="${ARGO3_FIXTURE_REVISION:-main}"
 
 # Pretty colors for status output. Quietly turn off in non-interactive env.
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -74,6 +83,7 @@ cmd_up() {
   install_argocd
   install_flux
   apply_fixtures
+  mint_radar_token
   print_summary
 }
 
@@ -101,8 +111,9 @@ install_argocd() {
   kubectl --context "${KUBECTL_CTX}" create namespace argocd --dry-run=client -o yaml \
     | kubectl --context "${KUBECTL_CTX}" apply -f - >/dev/null
 
-  # Apply official manifests at the pinned version. Idempotent.
-  kubectl --context "${KUBECTL_CTX}" apply -n argocd \
+  # Apply official manifests at the pinned version. Idempotent. Server-side:
+  # the 3.x CRDs exceed the client-side last-applied annotation limit.
+  kubectl --context "${KUBECTL_CTX}" apply --server-side --force-conflicts -n argocd \
     -f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml" >/dev/null
 
   step "Waiting for Argo CD pods to be Ready (~60s)"
@@ -152,12 +163,46 @@ apply_fixtures() {
       continue
     fi
     note "applying $(basename "$f")"
+    if [ "$(basename "$f")" = "12-argo3-health-app.yaml" ] && [ "${ARGO3_FIXTURE_REVISION}" != "main" ]; then
+      sed "s|targetRevision: main|targetRevision: ${ARGO3_FIXTURE_REVISION}|" "$f"         | kubectl --context "${KUBECTL_CTX}" apply -f - >/dev/null
+      continue
+    fi
     kubectl --context "${KUBECTL_CTX}" apply -f "$f" >/dev/null
   done
   ok "Fixtures applied"
 
+  setup_argo_health_customizations
   setup_rollback_history
   setup_zombie
+}
+
+# setup_argo_health_customizations merges the demo's Argo health checks
+# (fixture ConfigMap radar-demo-argo-health-customizations) into argocd-cm.
+# argocd-cm is owned by install.yaml, so the keys are patched in rather
+# than applied as a second manifest. The application controller reloads
+# argocd-cm on its own; the restart just makes the first evaluation prompt.
+setup_argo_health_customizations() {
+  step "Installing Argo CD health checks for the argo3-health scenario"
+  local lua
+  lua=$(kubectl --context "${KUBECTL_CTX}" -n argocd get configmap radar-demo-argo-health-customizations \
+    -o jsonpath='{.data.resource\.customizations\.health\.radar\.demo_Widget}')
+  if [ -z "$lua" ]; then
+    warn "customization ConfigMap missing; Widget health will not be evaluated by Argo"
+    return
+  fi
+  # A YAML block scalar sidesteps JSON-escaping the Lua: indent every line
+  # under the key and let kubectl parse the merge patch as YAML.
+  local patch
+  patch=$(mktemp)
+  {
+    printf 'data:\n  resource.customizations.health.radar.demo_Widget: |\n'
+    printf '%s\n' "$lua" | sed 's/^/    /'
+  } > "$patch"
+  kubectl --context "${KUBECTL_CTX}" -n argocd patch configmap argocd-cm --type merge \
+    --patch-file "$patch" >/dev/null
+  rm -f "$patch"
+  kubectl --context "${KUBECTL_CTX}" -n argocd rollout restart statefulset/argocd-application-controller >/dev/null
+  ok "Widget health check installed"
 }
 
 # wait_for_app_synced polls until an Argo Application reports Synced+Healthy.
@@ -363,6 +408,63 @@ cmd_status() {
   printf "\n"
 }
 
+# --- Radar Argo CD API token -------------------------------------------------
+
+# mint_radar_token provisions a get-only Argo CD local account ("radar") and
+# mints an API token for it, so the Argo CD integration (Settings -> Argo CD,
+# or PUT /api/integrations/argocd) can be exercised against the demo cluster.
+# The token lands in scripts/gitops-demo/.radar-argocd-token (gitignored).
+# Idempotent: re-running replaces the token.
+mint_radar_token() {
+  step "Minting a get-only Argo CD API token for Radar"
+
+  kubectl --context "${KUBECTL_CTX}" -n argocd patch configmap argocd-cm --type merge \
+    -p '{"data":{"accounts.radar":"apiKey"}}' >/dev/null
+  kubectl --context "${KUBECTL_CTX}" -n argocd patch configmap argocd-rbac-cm --type merge \
+    -p '{"data":{"policy.csv":"p, role:radar, applications, get, */*, allow\ng, radar, role:radar"}}' >/dev/null
+
+  local admin_pw pf_pid token session_token
+  admin_pw=$(kubectl --context "${KUBECTL_CTX}" -n argocd get secret argocd-initial-admin-secret \
+    -o jsonpath='{.data.password}' | base64 -d)
+
+  kubectl --context "${KUBECTL_CTX}" -n argocd port-forward svc/argocd-server 18085:443 >/dev/null 2>&1 &
+  pf_pid=$!
+  # Wait for the forward to accept connections; the account cm change is
+  # hot-reloaded by argocd-server, but give it a couple of retries too.
+  local attempt session_resp
+  for attempt in $(seq 1 15); do
+    sleep 1
+    session_resp=$(curl -ks -X POST https://localhost:18085/api/v1/session \
+      -H "Content-Type: application/json" \
+      -d "{\"username\":\"admin\",\"password\":\"${admin_pw}\"}" 2>/dev/null) || continue
+    session_token=$(printf '%s' "$session_resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+    [ -n "$session_token" ] && break
+  done
+  if [ -z "${session_token:-}" ]; then
+    kill "$pf_pid" 2>/dev/null || true
+    warn "Could not log in to argocd-server to mint the Radar token (skipping — mint manually with 'argocd account generate-token --account radar')"
+    return 0
+  fi
+
+  for attempt in $(seq 1 10); do
+    token=$(curl -ks -X POST https://localhost:18085/api/v1/account/radar/token \
+      -H "Authorization: Bearer ${session_token}" -H "Content-Type: application/json" -d '{}' \
+      | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+    [ -n "$token" ] && break
+    sleep 2
+  done
+  kill "$pf_pid" 2>/dev/null || true
+
+  if [ -z "${token:-}" ]; then
+    warn "Token mint failed (account may still be propagating) — mint manually with 'argocd account generate-token --account radar'"
+    return 0
+  fi
+
+  printf '%s' "$token" > "${SCRIPT_DIR}/gitops-demo/.radar-argocd-token"
+  chmod 600 "${SCRIPT_DIR}/gitops-demo/.radar-argocd-token"
+  ok "Token written to scripts/gitops-demo/.radar-argocd-token"
+}
+
 # --- Final summary ---------------------------------------------------------
 
 print_summary() {
@@ -383,6 +485,11 @@ print_summary() {
   Run Radar against this cluster:
     kubectl config use-context ${KUBECTL_CTX}
     ./scripts/visual-test-start.sh
+
+  Connect Radar's Argo CD integration (deep diff):
+    port-forward argocd-server (see above), then in Radar Settings -> Argo CD:
+    URL https://localhost:8080, insecure TLS on, token from
+    scripts/gitops-demo/.radar-argocd-token
 
   Other commands:
     $0 status           # inventory the cluster

@@ -8,6 +8,7 @@
 
 @theme inline {
   /* Backgrounds */
+  --color-theme-sidebar: var(--bg-sidebar);
   --color-theme-base: var(--bg-base);
   --color-theme-surface: var(--bg-surface);
   --color-theme-elevated: var(--bg-elevated);
@@ -19,6 +20,11 @@
   --color-theme-text-secondary: var(--text-secondary);
   --color-theme-text-tertiary: var(--text-tertiary);
   --color-theme-text-disabled: var(--text-disabled);
+  --color-warning-text: var(--warning-text);
+
+  /* Semantic status */
+  --color-semantic-warning: var(--color-warning);
+  --color-semantic-error: var(--color-error);
 
   /* Borders */
   --color-theme-border: var(--border-default);
