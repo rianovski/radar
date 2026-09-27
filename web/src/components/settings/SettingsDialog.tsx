@@ -2006,7 +2006,7 @@ function APIKeysSection({ open }: { open: boolean }) {
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setKeys(await res.json())
-    } catch (e) {
+    } catch {
       setError('Failed to load API keys.')
     } finally {
       setLoading(false)
@@ -2091,13 +2091,15 @@ function APIKeysSection({ open }: { open: boolean }) {
             <code className="flex-1 px-2 py-1 text-xs font-mono bg-theme-elevated border border-theme-border rounded text-theme-text-primary break-all">
               {newKey}
             </code>
-            <button
-              onClick={handleCopy}
-              className="shrink-0 p-1.5 text-theme-text-tertiary hover:text-theme-text-primary hover:bg-theme-elevated rounded-md transition-colors"
-              title="Copy key"
-            >
-              {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
-            </button>
+            <Tooltip content="Copy key" wrapperClassName="shrink-0">
+              <button
+                onClick={handleCopy}
+                aria-label="Copy key"
+                className="p-1.5 text-theme-text-tertiary hover:text-theme-text-primary hover:bg-theme-elevated rounded-md transition-colors"
+              >
+                {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
+              </button>
+            </Tooltip>
           </div>
           <p className="text-xs text-theme-text-tertiary">
             Use as: <code className="font-mono">Authorization: Bearer {newKey.slice(0, 8)}…</code>
@@ -2149,19 +2151,23 @@ function APIKeysSection({ open }: { open: boolean }) {
                   {key.lastUsedAt && ` · last used ${new Date(key.lastUsedAt).toLocaleDateString()}`}
                 </p>
               </div>
-              <button
-                onClick={() => handleDelete(key.id)}
-                className={clsx(
-                  'shrink-0 flex items-center gap-1 px-2 py-1 text-xs rounded-md transition-colors',
-                  deleteConfirm === key.id
-                    ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
-                    : 'text-theme-text-tertiary hover:text-red-400 hover:bg-theme-elevated'
-                )}
-                title={deleteConfirm === key.id ? 'Click again to confirm revoke' : 'Revoke key'}
+              <Tooltip
+                content={deleteConfirm === key.id ? 'Click again to confirm revoke' : 'Revoke key'}
+                wrapperClassName="shrink-0"
               >
-                <Trash2 className="w-3 h-3" />
-                {deleteConfirm === key.id ? 'Confirm' : 'Revoke'}
-              </button>
+                <button
+                  onClick={() => handleDelete(key.id)}
+                  className={clsx(
+                    'flex items-center gap-1 px-2 py-1 text-xs rounded-md transition-colors',
+                    deleteConfirm === key.id
+                      ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
+                      : 'text-theme-text-tertiary hover:text-red-400 hover:bg-theme-elevated'
+                  )}
+                >
+                  <Trash2 className="w-3 h-3" />
+                  {deleteConfirm === key.id ? 'Confirm' : 'Revoke'}
+                </button>
+              </Tooltip>
             </div>
           ))}
         </div>
