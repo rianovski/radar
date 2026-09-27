@@ -73,3 +73,25 @@ func TestClusterTargetMiddlewareBindsSwitchedUsers(t *testing.T) {
 		t.Fatalf("default-context user must stay unbound, got %+v", got)
 	}
 }
+
+func TestSwitchUserContextMovesOnlyTheRequester(t *testing.T) {
+	pool, _ := newSwitchedPool(t)
+	pool.Seed("third", k8s.PoolEntry{
+		RestConfig:  &rest.Config{Host: "https://third.example"},
+		ContextName: "third",
+	}, func() {})
+	s := &Server{pool: pool, broadcaster: NewSSEBroadcaster()}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/capi/clusters/ns/c/connect", nil)
+	req = req.WithContext(auth.ContextWithUser(req.Context(), &auth.User{Username: "bob"}))
+	if err := s.switchUserContext(req, "third"); err != nil {
+		t.Fatalf("switch: %v", err)
+	}
+
+	if got := pool.ContextForUser("bob"); got != "third" {
+		t.Errorf("requester should move to the new context, got %q", got)
+	}
+	if got := pool.ContextForUser("alice"); got != "other" {
+		t.Errorf("other users must stay where they were, got %q", got)
+	}
+}

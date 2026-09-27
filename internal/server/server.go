@@ -4979,25 +4979,10 @@ func (s *Server) handleSwitchContext(w http.ResponseWriter, r *http.Request) {
 
 	// Pool-based per-user switch: only affects the requesting user.
 	if s.pool != nil {
-		username := usernameFrom(r)
-		// Capture the broadcaster the user is currently connected to BEFORE
-		// switching — pool.Switch changes ContextForUser, so broadcasterFor
-		// would resolve to the new context's broadcaster after the call.
-		prevBroadcaster := s.broadcasterFor(username)
-		if err := s.pool.Switch(r.Context(), username, name); err != nil {
+		if err := s.switchUserContext(r, name); err != nil {
 			s.writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		// Notify on the old broadcaster so the user's active SSE stream
-		// receives the event and triggers an EventSource reconnect. Use the
-		// reliable broadcaster — a dropped context_changed leaves the UI's
-		// switching overlay stuck because waitingForTopologyAfterSwitch is
-		// only set in response to this event, and the buffered eventCh can
-		// fill up if a slow client/proxy is backpressuring topology updates.
-		prevBroadcaster.BroadcastReliable(SSEEvent{
-			Event: "context_changed",
-			Data:  map[string]any{"context": name},
-		}, 2*time.Second)
 		s.writeJSON(w, map[string]string{"status": "ok", "context": name})
 		return
 	}
@@ -5034,6 +5019,30 @@ func (s *Server) handleSwitchContext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, info)
+}
+
+// switchUserContext moves only the requesting user to contextName in the pool
+// and tells their open SSE stream about it.
+func (s *Server) switchUserContext(r *http.Request, contextName string) error {
+	username := usernameFrom(r)
+	// Capture the broadcaster the user is currently connected to BEFORE
+	// switching — pool.Switch changes ContextForUser, so broadcasterFor
+	// would resolve to the new context's broadcaster after the call.
+	prevBroadcaster := s.broadcasterFor(username)
+	if err := s.pool.Switch(r.Context(), username, contextName); err != nil {
+		return err
+	}
+	// Notify on the old broadcaster so the user's active SSE stream
+	// receives the event and triggers an EventSource reconnect. Use the
+	// reliable broadcaster — a dropped context_changed leaves the UI's
+	// switching overlay stuck because waitingForTopologyAfterSwitch is
+	// only set in response to this event, and the buffered eventCh can
+	// fill up if a slow client/proxy is backpressuring topology updates.
+	prevBroadcaster.BroadcastReliable(SSEEvent{
+		Event: "context_changed",
+		Data:  map[string]any{"context": contextName},
+	}, 2*time.Second)
+	return nil
 }
 
 // Connection status handlers (for graceful startup)
@@ -5265,6 +5274,24 @@ func (s *Server) handleCAPIClusterConnect(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		log.Printf("[capi] Failed to merge kubeconfig for cluster %s/%s: %v", ns, name, err)
 		s.writeError(w, http.StatusInternalServerError, "failed to connect: "+err.Error())
+		return
+	}
+
+	// With a pool, the workload cluster becomes the requesting user's context
+	// only; everyone else stays where they are.
+	if s.pool != nil {
+		if err := s.switchUserContext(r, qualifiedName); err != nil {
+			if k8s.DiscardFailedMergedContext(mergedPath, created) {
+				log.Printf("[capi] Discarded inactive kubeconfig after failed switch to %q", qualifiedName)
+			}
+			s.writeError(w, http.StatusInternalServerError, "failed to switch context: "+err.Error())
+			return
+		}
+		log.Printf("[capi] Connected user %q to workload cluster %s/%s (context: %q, kubeconfig: %q)", usernameFrom(r), ns, name, qualifiedName, mergedPath)
+		s.writeJSON(w, map[string]string{
+			"status":  "connected",
+			"context": qualifiedName,
+		})
 		return
 	}
 

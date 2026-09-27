@@ -375,6 +375,7 @@ See `helm.Client.ForContext` + `helm.Handlers.ContextResolver` + `server.helmTar
 | RBAC decisions (REST `canRead*`, namespace discovery, MCP permission checks, search/curl/upgrade-readiness SARs) | `s.permScope(username)` / `mcpPermScope(username)` for the cache key + SAR client; `k8s.ServiceClientFromContext(ctx)` for one-off SARs | a switched user's permission-cache key is `username\x01context`, so one cluster's RBAC never answers for another's |
 | MCP tools | `mcpCache(ctx)` / `mcpDynCache(ctx)` / `mcpDiscovery(ctx)` in `internal/mcp/pool.go`, wired via `mcp.SetPool` | only the tools that already used them; new upstream tools read globals |
 | `/api/connection` | per-user `context`, `clusterName`, `contexts[].isCurrent` | |
+| Context switch + CAPI workload-cluster connect | `s.switchUserContext(r, name)` | with a pool only the requester moves; the global `PerformContextSwitch` path runs only when `s.pool == nil` |
 
 ### Still wired to global state — KNOWN BUGS, prioritized
 
