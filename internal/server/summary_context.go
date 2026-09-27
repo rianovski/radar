@@ -10,7 +10,8 @@
 package server
 
 import (
-	"github.com/skyhook-io/radar/internal/issues"
+	"net/http"
+
 	"github.com/skyhook-io/radar/internal/summarycontext"
 )
 
@@ -27,13 +28,13 @@ import (
 // Use newSearchSummaryContextBuilder for search, which routes per-hit
 // between a namespaced and a cluster-wide index — search returns mixed
 // kinds in one response, so a single index can't get both right.
-func (s *Server) newResourceSummaryContextBuilder(namespaces []string) summarycontext.Builder {
-	provider := issues.NewCacheProvider()
+func (s *Server) newResourceSummaryContextBuilder(r *http.Request, namespaces []string) summarycontext.Builder {
+	provider := s.issuesProviderFor(r)
 	if provider == nil {
 		return nil
 	}
 	idx := summarycontext.BuildIssueIndex(provider, namespaces)
-	return summarycontext.BuilderFromIndexes(s.broadcaster.GetCachedTopology(), idx, idx)
+	return summarycontext.BuilderFromIndexes(s.broadcasterFor(usernameFrom(r)).GetCachedTopology(), idx, idx)
 }
 
 // newSearchSummaryContextBuilder is the search-specific variant. Search
@@ -56,8 +57,8 @@ func (s *Server) newResourceSummaryContextBuilder(namespaces []string) summaryco
 // The cluster-wide index is skipped when scanNamespaces is already nil
 // (cluster-wide user) — both indexes would be identical, so one pass
 // suffices.
-func (s *Server) newSearchSummaryContextBuilder(scanNamespaces []string) summarycontext.Builder {
-	provider := issues.NewCacheProvider()
+func (s *Server) newSearchSummaryContextBuilder(r *http.Request, scanNamespaces []string) summarycontext.Builder {
+	provider := s.issuesProviderFor(r)
 	if provider == nil {
 		return nil
 	}
@@ -66,5 +67,5 @@ func (s *Server) newSearchSummaryContextBuilder(scanNamespaces []string) summary
 	if scanNamespaces != nil {
 		clusterIdx = summarycontext.BuildIssueIndex(provider, nil)
 	}
-	return summarycontext.BuilderFromIndexes(s.broadcaster.GetCachedTopology(), namespacedIdx, clusterIdx)
+	return summarycontext.BuilderFromIndexes(s.broadcasterFor(usernameFrom(r)).GetCachedTopology(), namespacedIdx, clusterIdx)
 }

@@ -95,3 +95,14 @@ func TestSwitchUserContextMovesOnlyTheRequester(t *testing.T) {
 		t.Errorf("other users must stay where they were, got %q", got)
 	}
 }
+
+func TestNamespacePicksFollowTheUsersContext(t *testing.T) {
+	pool, _ := newSwitchedPool(t)
+	s := &Server{pool: pool}
+	if got := s.nsContextFor("alice"); got != "other" {
+		t.Errorf("switched user's picks belong to their context, got %q", got)
+	}
+	if got := s.nsContextFor("bob"); got != k8s.GetContextName() {
+		t.Errorf("default-context user keeps the global context, got %q", got)
+	}
+}

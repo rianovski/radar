@@ -10,9 +10,9 @@
 package mcp
 
 import (
+	"context"
 	"time"
 
-	"github.com/skyhook-io/radar/internal/issues"
 	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/internal/summarycontext"
 	"github.com/skyhook-io/radar/pkg/topology"
@@ -30,13 +30,13 @@ import (
 // per-hit between a namespaced and a cluster-wide index — search
 // returns mixed kinds in one response, so a single index can't get
 // both right.
-func newResourceSummaryContextBuilder(namespaces []string) summarycontext.Builder {
-	provider := issues.NewCacheProvider()
+func newResourceSummaryContextBuilder(ctx context.Context, namespaces []string) summarycontext.Builder {
+	provider := mcpIssuesProvider(ctx)
 	if provider == nil {
 		return nil
 	}
 	idx := summarycontext.BuildIssueIndex(provider, namespaces)
-	return summarycontext.BuilderFromIndexes(buildSummaryContextTopology(namespaces), idx, idx)
+	return summarycontext.BuilderFromIndexes(buildSummaryContextTopology(ctx, namespaces), idx, idx)
 }
 
 // newSearchSummaryContextBuilder is the MCP search variant. Mirrors
@@ -46,8 +46,8 @@ func newResourceSummaryContextBuilder(namespaces []string) summarycontext.Builde
 // canReadClusterScopedKind) already gates which cluster-scoped kinds
 // are reachable, so composing the cluster-wide index doesn't leak
 // rows the user can't see.
-func newSearchSummaryContextBuilder(scanNamespaces []string) summarycontext.Builder {
-	provider := issues.NewCacheProvider()
+func newSearchSummaryContextBuilder(ctx context.Context, scanNamespaces []string) summarycontext.Builder {
+	provider := mcpIssuesProvider(ctx)
 	if provider == nil {
 		return nil
 	}
@@ -56,7 +56,7 @@ func newSearchSummaryContextBuilder(scanNamespaces []string) summarycontext.Buil
 	if scanNamespaces != nil {
 		clusterIdx = summarycontext.BuildIssueIndex(provider, nil)
 	}
-	return summarycontext.BuilderFromIndexes(buildSummaryContextTopology(scanNamespaces), namespacedIdx, clusterIdx)
+	return summarycontext.BuilderFromIndexes(buildSummaryContextTopology(ctx, scanNamespaces), namespacedIdx, clusterIdx)
 }
 
 // summaryCtxTopoMemo caches topology builds across summary-context list and
@@ -75,14 +75,28 @@ var summaryCtxTopoMemo = topology.NewMemoizer(5 * time.Second)
 // resolving managedBy pointers, reusing a cached snapshot when one is
 // fresh. Returns nil on failure — the caller falls back to a
 // managedBy-less ResourceSummaryContext rather than failing the response.
-func buildSummaryContextTopology(namespaces []string) *topology.Topology {
-	cache := k8s.GetResourceCache()
-	if cache == nil {
-		return nil
-	}
+func buildSummaryContextTopology(ctx context.Context, namespaces []string) *topology.Topology {
 	opts := topology.DefaultBuildOptions()
 	if len(namespaces) > 0 {
 		opts.Namespaces = namespaces
+	}
+	// The memo is keyed by build options alone, so a pool context builds
+	// directly rather than share (or poison) the default cluster's entry.
+	if e := mcpNonDefaultEntry(ctx); e != nil {
+		if e.Cache == nil {
+			return nil
+		}
+		topo, err := topology.NewBuilder(k8s.NewTopologyResourceProvider(e.Cache)).
+			WithDynamic(k8s.NewTopologyDynamicProvider(e.DynCache, e.Discovery)).
+			Build(opts)
+		if err != nil {
+			return nil
+		}
+		return topo
+	}
+	cache := k8s.GetResourceCache()
+	if cache == nil {
+		return nil
 	}
 	topo, err := summaryCtxTopoMemo.Get(opts, func() (*topology.Topology, error) {
 		builder := topology.NewBuilder(k8s.NewTopologyResourceProvider(cache)).

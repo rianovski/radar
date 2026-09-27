@@ -46,14 +46,19 @@ type CacheProvider struct {
 // NewCacheProvider returns a Provider over the live radar caches, or
 // nil if the typed cache isn't ready (cluster connection still pending).
 func NewCacheProvider() *CacheProvider {
-	cache := k8s.GetResourceCache()
+	return NewCacheProviderFor(k8s.GetResourceCache(), k8s.GetDynamicResourceCache(), k8s.GetResourceDiscovery())
+}
+
+// NewCacheProviderFor is NewCacheProvider over explicit caches — a per-user
+// pool context's. Returns nil when cache is nil.
+func NewCacheProviderFor(cache *k8s.ResourceCache, dynamic *k8s.DynamicResourceCache, discovery *k8s.ResourceDiscovery) *CacheProvider {
 	if cache == nil {
 		return nil
 	}
 	return &CacheProvider{
 		cache:     cache,
-		dynamic:   k8s.GetDynamicResourceCache(),
-		discovery: k8s.GetResourceDiscovery(),
+		dynamic:   dynamic,
+		discovery: discovery,
 	}
 }
 

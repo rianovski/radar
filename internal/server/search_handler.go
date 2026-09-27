@@ -28,7 +28,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	parsed := search.Parse(q)
 
-	provider := search.NewCacheProvider()
+	provider := s.searchProviderFor(r)
 	if provider == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
@@ -127,7 +127,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	// (CanReadClusterScoped) already constrains which cluster-scoped
 	// kinds are reachable.
 	if r.URL.Query().Get("context") != "none" {
-		if builder := s.newSearchSummaryContextBuilder(scanNamespaces); builder != nil {
+		if builder := s.newSearchSummaryContextBuilder(r, scanNamespaces); builder != nil {
 			opts.SummaryBuilder = search.SummaryBuilderFunc(builder)
 		}
 	}

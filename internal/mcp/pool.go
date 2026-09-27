@@ -5,7 +5,10 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/skyhook-io/radar/internal/helm"
+	"github.com/skyhook-io/radar/internal/issues"
 	"github.com/skyhook-io/radar/internal/k8s"
+	"github.com/skyhook-io/radar/internal/search"
 	"github.com/skyhook-io/radar/pkg/auth"
 )
 
@@ -70,4 +73,49 @@ func mcpPermScope(username string) (key string, client kubernetes.Interface) {
 		return username, c
 	}
 	return username, nil
+}
+
+// mcpNonDefaultEntry is the caller's pool entry when it targets a context other
+// than the process-global default, else nil.
+func mcpNonDefaultEntry(ctx context.Context) *k8s.PoolEntry {
+	if mcpPool == nil || mcpPool.ContextForUser(mcpUsername(ctx)) == k8s.GetContextName() {
+		return nil
+	}
+	if e := mcpEntry(ctx); e != nil && e.ContextName != k8s.GetContextName() {
+		return e
+	}
+	return nil
+}
+
+// mcpHelmClient returns the Helm client bound to the caller's context.
+func mcpHelmClient(ctx context.Context) *helm.Client {
+	c := helm.GetClient()
+	if e := mcpNonDefaultEntry(ctx); e != nil {
+		return c.ForContext(e.RestConfig, e.ContextName, e.Cache)
+	}
+	return c
+}
+
+// mcpContextName is the caller's pool context, or "" for the default one.
+func mcpContextName(ctx context.Context) string {
+	if e := mcpNonDefaultEntry(ctx); e != nil {
+		return e.ContextName
+	}
+	return ""
+}
+
+// mcpIssuesProvider is the issues engine's provider over the caller's caches.
+func mcpIssuesProvider(ctx context.Context) *issues.CacheProvider {
+	if e := mcpNonDefaultEntry(ctx); e != nil {
+		return issues.NewCacheProviderFor(e.Cache, e.DynCache, e.Discovery)
+	}
+	return issues.NewCacheProvider()
+}
+
+// mcpSearchProvider is the search provider over the caller's caches.
+func mcpSearchProvider(ctx context.Context) *search.CacheProvider {
+	if e := mcpNonDefaultEntry(ctx); e != nil {
+		return search.NewCacheProviderFor(e.Cache, e.DynCache, e.Discovery)
+	}
+	return search.NewCacheProvider()
 }

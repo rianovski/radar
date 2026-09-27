@@ -17,7 +17,7 @@ func helmRecentChangesForContext(ctx context.Context, input getChangesInput, sin
 	if input.Kind != "" && !issues.KindFilterIncludes([]string{input.Kind}, "HelmRelease", "helmreleases") {
 		return nil, nil
 	}
-	helmClient := helm.GetClient()
+	helmClient := mcpHelmClient(ctx)
 	if helmClient == nil {
 		return nil, nil
 	}

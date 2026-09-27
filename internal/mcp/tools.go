@@ -965,7 +965,7 @@ func handleListResources(ctx context.Context, req *mcp.CallToolRequest, input li
 		if clusterScoped {
 			idxNamespaces = nil
 		}
-		if builder := newResourceSummaryContextBuilder(idxNamespaces); builder != nil {
+		if builder := newResourceSummaryContextBuilder(ctx, idxNamespaces); builder != nil {
 			summarycontext.AttachToTypedList(results, objs, builder)
 		}
 	}
@@ -1005,7 +1005,7 @@ func listDynamicResources(ctx context.Context, cache *k8s.ResourceCache, kind, g
 		if clusterScoped {
 			idxNamespaces = nil
 		}
-		if builder := newResourceSummaryContextBuilder(idxNamespaces); builder != nil {
+		if builder := newResourceSummaryContextBuilder(ctx, idxNamespaces); builder != nil {
 			summarycontext.AttachToUnstructuredList(allItems, rawItems, builder)
 		}
 	}
@@ -2719,7 +2719,7 @@ func buildDashboard(ctx context.Context, cache *k8s.ResourceCache, namespace str
 	}
 
 	// Helm releases — sort failed-first before slicing
-	helmClient := helm.GetClient()
+	helmClient := mcpHelmClient(ctx)
 	if helmClient == nil {
 		d.HelmReleases.Unavailable = true
 		d.HelmReleases.UnavailableReason = "Helm client not initialized."
@@ -2980,7 +2980,7 @@ func countResources(cache *k8s.ResourceCache, namespace string, d *mcpDashboard,
 }
 
 func handleIssuesTool(ctx context.Context, _ *mcp.CallToolRequest, input issuesInput) (*mcp.CallToolResult, any, error) {
-	provider := issues.NewCacheProvider()
+	provider := mcpIssuesProvider(ctx)
 	if provider == nil {
 		return nil, nil, errNotConnected()
 	}
@@ -3092,7 +3092,7 @@ func nativeHelmIssuesForContext(ctx context.Context, namespaces []string, filter
 	if !issues.KindFilterIncludes(filters.Kinds, "HelmRelease", "helmreleases") {
 		return nil
 	}
-	helmClient := helm.GetClient()
+	helmClient := mcpHelmClient(ctx)
 	if helmClient == nil {
 		return nil
 	}
@@ -3252,7 +3252,7 @@ func mcpSearchSecretsRBAC(ctx context.Context, scanNamespaces []string) (decisio
 }
 
 func handleSearch(ctx context.Context, req *mcp.CallToolRequest, input searchInput) (*mcp.CallToolResult, any, error) {
-	provider := search.NewCacheProvider()
+	provider := mcpSearchProvider(ctx)
 	if provider == nil {
 		return nil, nil, errNotConnected()
 	}
@@ -3329,7 +3329,7 @@ func handleSearch(ctx context.Context, req *mcp.CallToolRequest, input searchInp
 	// builder routes per-hit by scope; CanReadClusterScoped above
 	// already gates which cluster-scoped kinds are reachable.
 	if input.Context != "none" {
-		if builder := newSearchSummaryContextBuilder(scanNamespaces); builder != nil {
+		if builder := newSearchSummaryContextBuilder(ctx, scanNamespaces); builder != nil {
 			opts.SummaryBuilder = search.SummaryBuilderFunc(builder)
 		}
 	}

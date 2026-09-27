@@ -60,6 +60,18 @@ func nsPreferenceKey(username, contextName string) string {
 	return username + "\x00" + contextName
 }
 
+// nsContextFor is the kubeconfig context username's namespace picks belong
+// to: their pool context when they have switched away from the default,
+// otherwise the process-global one.
+func (s *Server) nsContextFor(username string) string {
+	if s.pool != nil {
+		if c := s.pool.ContextForUser(username); c != "" && c != k8s.GetContextName() {
+			return c
+		}
+	}
+	return k8s.GetContextName()
+}
+
 // getActiveNamespaceForUserInContext returns this user's picks together with
 // the context they were read under, as one atomic snapshot. Read paths that
 // later mutate the pick must commit against the returned ctxName — capturing
@@ -70,7 +82,7 @@ func (s *Server) getActiveNamespaceForUserInContext(r *http.Request) (string, []
 	if u := auth.UserFromContext(r.Context()); u != nil {
 		username = u.Username
 	}
-	ctxName := k8s.GetContextName()
+	ctxName := s.nsContextFor(username)
 	if ctxName == "" {
 		return "", nil
 	}
@@ -89,7 +101,7 @@ func (s *Server) getActiveNamespaceForUser(r *http.Request) []string {
 	if u := auth.UserFromContext(r.Context()); u != nil {
 		username = u.Username
 	}
-	ctxName := k8s.GetContextName()
+	ctxName := s.nsContextFor(username)
 	if ctxName == "" {
 		return nil
 	}
@@ -108,7 +120,7 @@ func (s *Server) setActiveNamespaceForUser(r *http.Request, namespaces []string)
 	if u := auth.UserFromContext(r.Context()); u != nil {
 		username = u.Username
 	}
-	ctxName := k8s.GetContextName()
+	ctxName := s.nsContextFor(username)
 	if ctxName == "" {
 		return
 	}
@@ -208,13 +220,13 @@ func (s *Server) invalidatePostContextSwitchCaches() {
 //     kubeconfig, so a kubens-style change is followed rather than frozen at
 //     first launch.
 func (s *Server) loadSavedNamespacePreference(r *http.Request) {
-	ctxName := k8s.GetContextName()
-	if ctxName == "" {
-		return
-	}
 	username := ""
 	if u := auth.UserFromContext(r.Context()); u != nil {
 		username = u.Username
+	}
+	ctxName := s.nsContextFor(username)
+	if ctxName == "" {
+		return
 	}
 	key := nsPreferenceKey(username, ctxName)
 	if _, ok := s.nsPreferences.Load(key); ok {
@@ -238,7 +250,7 @@ func (s *Server) loadSavedNamespacePreference(r *http.Request) {
 				// configured list. Seeding from disk also burns configured-
 				// seed eligibility, so a later prune eviction falls back to
 				// All namespaces instead of resurfacing --namespaces.
-				s.seedPick(ctxName, key, picks)
+				s.seedPick(username, ctxName, key, picks)
 			}
 			// An empty entry is the user's persisted explicit "All
 			// namespaces" choice — no seeding from flags or kubeconfig.
@@ -246,7 +258,7 @@ func (s *Server) loadSavedNamespacePreference(r *http.Request) {
 		}
 	}
 	if configured := k8s.ConfiguredNamespacesForCurrentContext(); len(configured) > 0 {
-		s.seedPick(ctxName, key, configured)
+		s.seedPick(username, ctxName, key, configured)
 		return
 	}
 	// Auth users don't inherit the operator's kubeconfig namespace, and under
@@ -267,7 +279,7 @@ func (s *Server) loadSavedNamespacePreference(r *http.Request) {
 	// cycle on every read.
 	seed = pruneToExistingNamespaces(seed, allNamespaceNames())
 	if len(seed) > 0 {
-		s.seedPick(ctxName, key, seed)
+		s.seedPick(username, ctxName, key, seed)
 	}
 }
 
@@ -280,10 +292,10 @@ func (s *Server) loadSavedNamespacePreference(r *http.Request) {
 // bare preference CAS is NOT enough here — an absent key means both "never
 // picked" (seed) and "explicitly cleared" (don't); the marker is what tells
 // them apart.
-func (s *Server) seedPick(ctxName, key string, picks []string) {
+func (s *Server) seedPick(username, ctxName, key string, picks []string) {
 	s.nsPickMu.Lock()
 	defer s.nsPickMu.Unlock()
-	if k8s.GetContextName() != ctxName {
+	if s.nsContextFor(username) != ctxName {
 		return
 	}
 	if _, considered := s.seededPicks.LoadOrStore(key, true); considered {
@@ -343,7 +355,7 @@ func (s *Server) commitPickMutation(r *http.Request, ctxName string, expected, s
 	// context) could compare against one context's pick and then store under
 	// another's. Skip if the context already moved on; otherwise read, compare,
 	// and write all under the same key.
-	if k8s.GetContextName() != ctxName {
+	if s.nsContextFor(usernameFrom(r)) != ctxName {
 		return
 	}
 	var current []string
@@ -671,7 +683,7 @@ func (s *Server) handleSetActiveNamespace(w http.ResponseWriter, r *http.Request
 	// Outside scope mode the pick is just a view filter, so a save failure is
 	// non-fatal — log and continue.
 	if auth.UserFromContext(r.Context()) == nil {
-		if ctxName := k8s.GetContextName(); ctxName != "" {
+		if ctxName := s.nsContextFor(""); ctxName != "" {
 			if err := persistNamespacePick(ctxName, cleaned, true); err != nil {
 				log.Printf("[namespace] failed to persist namespace pick for context %q: %v", ctxName, err)
 				if k8s.ForceNamespaceScope {
@@ -700,7 +712,7 @@ func (s *Server) handleSetActiveNamespace(w http.ResponseWriter, r *http.Request
 				// (rolled back to the previous namespace, or superseded by a newer op).
 				// Re-sync the saved pick to whatever scope is actually live now, so a
 				// later reconnect doesn't restore the namespace we just rejected.
-				if ctxName := k8s.GetContextName(); ctxName != "" {
+				if ctxName := s.nsContextFor(""); ctxName != "" {
 					var livePick []string
 					if live := k8s.GetNamespaceScopeTarget(); live != "" {
 						livePick = []string{live}

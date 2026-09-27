@@ -751,7 +751,7 @@ func relatedIssuesForObject(ctx context.Context, obj *unstructured.Unstructured)
 	if obj == nil {
 		return nil
 	}
-	provider := issues.NewCacheProvider()
+	provider := mcpIssuesProvider(ctx)
 	if provider == nil {
 		return nil
 	}

@@ -5,7 +5,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/skyhook-io/radar/internal/issues"
 	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/internal/trace"
 )
@@ -77,7 +76,7 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request) {
 		Cache:     k8s.GetResourceCache(),
 		Dynamic:   k8s.GetDynamicResourceCache(),
 		Discovery: k8s.GetResourceDiscovery(),
-		Issues:    issues.NewCacheProvider(),
+		Issues:    s.issuesProviderFor(r),
 		// Probes call services/proxy + pods/proxy on this client. Use the
 		// per-request impersonated identity (or the SA when auth is disabled)
 		// so the apiserver enforces the caller's RBAC on the proxy verbs -

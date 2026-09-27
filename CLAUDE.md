@@ -327,17 +327,11 @@ Concretely: when user A is on context X and user B is on context Y simultaneousl
 
 **Upstream merge (2026-09-27).** `skyhook-io/radar` main (v1.15 highlights, ~785 commits since the May fork point) was merged in. Upstream has no pool concept, so every feature it added reads the process globals — `internal/server` alone went from ~28 to ~200 `k8s.Get*()` calls. The merge kept every per-user path listed under "Already migrated" working and made Helm fully per-user, but the new upstream surfaces (issues, capacity, reachability, rollouts, policy, CNPG/Velero/Kyverno pages, timeline filters, upgrade readiness, etc.) show the default cluster to users on another context until migrated.
 
-**Priority 1 — `/api/packages` and `/api/issues` Helm rows.** With `helm.Client.ForContext` this is now small: pass `s.helmClientFor(r, helm.GetClient())` into `ListPackagesParams` (thread to `collectHelmReleases` in `internal/server/packages.go`) and use it in `internal/server/issues_handler.go` (`ListReleasesAcrossNamespaces`).
+**Priority 1 — Shared server helpers that read globals.** `listDynamicSynced` (`internal/server/policy_handlers.go`, used by policy/CNPG/Cilium pages), `k8s.ReadableCacheForKind` callers outside `gateResourceRead`, and `k8s.GetCachedPermissionResult()` (dashboard visibility summary). Timeline queries filter by the global `ActiveClusterContext()`; pool entries now stamp their own context name on recorded events, so a per-user filter only needs the query side.
 
-**Priority 2 — Namespace switcher preferences leak across contexts.** `internal/server/namespace_scope.go` keys picks with `k8s.GetContextName()`. Replace with `s.pool.ContextForUser(usernameFrom(r))` (falling back to `k8s.GetContextName()` when `s.pool == nil`).
+**Priority 2 — Remaining direct `k8s.GetClient()` / `GetConfig()` users.** `capacity.go` (`liveCapacityClusterIdentity`), `capacity_capability.go`, `selfupgrade.go` (Cloud-only), `usage_handlers.go`, and the MCP helpers that still read the global cache. Prefer `k8s.ServiceClientFromContext(ctx)` / `k8s.ClientFromContext(ctx)`, which follow the request's ClusterTarget.
 
-**Priority 3 — Search / Issues providers.** `internal/search/provider.go` and `internal/issues/provider.go` capture `k8s.GetResourceCache()` / `GetDynamicResourceCache()` / `GetResourceDiscovery()`. Refactor to take a per-request provider so the server can wire `s.cacheFor / s.dynCacheFor / s.discoveryFor`. Affects `/api/search/*`, `/api/issues`, and the issues shown in resource drawers.
-
-**Priority 4 — Shared server helpers that read globals.** `listDynamicSynced` (`internal/server/policy_handlers.go`, used by policy/CNPG/Cilium pages), `k8s.ReadableCacheForKind` callers outside `gateResourceRead`, and `k8s.GetCachedPermissionResult()` (dashboard visibility summary). Timeline queries filter by the global `ActiveClusterContext()`; pool entries now stamp their own context name on recorded events, so a per-user filter only needs the query side.
-
-**Priority 5 — Remaining direct `k8s.GetClient()` / `GetConfig()` users.** `capacity.go` (`liveCapacityClusterIdentity`), `capacity_capability.go`, `selfupgrade.go` (Cloud-only), `usage_handlers.go`, and the MCP helpers that still read the global cache. Prefer `k8s.ServiceClientFromContext(ctx)` / `k8s.ClientFromContext(ctx)`, which follow the request's ClusterTarget.
-
-**Priority 6 — Image inspector, Prometheus, OpenCost, Traffic.** Own connection state attached to the default cluster; lower priority because they degrade to "not configured".
+**Priority 3 — Image inspector, Prometheus, OpenCost, Traffic.** Own connection state attached to the default cluster; lower priority because they degrade to "not configured".
 
 ### The migration pattern (use this for every fix in this section)
 
@@ -375,6 +369,10 @@ See `helm.Client.ForContext` + `helm.Handlers.ContextResolver` + `server.helmTar
 | RBAC decisions (REST `canRead*`, namespace discovery, MCP permission checks, search/curl/upgrade-readiness SARs) | `s.permScope(username)` / `mcpPermScope(username)` for the cache key + SAR client; `k8s.ServiceClientFromContext(ctx)` for one-off SARs | a switched user's permission-cache key is `username\x01context`, so one cluster's RBAC never answers for another's |
 | MCP tools | `mcpCache(ctx)` / `mcpDynCache(ctx)` / `mcpDiscovery(ctx)` in `internal/mcp/pool.go`, wired via `mcp.SetPool` | only the tools that already used them; new upstream tools read globals |
 | `/api/connection` | per-user `context`, `clusterName`, `contexts[].isCurrent` | |
+| `/api/packages` (+ MCP `list_packages`) and native Helm rows in `/api/issues` | `ListPackagesParams.HelmClient` / `.ContextName` from `s.helmClientFor` / `s.nonDefaultContextName`; MCP `mcpHelmClient(ctx)` / `mcpContextName(ctx)` | the packages memo key is context-qualified |
+| MCP Helm tools (`list_helm_releases`, `get_helm_release`, Helm changes, dashboard/issue Helm rows) | `mcpHelmClient(ctx)` | |
+| Namespace switcher picks | `s.nsContextFor(username)` keys `nsPreferences` / seeding / persistence | a pick made on one context never applies to another |
+| Issues engine + search (`/api/issues`, resource issue summaries, diagnose, trace, reachability, capacity issues, GitOps insights, `/api/search`, summary contexts; MCP equivalents) | `s.issuesProviderFor(r)` / `s.searchProviderFor(r)`; MCP `mcpIssuesProvider(ctx)` / `mcpSearchProvider(ctx)`; `issues.NewCacheProviderFor` / `search.NewCacheProviderFor` | GitOps issues memo key is context-qualified; MCP summary topology skips its options-keyed memo for pool contexts |
 | Context switch + CAPI workload-cluster connect | `s.switchUserContext(r, name)` | with a pool only the requester moves; the global `PerformContextSwitch` path runs only when `s.pool == nil` |
 
 ### Still wired to global state — KNOWN BUGS, prioritized
@@ -382,13 +380,10 @@ See `helm.Client.ForContext` + `helm.Handlers.ContextResolver` + `server.helmTar
 Subsystems that ignore the user's context and always return / act on the default cluster's data. Listed by user-visibility:
 
 1. **Everything upstream added after the fork point that reads caches/discovery directly** — see "Next move" above. Client acquisition through the request-scoped helpers is already per-user.
-2. **Search provider (`internal/search/provider.go:26-33`)** — captures globals at init. `/api/search/*` returns default cluster's results.
-3. **Issues provider (`internal/issues/provider.go:28-35`)** — captures globals at init. Issues page shows default cluster's issues.
-4. **Namespace switcher prefs (`internal/server/namespace_scope.go:62,81,125,321`)** — key shape `username\x00contextName` uses `k8s.GetContextName()` instead of `pool.ContextForUser(username)`. Picks bleed across contexts.
-5. **Image inspector (`internal/images/auth.go:38,80,218`)** — pull secrets read via `k8s.GetResourceCache()`. Cluster audit's image checks use default cluster's pull secrets.
-6. **Traffic manager (`internal/traffic`)** — process singleton, Hubble connection to default cluster only.
-7. **Prometheus / OpenCost (`internal/prometheus/handlers.go:483`, `internal/opencost/handlers.go:381`)** — auto-discovery against default cluster only; charts always reflect default cluster.
-8. **Self-upgrade SAR** (`selfupgrade.go`) — Cloud-only path, still uses the global client.
+2. **Image inspector (`internal/images/auth.go:38,80,218`)** — pull secrets read via `k8s.GetResourceCache()`. Cluster audit's image checks use default cluster's pull secrets.
+3. **Traffic manager (`internal/traffic`)** — process singleton, Hubble connection to default cluster only.
+4. **Prometheus / OpenCost (`internal/prometheus/handlers.go:483`, `internal/opencost/handlers.go:381`)** — auto-discovery against default cluster only; charts always reflect default cluster.
+5. **Self-upgrade SAR** (`selfupgrade.go`) — Cloud-only path, still uses the global client.
 
 `internal/server/diagnostics.go:246`, `internal/mcp/tools.go:1379`, and `internal/server/server.go:2866` also call `k8s.GetClusterInfo` but those are correct as-is (diagnostics endpoint, MCP handler, and the legacy `PerformContextSwitch` fallback path which only fires when `s.pool == nil`).
 

@@ -43,7 +43,7 @@ type getHelmReleaseInput struct {
 // Helm tool handlers
 
 func handleListHelmReleases(ctx context.Context, req *mcp.CallToolRequest, input listHelmReleasesInput) (*mcp.CallToolResult, any, error) {
-	helmClient := helm.GetClient()
+	helmClient := mcpHelmClient(ctx)
 	if helmClient == nil {
 		return nil, nil, fmt.Errorf("helm is not available (no releases found or helm not installed)")
 	}
@@ -85,7 +85,7 @@ func resolveHelmListNamespaces(ctx context.Context, namespace string) []string {
 }
 
 func handleGetHelmRelease(ctx context.Context, req *mcp.CallToolRequest, input getHelmReleaseInput) (*mcp.CallToolResult, any, error) {
-	helmClient := helm.GetClient()
+	helmClient := mcpHelmClient(ctx)
 	if helmClient == nil {
 		return nil, nil, fmt.Errorf("helm is not available (no releases found or helm not installed)")
 	}

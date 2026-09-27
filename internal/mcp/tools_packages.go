@@ -54,11 +54,14 @@ func handleListPackages(ctx context.Context, req *mcp.CallToolRequest, input lis
 	// nil = all-namespace access; empty = no access (ListPackages returns empty).
 	namespaces := filterNamespacesForUser(ctx, requested)
 	resp, err := server.ListPackages(ctx, server.ListPackagesParams{
-		Namespaces: namespaces,
-		Source:     normalizeMCPPackageSourceFilter(input.Source),
-		Chart:      input.Chart,
-		User:       user,
-		Groups:     groups,
+		Namespaces:  namespaces,
+		Source:      normalizeMCPPackageSourceFilter(input.Source),
+		Chart:       input.Chart,
+		User:        user,
+		Groups:      groups,
+		Cache:       mcpCache(ctx),
+		HelmClient:  mcpHelmClient(ctx),
+		ContextName: mcpContextName(ctx),
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("packages: %w", err)

@@ -175,7 +175,11 @@ func (s *Server) resolveGitOpsTree(r *http.Request, req *gitopsRequest) (*gitops
 		return s.canAccessGitOpsRef(r, req, group, kind, namespace, name, false)
 	}
 	resolver := newInsightsResolver(r.Context(), req.Cache, req.AllowedNamespaces, canAccess)
+	resolver.issues = s.issuesProviderFor(r)
 	memoKey := gitopsIssuesMemoKey(auth.UserFromContext(r.Context()), req.AllowedNamespaces)
+	if ctxName := s.nonDefaultContextName(r); ctxName != "" {
+		memoKey = ctxName + "\x01" + memoKey
+	}
 	resolver.composed = func() ([]issues.Issue, []issues.Issue) {
 		return s.gitopsIssuesMemo.load(memoKey, resolver.composeIssues)
 	}
@@ -482,8 +486,7 @@ var managedScanDenyList = map[string]bool{
 // Empty discovery (boot-time race or a degraded cluster) returns nil;
 // caller surfaces it as "discovery unavailable" rather than silently
 // scanning nothing.
-func managedScanKindsFromDiscovery() []managedScanKind {
-	disc := k8s.GetResourceDiscovery()
+func managedScanKindsFromDiscovery(disc *k8s.ResourceDiscovery) []managedScanKind {
 	if disc == nil {
 		return nil
 	}
@@ -553,7 +556,7 @@ func (s *Server) handleGitOpsManagedResources(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	cache := k8s.GetResourceCache()
+	cache := s.cacheFor(r)
 	if cache == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
@@ -566,7 +569,7 @@ func (s *Server) handleGitOpsManagedResources(w http.ResponseWriter, r *http.Req
 	// scan deny-list keeps the list focused (drops descendants like
 	// Pod/ReplicaSet that are walked from owners separately, and
 	// platform-internal noise like Events/Leases).
-	scanKinds := managedScanKindsFromDiscovery()
+	scanKinds := managedScanKindsFromDiscovery(s.discoveryFor(r))
 	if len(scanKinds) == 0 {
 		// Discovery is unavailable (boot-time race or degraded cluster).
 		// Surface to caller rather than scanning nothing silently.
@@ -834,8 +837,11 @@ func namespaceAllowedForGitOps(allowed []string, namespace string) bool {
 // pkg/gitops/insights API. Per-request: ctx + namespace allowlist captured
 // once at construction; lookups are namespace-filtered to enforce RBAC.
 type insightsResolver struct {
-	ctx               context.Context
-	cache             *k8s.ResourceCache
+	ctx   context.Context
+	cache *k8s.ResourceCache
+	// issues is the issues-engine provider over the request's cluster; nil
+	// uses the process-global caches.
+	issues            *issues.CacheProvider
 	allowedNamespaces []string
 	canAccess         func(group, kind, namespace, name string) bool
 
@@ -1136,7 +1142,11 @@ func (r *insightsResolver) RecentEvents(group, kind, namespace, name string) []g
 // composeIssues runs the cluster-wide issues engine for this request's
 // namespaces, redacting related refs the caller can't read.
 func (r *insightsResolver) composeIssues() ([]issues.Issue, []issues.Issue) {
-	flat := issues.Compose(issues.NewCacheProvider(), issues.Filters{
+	provider := r.issues
+	if provider == nil {
+		provider = issues.NewCacheProvider()
+	}
+	flat := issues.Compose(provider, issues.Filters{
 		SkipPodTemplateContext: true,
 		Namespaces:             r.allowedNamespaces,
 		Limit:                  issues.NoLimit,

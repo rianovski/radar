@@ -443,7 +443,7 @@ func handleDiagnose(ctx context.Context, _ *mcp.CallToolRequest, input diagnoseI
 
 	resp.StartupBlockers = startupBlockersForWorkload(cache, kindNorm, canonicalGroup, input.Namespace, input.Name, pods)
 	if len(resp.RelatedIssues) > 0 || len(resp.StartupBlockers) > 0 {
-		if p := issues.NewCacheProvider(); p != nil {
+		if p := mcpIssuesProvider(ctx); p != nil {
 			resp.ChangeContext = p.ChangeContextForIssue(issues.Issue{
 				Group:     canonicalGroup,
 				Kind:      canonicalKind,
@@ -609,7 +609,7 @@ func handleGitOpsDiagnose(ctx context.Context, input diagnoseInput, canonicalKin
 	resp := diagnoseResponse{
 		Resource:        minified,
 		GitOpsDiagnosis: gd,
-		RelatedIssues: issues.RelatedIssues(issues.NewCacheProvider(), issues.RelatedIssueOptions{
+		RelatedIssues: issues.RelatedIssues(mcpIssuesProvider(ctx), issues.RelatedIssueOptions{
 			Namespaces:           issueNamespacesForResource(input.Namespace),
 			CanReadClusterScoped: issueClusterScopedAccess(ctx),
 			CanReadRelated:       issueRelatedResourceAccess(ctx),
@@ -1095,7 +1095,7 @@ func handleNetworkTraceDiagnose(ctx context.Context, input diagnoseInput, kind s
 		Cache:     cache,
 		Dynamic:   k8s.GetDynamicResourceCache(),
 		Discovery: k8s.GetResourceDiscovery(),
-		Issues:    issues.NewCacheProvider(),
+		Issues:    mcpIssuesProvider(ctx),
 		// Probes call services/proxy + pods/proxy on this client. Use the
 		// per-request impersonated identity (or the SA when auth is disabled)
 		// so the apiserver enforces the caller's RBAC on the proxy verbs.

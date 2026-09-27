@@ -177,6 +177,13 @@ type ListPackagesParams struct {
 	Groups []string
 	// Cache is the per-user resource cache. nil falls back to the global cache.
 	Cache *k8s.ResourceCache
+	// HelmClient reads Helm releases for the caller's cluster. nil falls back
+	// to the global client.
+	HelmClient *helm.Client
+	// ContextName is the caller's pool context when it is not the default
+	// one. It scopes the shared result memo so one cluster's inventory is
+	// never served for another's.
+	ContextName string
 }
 
 // ErrInvalidSourceCode is returned when ListPackagesParams.Source is set
@@ -209,6 +216,9 @@ func ListPackages(ctx context.Context, p ListPackagesParams) (PackagesResponse, 
 	}
 
 	cacheKey := packagesCacheKeyFor(p.Namespaces)
+	if p.ContextName != "" {
+		cacheKey = p.ContextName + "\x01" + cacheKey
+	}
 	packagesCacheMu.Lock()
 	entry, hit := packagesCache[cacheKey]
 	packagesCacheMu.Unlock()
@@ -222,7 +232,7 @@ func ListPackages(ctx context.Context, p ListPackagesParams) (PackagesResponse, 
 		generatedAt = entry.at
 	} else {
 		var err error
-		rows, sourceErrs, err = computePackagesInternal(ctx, p.Namespaces, p.Cache)
+		rows, sourceErrs, err = computePackagesInternal(ctx, p.Namespaces, p.Cache, p.HelmClient)
 		if err != nil {
 			return PackagesResponse{}, err
 		}
@@ -321,12 +331,14 @@ func (s *Server) handleListPackages(w http.ResponseWriter, r *http.Request) {
 	namespaces := s.parseNamespacesForUser(r)
 	user, groups := userCredsForPackages(r)
 	resp, err := ListPackages(r.Context(), ListPackagesParams{
-		Namespaces: namespaces,
-		Source:     r.URL.Query().Get("source"),
-		Chart:      r.URL.Query().Get("chart"),
-		User:       user,
-		Groups:     groups,
-		Cache:      s.cacheFor(r),
+		Namespaces:  namespaces,
+		Source:      r.URL.Query().Get("source"),
+		Chart:       r.URL.Query().Get("chart"),
+		User:        user,
+		Groups:      groups,
+		Cache:       s.cacheFor(r),
+		HelmClient:  s.helmClientFor(r, helm.GetClient()),
+		ContextName: s.nonDefaultContextName(r),
 	})
 	if err != nil {
 		if errors.Is(err, errResourceCacheUnavailable) {
@@ -353,7 +365,7 @@ func (s *Server) handleListPackages(w http.ResponseWriter, r *http.Request) {
 // cloud-mode (see the helm comment below for the rationale). User
 // identity does still flow through ListPackagesParams for cache
 // scoping and for sensitive Helm endpoints invoked elsewhere.
-func computePackagesInternal(ctx context.Context, namespaces []string, cache *k8s.ResourceCache) ([]packages.PackageRow, []SourceError, error) {
+func computePackagesInternal(ctx context.Context, namespaces []string, cache *k8s.ResourceCache, helmClient *helm.Client) ([]packages.PackageRow, []SourceError, error) {
 	if cache == nil {
 		cache = k8s.GetResourceCache()
 	}
@@ -370,7 +382,7 @@ func computePackagesInternal(ctx context.Context, namespaces []string, cache *k8
 	// secrets, so impersonating would 403 viewers on inventory metadata
 	// that isn't credential data). Sensitive Helm reads (GetValues,
 	// GetManifest) and all writes still impersonate.
-	helmReleases, helmErrs := collectHelmReleases(namespaces, "", nil)
+	helmReleases, helmErrs := collectHelmReleases(helmClient, namespaces, "", nil)
 	src.Helm = helmReleases
 	errs = append(errs, helmErrs...)
 
@@ -450,7 +462,7 @@ func computePackagesInternal(ctx context.Context, namespaces []string, cache *k8
 // multi-namespace → one call per namespace; per-namespace forbidden
 // errors are coalesced into one SourceError so a user with access to
 // ns-a but not ns-b still sees ns-a's releases.
-func collectHelmReleases(namespaces []string, user string, groups []string) ([]packages.HelmRelease, []SourceError) {
+func collectHelmReleases(hClient *helm.Client, namespaces []string, user string, groups []string) ([]packages.HelmRelease, []SourceError) {
 	// Defensive: empty (non-nil) slice means "no namespaces authorized";
 	// callers should short-circuit before reaching here, but guard
 	// against a future caller that forgets and would otherwise fall
@@ -458,7 +470,9 @@ func collectHelmReleases(namespaces []string, user string, groups []string) ([]p
 	if namespaces != nil && len(namespaces) == 0 {
 		return nil, nil
 	}
-	hClient := helm.GetClient()
+	if hClient == nil {
+		hClient = helm.GetClient()
+	}
 	if hClient == nil {
 		return nil, []SourceError{{
 			Source: packages.SourceHelm,

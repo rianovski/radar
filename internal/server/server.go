@@ -49,9 +49,11 @@ import (
 	"github.com/skyhook-io/radar/internal/helm"
 	"github.com/skyhook-io/radar/internal/images"
 	"github.com/skyhook-io/radar/internal/investigationrefs"
+	"github.com/skyhook-io/radar/internal/issues"
 	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/internal/opencost"
 	prometheuspkg "github.com/skyhook-io/radar/internal/prometheus"
+	"github.com/skyhook-io/radar/internal/search"
 	"github.com/skyhook-io/radar/internal/settings"
 	"github.com/skyhook-io/radar/internal/timeline"
 	"github.com/skyhook-io/radar/internal/traffic"
@@ -1317,6 +1319,32 @@ func (s *Server) clusterTargetMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// nonDefaultContextName is the requesting user's pool context, or "" when it
+// is the process-global default.
+func (s *Server) nonDefaultContextName(r *http.Request) string {
+	if e := s.nonDefaultEntryFor(r); e != nil {
+		return e.ContextName
+	}
+	return ""
+}
+
+// issuesProviderFor is the issues engine's provider over the requesting
+// user's caches.
+func (s *Server) issuesProviderFor(r *http.Request) *issues.CacheProvider {
+	if e := s.nonDefaultEntryFor(r); e != nil {
+		return issues.NewCacheProviderFor(e.Cache, e.DynCache, e.Discovery)
+	}
+	return issues.NewCacheProvider()
+}
+
+// searchProviderFor is the search provider over the requesting user's caches.
+func (s *Server) searchProviderFor(r *http.Request) *search.CacheProvider {
+	if e := s.nonDefaultEntryFor(r); e != nil {
+		return search.NewCacheProviderFor(e.Cache, e.DynCache, e.Discovery)
+	}
+	return search.NewCacheProvider()
 }
 
 // snapshotCachesFor is k8s.SnapshotCaches for the requesting user. A

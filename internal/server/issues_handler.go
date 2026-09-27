@@ -58,7 +58,7 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
 	}
-	provider := issues.NewCacheProvider()
+	provider := s.issuesProviderFor(r)
 	if provider == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
@@ -211,7 +211,7 @@ func (s *Server) nativeHelmIssuesForRequest(r *http.Request, namespaces []string
 			return nil
 		}
 	}
-	releases, err := helmClient.ListReleasesAcrossNamespaces(helmNamespaces, username, groups)
+	releases, err := s.helmClientFor(r, helmClient).ListReleasesAcrossNamespaces(helmNamespaces, username, groups)
 	if err != nil {
 		if !helm.IsForbiddenError(err) {
 			log.Printf("[issues] Failed to list Helm releases for issue stream: %v", err)
@@ -235,7 +235,7 @@ func (s *Server) handleResourceIssues(w http.ResponseWriter, r *http.Request) {
 	if !s.requireConnected(w) {
 		return
 	}
-	provider := issues.NewCacheProvider()
+	provider := s.issuesProviderFor(r)
 	if provider == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "Resource cache not available")
 		return
