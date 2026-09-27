@@ -490,6 +490,7 @@ func (s *Server) setupAppRoutes(r chi.Router) {
 	if s.authConfig.Enabled() {
 		r.Use(auth.Authenticate(s.authConfig))
 	}
+	r.Use(s.clusterTargetMiddleware)
 
 	// Auth routes
 	if s.oidcHandler != nil {
@@ -1296,10 +1297,26 @@ func (s *Server) entryFor(r *http.Request) *k8s.PoolEntry {
 // targets a context other than the process-global default. Callers use the
 // global accessors otherwise, so the default-context path stays unchanged.
 func (s *Server) nonDefaultEntryFor(r *http.Request) *k8s.PoolEntry {
+	if s.pool == nil || s.pool.ContextForUser(usernameFrom(r)) == k8s.GetContextName() {
+		return nil
+	}
 	if e := s.entryFor(r); e != nil && e.ContextName != k8s.GetContextName() {
 		return e
 	}
 	return nil
+}
+
+// clusterTargetMiddleware binds requests from users on a non-default pool
+// context to that context, so request-scoped client helpers
+// (k8s.ClientFromContext, getClientForRequest, …) reach the user's cluster.
+// Default-context requests pass through unbound.
+func (s *Server) clusterTargetMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if e := s.nonDefaultEntryFor(r); e != nil {
+			r = r.WithContext(k8s.WithClusterTarget(r.Context(), e.Target()))
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // snapshotCachesFor is k8s.SnapshotCaches for the requesting user. A
@@ -1792,6 +1809,33 @@ func (s *Server) prometheusAuthGate(req *http.Request, group, resource, namespac
 // an empty namespace makes the SubjectAccessReview an all-namespaces check
 // ("may the user list pods cluster-wide?"), which is how cluster-wide
 // surfaces are gated.
+// permScope resolves, in one step, the permission-cache key and the
+// ServiceAccount client that SubjectAccessReviews must use for username. A
+// user on a non-default pool context gets a context-qualified key and that
+// cluster's client, so one cluster's RBAC never answers for another's. \x01
+// cannot appear in a Kubernetes username, so the qualified key can't collide
+// with a real one.
+func (s *Server) permScope(username string) (key string, client kubernetes.Interface) {
+	if s.pool != nil {
+		if ctxName := s.pool.ContextForUser(username); ctxName != "" && ctxName != k8s.GetContextName() {
+			if e := s.pool.EntryForContext(ctxName); e != nil && e.Client != nil {
+				return username + "\x01" + ctxName, e.Client
+			}
+			return username + "\x01" + ctxName, nil
+		}
+	}
+	if c := k8s.GetClient(); c != nil {
+		return username, c
+	}
+	return username, nil
+}
+
+// permsFor returns the cached permissions for user in their current context.
+func (s *Server) permsFor(user *auth.User) *auth.UserPermissions {
+	key, _ := s.permScope(user.Username)
+	return s.permCache.Get(key, user.Groups)
+}
+
 func (s *Server) canRead(r *http.Request, group, resource, namespace, verb string) bool {
 	allowed, _ := s.canReadDecision(r, group, resource, namespace, verb)
 	return allowed
@@ -1802,7 +1846,7 @@ func (s *Server) canReadDecision(r *http.Request, group, resource, namespace, ve
 	if user == nil || s.permCache == nil {
 		return true, true
 	}
-	if s.permCache.Get(user.Username, user.Groups) == nil {
+	if s.permsFor(user) == nil {
 		// Trigger namespace discovery so SAR cache has a parent UserPermissions
 		// entry. parseNamespacesForUser is the canonical path that populates
 		// this; if it hasn't run yet, canReadUser falls through to a fresh SAR.
@@ -1831,13 +1875,14 @@ func (s *Server) canReadUserDecision(ctx context.Context, user *auth.User, group
 	if user == nil || s.permCache == nil {
 		return true, true
 	}
-	perms := s.permCache.Get(user.Username, user.Groups)
+	key, client := s.permScope(user.Username)
+	perms := s.permCache.Get(key, user.Groups)
 	if perms != nil {
 		if v, ok := perms.CanI(verb, group, resource, namespace); ok {
 			return v, true
 		}
 	}
-	allowed, authoritative := s.canReadUserSAR(ctx, user, group, resource, namespace, verb)
+	allowed, authoritative := s.canReadUserSARWith(ctx, client, user, group, resource, namespace, verb)
 	// Cache only a real apiserver verdict. A transient failure (no client, SAR
 	// error, timeout) fails closed for this call but must NOT be memoized, or a
 	// momentary blip would deny the tuple for the whole cache TTL.
@@ -1861,7 +1906,11 @@ func (s *Server) canReadUserDecision(ctx context.Context, user *auth.User, group
 // because the SSE memo, not the shared cache, is what a long-lived stream reads.
 // A fresh SAR keeps the SSE staleness bounded to that memo's TTL alone.
 func (s *Server) canReadUserSAR(ctx context.Context, user *auth.User, group, resource, namespace, verb string) (allowed bool, authoritative bool) {
-	client := k8s.GetClient()
+	_, client := s.permScope(user.Username)
+	return s.canReadUserSARWith(ctx, client, user, group, resource, namespace, verb)
+}
+
+func (s *Server) canReadUserSARWith(ctx context.Context, client kubernetes.Interface, user *auth.User, group, resource, namespace, verb string) (allowed bool, authoritative bool) {
 	if client == nil {
 		// Fail-closed: no apiserver to ask, refuse rather than quietly
 		// serving from the cache.
@@ -4233,7 +4282,7 @@ func (s *Server) filterEventsByRBAC(r *http.Request, events []timeline.TimelineE
 
 	// Prime the parent UserPermissions entry once so the parallel canReadUser
 	// calls below share its SAR memo instead of racing to populate it.
-	if s.permCache.Get(user.Username, user.Groups) == nil {
+	if s.permsFor(user) == nil {
 		_ = s.getUserNamespaces(r, []string{})
 	}
 
@@ -5413,6 +5462,9 @@ func (s *Server) getDynamicClientForRequest(r *http.Request) dynamic.Interface {
 }
 
 func (s *Server) getDynamicClientSnapshotForRequest(r *http.Request) (dynamic.Interface, string) {
+	if t := k8s.ClusterTargetFromContext(r.Context()); t != nil {
+		return k8s.DynamicClientFromContext(r.Context()), t.ContextName
+	}
 	if user := auth.UserFromContext(r.Context()); user != nil {
 		client, contextName, err := k8s.ImpersonatedDynamicClientSnapshot(user.Username, user.Groups)
 		if err != nil {
@@ -5433,6 +5485,9 @@ func (s *Server) getConfigForRequest(r *http.Request) *rest.Config {
 }
 
 func (s *Server) getConfigSnapshotForRequest(r *http.Request) (*rest.Config, string) {
+	if t := k8s.ClusterTargetFromContext(r.Context()); t != nil {
+		return k8s.ConfigFromContext(r.Context()), t.ContextName
+	}
 	if user := auth.UserFromContext(r.Context()); user != nil {
 		cfg, contextName, err := k8s.ImpersonatedConfigSnapshot(user.Username, user.Groups)
 		if err != nil {
@@ -5448,6 +5503,9 @@ func (s *Server) getConfigSnapshotForRequest(r *http.Request) (*rest.Config, str
 // or the shared client when auth is disabled. Returns nil if impersonation fails
 // (never falls back to the ServiceAccount client). Callers must handle nil.
 func (s *Server) getClientForRequest(r *http.Request) kubernetes.Interface {
+	if k8s.ClusterTargetFromContext(r.Context()) != nil {
+		return k8s.ClientFromContext(r.Context())
+	}
 	if user := auth.UserFromContext(r.Context()); user != nil {
 		client, err := k8s.ImpersonatedClient(user.Username, user.Groups)
 		if err != nil {
@@ -5467,6 +5525,9 @@ func (s *Server) getClientForRequest(r *http.Request) kubernetes.Interface {
 }
 
 func (s *Server) getClientSafetySnapshotForRequest(r *http.Request) (kubernetes.Interface, string) {
+	if t := k8s.ClusterTargetFromContext(r.Context()); t != nil {
+		return k8s.ClientFromContext(r.Context()), "pool:" + t.ContextName
+	}
 	if user := auth.UserFromContext(r.Context()); user != nil {
 		client, binding, err := k8s.ImpersonatedClientSafetySnapshot(user.Username, user.Groups)
 		if err != nil {
@@ -5491,14 +5552,14 @@ func (s *Server) getUserNamespaces(r *http.Request, requested []string) []string
 		return requested
 	}
 
-	perms := s.permCache.Get(user.Username, user.Groups)
+	permKey, client := s.permScope(user.Username)
+	perms := s.permCache.Get(permKey, user.Groups)
 	if perms != nil {
 		log.Printf("[auth] Using cached permissions for %s: allowed=%v", user.Username, perms.AllowedNamespaces == nil)
 	}
 	if perms == nil {
 		log.Printf("[auth] No cached permissions for %s — discovering namespaces", user.Username)
 		// Discover namespaces synchronously on first request
-		client := k8s.GetClient()
 		if client == nil {
 			log.Printf("[auth] K8s client not available for namespace discovery (user=%s) — denying access", k8s.SanitizeForLog(user.Username))
 			return []string{} // fail-closed: cannot verify permissions
@@ -5534,7 +5595,7 @@ func (s *Server) getUserNamespaces(r *http.Request, requested []string) []string
 
 		log.Printf("[auth] DiscoverNamespaces result for %s: allowed=%v (nil=all, []=none)", user.Username, allowed)
 		perms = &auth.UserPermissions{AllowedNamespaces: allowed}
-		s.permCache.Set(user.Username, user.Groups, perms)
+		s.permCache.Set(permKey, user.Groups, perms)
 	}
 
 	return auth.FilterNamespacesForUser(requested, user, perms)
@@ -5588,7 +5649,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	// available) so the closure's canReadUser calls hit the memo. When auth is
 	// off, UserFromContext is nil and canReadUser short-circuits to allow.
 	user := auth.UserFromContext(r.Context())
-	if user != nil && s.permCache != nil && s.permCache.Get(user.Username, user.Groups) == nil {
+	if user != nil && s.permCache != nil && s.permsFor(user) == nil {
 		_ = s.getUserNamespaces(r, []string{})
 	}
 	s.broadcasterFor(usernameFrom(r)).HandleSSE(w, r, deny, s.newSSEChangeAuthorizer(r.Context(), user))

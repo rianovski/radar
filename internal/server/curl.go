@@ -98,7 +98,7 @@ func (s *Server) authorizeCurl(ctx context.Context, r *http.Request, namespace, 
 	if user == nil {
 		return true, nil
 	}
-	client := k8s.GetClient()
+	client := k8s.ServiceClientFromContext(ctx)
 	if client == nil {
 		return false, fmt.Errorf("k8s client not initialized")
 	}

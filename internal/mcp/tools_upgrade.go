@@ -128,7 +128,7 @@ func (a mcpUpgradeAuthorizer) CanGetSubresource(group, resource, subresource str
 	if user == nil {
 		return upgrade.EvidenceAuthorizationDecision{Allowed: true, Authoritative: true}
 	}
-	client := k8s.GetClient()
+	client := k8s.ServiceClientFromContext(a.ctx)
 	if client == nil {
 		return upgrade.EvidenceAuthorizationDecision{}
 	}

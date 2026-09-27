@@ -83,7 +83,7 @@ func (s *Server) canReadSubresourceDecision(r *http.Request, group, resource, su
 	if user == nil {
 		return true, true
 	}
-	client := k8s.GetClient()
+	client := k8s.ServiceClientFromContext(r.Context())
 	if client == nil {
 		return false, false
 	}

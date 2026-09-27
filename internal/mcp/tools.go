@@ -3184,7 +3184,7 @@ func mcpSearchSkipKinds(ctx context.Context) map[string]bool {
 	if user == nil {
 		return nil
 	}
-	client := k8s.GetClient()
+	client := k8s.ServiceClientFromContext(ctx)
 	if client == nil {
 		out := make(map[string]bool, len(mcpSensitiveSearchKinds))
 		for _, k := range mcpSensitiveSearchKinds {

@@ -104,11 +104,11 @@ func resolveUserPerms(ctx context.Context) (*pkgauth.User, *pkgauth.UserPermissi
 		return nil, nil
 	}
 	cache := getPermCache()
-	if perms := cache.Get(user.Username, user.Groups); perms != nil {
+	permKey, client := mcpPermScope(user.Username)
+	if perms := cache.Get(permKey, user.Groups); perms != nil {
 		return user, perms
 	}
 
-	client := k8s.GetClient()
 	if client == nil {
 		log.Printf("[mcp] K8s client unavailable for namespace discovery (user=%s) — denying access", user.Username)
 		// Empty (not nil) AllowedNamespaces means "no access"; nil would mean cluster-admin.
@@ -123,7 +123,7 @@ func resolveUserPerms(ctx context.Context) (*pkgauth.User, *pkgauth.UserPermissi
 	}
 
 	perms := &pkgauth.UserPermissions{AllowedNamespaces: allowed}
-	cache.Set(user.Username, user.Groups, perms)
+	cache.Set(permKey, user.Groups, perms)
 	return user, perms
 }
 
@@ -274,7 +274,7 @@ func canReadClusterScopedKind(ctx context.Context, kind, group, verb string) boo
 			return v
 		}
 	}
-	client := k8s.GetClient()
+	_, client := mcpPermScope(user.Username)
 	if client == nil {
 		// Fail-closed: no apiserver to ask, refuse the read rather than
 		// quietly serving the user something they may not be entitled to.
@@ -319,7 +319,7 @@ func canReadInNamespaceDecision(ctx context.Context, group, resource, namespace,
 			return v, true
 		}
 	}
-	client := k8s.GetClient()
+	_, client := mcpPermScope(user.Username)
 	if client == nil {
 		log.Printf("[mcp] canReadInNamespace: no K8s client, denying %s on %s/%s in %q for %s", k8s.SanitizeForLog(verb), k8s.SanitizeForLog(group), k8s.SanitizeForLog(resource), k8s.SanitizeForLog(namespace), k8s.SanitizeForLog(user.Username))
 		return false, false

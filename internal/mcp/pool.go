@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 
+	"k8s.io/client-go/kubernetes"
+
 	"github.com/skyhook-io/radar/internal/k8s"
 	"github.com/skyhook-io/radar/pkg/auth"
 )
@@ -49,4 +51,23 @@ func mcpDiscovery(ctx context.Context) *k8s.ResourceDiscovery {
 		return e.Discovery
 	}
 	return k8s.GetResourceDiscovery()
+}
+
+// mcpPermScope resolves the permission-cache key and the ServiceAccount client
+// SubjectAccessReviews must use for username, qualified by the user's pool
+// context so one cluster's RBAC never answers for another's. \x01 cannot
+// appear in a Kubernetes username, so the qualified key can't collide.
+func mcpPermScope(username string) (key string, client kubernetes.Interface) {
+	if mcpPool != nil {
+		if ctxName := mcpPool.ContextForUser(username); ctxName != "" && ctxName != k8s.GetContextName() {
+			if e := mcpPool.EntryForContext(ctxName); e != nil && e.Client != nil {
+				return username + "\x01" + ctxName, e.Client
+			}
+			return username + "\x01" + ctxName, nil
+		}
+	}
+	if c := k8s.GetClient(); c != nil {
+		return username, c
+	}
+	return username, nil
 }

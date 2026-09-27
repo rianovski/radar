@@ -30,6 +30,7 @@ type PoolEntry struct {
 	DynCache    *DynamicResourceCache
 	Discovery   *ResourceDiscovery
 	Client      kubernetes.Interface
+	Dynamic     dynamic.Interface
 	RestConfig  *rest.Config
 	ContextName string
 	ClusterName string
@@ -117,6 +118,9 @@ func (p *CachePool) resolveEntryLocked(contextName string, ref *poolRef) PoolEnt
 	}
 	if c := GetClient(); c != nil {
 		e.Client = c
+	}
+	if d := GetDynamicClient(); d != nil {
+		e.Dynamic = d
 	}
 	if c := GetConfig(); c != nil {
 		e.RestConfig = c
@@ -402,6 +406,7 @@ func BuildEntryForContext(ctx context.Context, contextName string) (*PoolEntry, 
 		DynCache:    &DynamicResourceCache{DynamicResourceCache: dynCore},
 		Discovery:   disc,
 		Client:      client,
+		Dynamic:     dynClient,
 		RestConfig:  restCfg,
 		ContextName: contextName,
 		ClusterName: clusterName,

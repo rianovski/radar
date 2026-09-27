@@ -49,7 +49,7 @@ func (s *Server) computeSearchSkipKinds(r *http.Request) map[string]bool {
 		// when the SA can't list. Nothing for us to add.
 		return nil
 	}
-	client := k8s.GetClient()
+	client := k8s.ServiceClientFromContext(r.Context())
 	if client == nil {
 		// Defensive: cache client not initialized. Fail closed on all
 		// sensitive kinds rather than silently leaking through.
